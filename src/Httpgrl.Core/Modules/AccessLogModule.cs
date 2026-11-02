@@ -45,6 +45,7 @@ internal sealed class AccessLogModule : IModule
             new("ua", req.Headers.Get("User-Agent")),
             new("referer", req.Headers.Get("Referer")),
             new("tls", ctx.Connection.IsTls),
+            new("client_verify", ctx.Connection.ClientVerify),
         ]);
         return HandlerResult.Done;
     }

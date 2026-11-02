@@ -1,5 +1,6 @@
 using System.Net;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography.X509Certificates;
 
 namespace Httpgrl;
 
@@ -125,6 +126,15 @@ public sealed class ConnectionInfo(long id, EndPoint? remote, EndPoint? local, b
     public bool IsTls { get; } = isTls;
     public string? TlsServerName { get; private set; }
     public string? TlsProtocol { get; private set; }
+    /// <summary>The certificate the client presented (only when <c>ssl_verify_client</c> is not off).</summary>
+    public X509Certificate2? ClientCertificate { get; private set; }
+    /// <summary>
+    /// The client certificate verdict as in nginx's <c>$ssl_client_verify</c>: "SUCCESS", "FAILED:reason" (only
+    /// reachable with <c>optional_no_ca</c>) or "NONE"; null when client certificates aren't requested.
+    /// </summary>
+    public string? ClientVerify { get; private set; }
+    /// <summary>True only when a client certificate was presented and chains to a trusted CA.</summary>
+    public bool ClientVerified => ClientVerify == "SUCCESS";
     public int Requests { get; private set; }
 
     public string RemoteAddress => Remote switch { IPEndPoint ip => ip.Address.ToString(), null => "", var e => e.ToString() ?? "" };
@@ -132,8 +142,15 @@ public sealed class ConnectionInfo(long id, EndPoint? remote, EndPoint? local, b
     public string LocalAddress => Local switch { IPEndPoint ip => ip.Address.ToString(), null => "", var e => e.ToString() ?? "" };
     public int LocalPort => Local is IPEndPoint ip ? ip.Port : 0;
 
-    public void SetTls(string? sni, string protocol) { TlsServerName = sni; TlsProtocol = protocol; }
-    public void CountRequest() => Requests++;
+    // Core-only: a module must not be able to rewrite the connection's TLS identity.
+    internal void SetTls(string? sni, string protocol, X509Certificate2? clientCert, string? clientVerify)
+    {
+        TlsServerName = sni;
+        TlsProtocol = protocol;
+        ClientCertificate = clientCert;
+        ClientVerify = clientVerify;
+    }
+    internal void CountRequest() => Requests++;
 }
 
 /// <summary>Ordered, case-insensitive header list. Flat arrays, linear lookup (headers are few).</summary>

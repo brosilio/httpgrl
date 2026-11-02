@@ -40,6 +40,7 @@ These are deliberate design decisions made by the project owner, not accidents t
    - **Connection limits:** connections are capped globally and per client (IPv4 address or IPv6 /64). Idle keep-alives are evicted first.
    - **Paths:** the core maps every request path through `root`/`alias` and checks it stays inside. All request-driven filesystem access lives in `src/Httpgrl.Core/Files/LocalFiles.cs`. Unix file opens use `O_NONBLOCK|O_CLOEXEC`.
    - **Sockets:** only `SO_REUSEADDR` by default. Never use .NET's `ReuseAddress` on Unix, because it silently adds `SO_REUSEPORT`. Port sharing is explicit, per socket: `listen ... reuseport`.
+   - **Client certificates:** verified only against the configured CA bundle (no system roots, no AIA downloads, no resumption). A request whose `Host` resolves to a server with a different client-certificate policy than the SNI-selected one gets a 421. Only the core sets a connection's TLS identity. Revocation directives are config errors until revocation is really checked.
    - **Server identity:** `server_tokens` is **off by default**, meaning no `Server` header and no product name on error pages. `on` is opt-in.
    - **Response headers:** `HeaderCollection` rejects CR, LF and NUL. Framing headers belong to the core.
    - **Proxying:**

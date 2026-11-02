@@ -1,7 +1,9 @@
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using Httpgrl.Core.Hosting;
+using Httpgrl.Core.Modules;
 using Httpgrl.Core.Pipeline;
 
 namespace Httpgrl.Core.Http;
@@ -19,6 +21,8 @@ internal sealed class Http1Session
     private readonly ConnectionManager _mgr;
     private readonly VirtualHosts _hosts;
     private Stream _transport = Stream.Null;
+    /// <summary>The server whose TLS settings the handshake used (chosen by SNI).</summary>
+    private ServerRt? _tlsServer;
 
     public Http1Session(Connection conn, ListenBinding binding, HttpRuntime rt, ConnectionManager mgr)
     {
@@ -42,10 +46,27 @@ internal sealed class Http1Session
             {
                 _conn.Phase = "tls handshake";
                 _conn.BaseDeadline = Environment.TickCount64 + core0.SslHandshakeTimeoutMs;
-                var ssl = new SslStream(transport, leaveInnerStreamOpen: false);
+                var ssl = new ClientAuthSslStream(transport);
+                _transport = transport = ssl;
                 await ssl.AuthenticateAsServerAsync(SelectTls, this, CancellationToken.None).ConfigureAwait(false);
-                info.SetTls(TlsHost(ssl.TargetHostName), ssl.SslProtocol.ToString());
-                transport = ssl;
+                X509Certificate2? clientCert = null;
+                string? verdict = null;
+                if (_tlsServer!.ClientAuth is { } auth)
+                {
+                    clientCert = ssl.RemoteCertificate as X509Certificate2;
+                    verdict = ssl.Verdict;
+                    if (verdict is null)
+                    {
+                        // The callback didn't run (e.g. a resumed session): verify here, under the same policy.
+                        (verdict, bool accept) = auth.Evaluate(clientCert);
+                        if (!accept)
+                        {
+                            _rt.Log.Info("client certificate rejected", new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", verdict));
+                            return;
+                        }
+                    }
+                }
+                info.SetTls(TlsHost(ssl.TargetHostName), ssl.SslProtocol.ToString(), clientCert, verdict);
             }
             _transport = transport;
 
@@ -102,6 +123,10 @@ internal sealed class Http1Session
                 }
 
                 ctx.ServerRt = reject == 0 ? _hosts.Resolve(req.HostValue) : _hosts.Default;
+                // A client may complete the handshake for one name (SNI) and then ask for another (Host). Never let that
+                // carry it past a client-certificate policy it wasn't checked against (cf. nginx's 421).
+                if (reject == 0 && _tlsServer is not null && !ReferenceEquals(ctx.ServerRt.ClientAuth, _tlsServer.ClientAuth))
+                    reject = 421;
                 ctx.SelectLocation(ctx.ServerRt.Root, null);
                 ctx.BodyReader.Reset(transport, reject == 0 ? req.ContentLengthValue : -1, reject == 0 && req.ChunkedValue);
                 if (req.ExpectContinue) ctx.BodyReader.SendContinue = SendContinueAsync;
@@ -133,6 +158,10 @@ internal sealed class Http1Session
                 }
                 first = false;
             }
+        }
+        catch (AuthenticationException e) when (_transport is ClientAuthSslStream { Verdict: { } v } && v != "SUCCESS")
+        {
+            _rt.Log.Info("client certificate rejected", new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", v), new("detail", e.Message));
         }
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or AuthenticationException or OperationCanceledException || (e is InvalidOperationException && _conn.IsAborted))
         {
@@ -184,9 +213,10 @@ internal sealed class Http1Session
     {
         var self = (Http1Session)state!;
         var srv = self._hosts.Resolve(TlsHost(hello.ServerName));
-        var opts = srv.Tls ?? self._hosts.Default.Tls ?? self._hosts.Servers.Find(s => s.Tls is not null)?.Tls
+        if (srv.Tls is null) srv = self._hosts.Default.Tls is not null ? self._hosts.Default : self._hosts.Servers.Find(s => s.Tls is not null)
             ?? throw new AuthenticationException("no certificate");
-        return ValueTask.FromResult(opts);
+        self._tlsServer = srv;
+        return ValueTask.FromResult(srv.Tls!);
     }
 
     private static string? TlsHost(string? sni) => string.IsNullOrEmpty(sni) ? null : RequestParser.NormalizeHost(sni);

@@ -83,6 +83,10 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `ssl_handshake_timeout` | http, server | `10s` | |
 | `ssl_certificate` / `ssl_certificate_key` | http, server | | PEM. The chain is read from the cert file. Selected by SNI. |
 | `ssl_protocols` | http, server | `TLSv1.2 TLSv1.3` | Older protocols are a config error. |
+| `ssl_verify_client off\|on\|optional\|optional_no_ca;` | http, server | `off` | Client certificates (mTLS). `on`: required. `optional`: a certificate is not required, but one that's presented must verify. `optional_no_ca`: also accepts an unknown issuer (the verdict is in `$ssl_client_verify`); expired or wrong-purpose certificates still fail. A failed check fails the TLS handshake (nginx answers 400 instead). TLS session resumption is disabled on these servers, so every connection gets the full check. |
+| `ssl_client_certificate file;` | http, server | | PEM CA bundle that client certificates must chain to. It's the *only* trust anchor: system roots are never used. Its CA names are sent to clients (not on Windows). Required for `on`/`optional`. |
+| `ssl_verify_depth n;` | http, server | `1` | Maximum chain length above the client certificate: `1` means issued directly by a CA in the bundle. Raise it for intermediates (the client must send them). |
+| `ssl_crl`, `ssl_ocsp`, `ssl_trusted_certificate` | | | Not supported, and a config error rather than silently ignored: there is no revocation checking yet. Use short-lived client certificates. |
 | `server_tokens on\|off;` | | **`off`** | `off`: no `Server` header and no product name on error pages. `on`: `Server: httpgrl/<version>` plus the error-page footer. Note: nginx's `off` still sends a header; here `off` sends none. |
 | `access_log stdout\|off;` | | `stdout` | |
 
@@ -90,6 +94,16 @@ Variables: `$uri $request_uri $args $is_args $host $server_name $scheme $https $
 `$server_addr $server_port $request_method $server_protocol $document_root $request_filename $status`
 `$body_bytes_sent $request_time $connection $connection_requests $msec $time_iso8601`, `$1`..`$9` from regex
 locations, and the prefix families `$http_*`, `$sent_http_*`, `$arg_*` and `$cookie_*`.
+
+TLS variables: `$ssl_protocol $ssl_server_name $ssl_client_verify` (`SUCCESS`, `FAILED:reason`, `NONE`) and, when a
+client certificate was presented, `$ssl_client_s_dn $ssl_client_i_dn $ssl_client_serial $ssl_client_escaped_cert` and
+`$ssl_client_fingerprint`. The fingerprint is the lowercase hex **SHA-256** of the certificate (nginx uses SHA-1).
+The access log records `client_verify`. Modules read the same data from `ctx.Connection.ClientCertificate`,
+`ClientVerify` and `ClientVerified`.
+
+To hand the identity to a backend, set it with `proxy_set_header` (for example
+`proxy_set_header X-Client-Verify $ssl_client_verify;`). A request header with the same name as one set by
+`proxy_set_header` is always dropped, even when the value is empty, so a client can't forge it.
 
 ### Reverse proxy
 
@@ -170,6 +184,12 @@ through without buffering (nginx's `proxy_buffering off`), and are flushed whene
 - `Upgrade: h2c` is never tunnelled (h2c smuggling would bypass every rule configured here). An unsolicited `101` from an upstream is a 502.
 - Upstream TLS is verified by default.
 - Pooled keep-alive connections are reused only under the exact TLS settings they were verified with.
+
+**Client certificates (mTLS).**
+- Chains are built only against `ssl_client_certificate`. There are no system roots, no AIA downloads (a client-supplied URL never makes the server connect out) and no revocation fetches. The leaf must allow TLS client authentication (EKU), be within its validity period and respect `ssl_verify_depth`.
+- SNI picks the TLS policy, and `Host` picks the server. If they land on servers with different client-certificate policies, the request gets a **421**. So a client can't do the handshake for an open name and then ask for a protected one (or the reverse, carrying a verified identity to a server that didn't ask for it).
+- Session resumption is off where client certificates are requested. A resumed session would skip, or only partly redo, the check.
+- The connection's TLS identity can only be set by the core (`ConnectionInfo.SetTls` is internal).
 
 **Sockets.**
 - Regexes use the linear-time `NonBacktracking` engine where possible. Otherwise they run with a 50 ms match timeout.

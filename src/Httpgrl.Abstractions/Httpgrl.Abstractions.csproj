@@ -2,4 +2,7 @@
   <PropertyGroup>
     <RootNamespace>Httpgrl</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Httpgrl.Core" />
+  </ItemGroup>
 </Project>
