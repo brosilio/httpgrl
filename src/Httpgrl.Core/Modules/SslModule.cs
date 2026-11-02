@@ -14,6 +14,8 @@ public sealed class SslConf : ScopeConfig<SslConf>
     public string? ClientCa;
     public SourceLocation ClientCaSource;
     public int? VerifyDepth;
+    public string? Crl;
+    public SourceLocation CrlSource;
     /// <summary>Built in Configure for every server that listens with ssl.</summary>
     public SslServerAuthenticationOptions? Options;
     /// <summary>Built in Configure when ssl_verify_client is not off; shared by servers with identical settings.</summary>
@@ -26,6 +28,7 @@ public sealed class SslConf : ScopeConfig<SslConf>
         Verify ??= p.Verify;
         if (ClientCa is null) { ClientCa = p.ClientCa; ClientCaSource = p.ClientCaSource; }
         VerifyDepth ??= p.VerifyDepth;
+        if (Crl is null) { Crl = p.Crl; CrlSource = p.CrlSource; }
     }
 }
 
@@ -45,11 +48,14 @@ public sealed class ClientAuth
     public readonly X509ChainPolicy Policy;
     /// <summary>The CA names sent in the CertificateRequest so clients can pick the right certificate.</summary>
     public readonly SslCertificateTrust? Trust;
+    /// <summary>ssl_crl: revocation is checked for every certificate of the chain below the trust anchor.</summary>
+    public readonly CrlSet? Crls;
 
-    public ClientAuth(VerifyClient mode, X509Certificate2Collection? cas, int depth)
+    public ClientAuth(VerifyClient mode, X509Certificate2Collection? cas, int depth, CrlSet? crls = null)
     {
         Mode = mode;
         Depth = depth;
+        Crls = crls;
         Policy = new X509ChainPolicy
         {
             TrustMode = X509ChainTrustMode.CustomRootTrust,
@@ -82,6 +88,11 @@ public sealed class ClientAuth
         else if (chain.ChainElements.Count - 1 > Depth)
         {
             failure = "certificate chain too long";
+            caOnly = false;
+        }
+        else if (Crls?.Check(chain.ChainElements, DateTime.UtcNow) is { } revocation)
+        {
+            failure = revocation;
             caOnly = false;
         }
         if (failure is null) return ("SUCCESS", true);
@@ -148,7 +159,8 @@ internal sealed class SslModule : IModule
             i.Conf<SslConf>().VerifyDepth = d;
         } });
         // Accepting these silently would claim a revocation check that doesn't happen.
-        foreach (var n in new[] { "ssl_crl", "ssl_ocsp", "ssl_ocsp_responder", "ssl_trusted_certificate" })
+        r.AddDirective(new() { Name = "ssl_crl", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => { var c = i.Conf<SslConf>(); c.Crl = i.Args[0]; c.CrlSource = i.Source; } });
+        foreach (var n in new[] { "ssl_ocsp", "ssl_ocsp_responder", "ssl_trusted_certificate" })
             r.AddDirective(new() { Name = n, Contexts = ctx, MaxArgs = -1, Handler = i => throw i.Error($"\"{i.Name}\" is not supported") });
 
         r.AddVariable("ssl_protocol", c => c.Connection.TlsProtocol);
@@ -187,7 +199,8 @@ internal sealed class SslModule : IModule
             setup.Log.Warn("directive ignored; the platform TLS stack defaults apply", new("directive", name), new("at", src.ToString()));
 
         var cache = new Dictionary<(string, string, string?), SslStreamCertificateContext>();
-        var auths = new Dictionary<(VerifyClient, string?, int), ClientAuth>();
+        var auths = new Dictionary<(VerifyClient, string?, int, string?), ClientAuth>();
+        var crlSets = new Dictionary<string, CrlSet>();
         var caBundles = new Dictionary<string, X509Certificate2Collection>();
         foreach (var server in setup.ScopesOf(ContextKind.Server))
         {
@@ -209,7 +222,8 @@ internal sealed class SslModule : IModule
                 if (ca is null && mode != VerifyClient.OptionalNoCa)
                     throw new ConfigException($"no \"ssl_client_certificate\" for \"ssl_verify_client {(mode == VerifyClient.On ? "on" : "optional")}\"", server.Source);
                 int depth = ssl.VerifyDepth ?? 1;
-                if (!auths.TryGetValue((mode, ca, depth), out auth))
+                string? crlPath = ssl.Crl is null ? null : Path.GetFullPath(ssl.Crl, root);
+                if (!auths.TryGetValue((mode, ca, depth, crlPath), out auth))
                 {
                     X509Certificate2Collection? cas = null;
                     if (ca is not null && !caBundles.TryGetValue(ca, out cas))
@@ -223,7 +237,10 @@ internal sealed class SslModule : IModule
                         if (cas.Count == 0) throw new ConfigException($"no certificates in client CA bundle \"{ca}\"", ssl.ClientCaSource);
                         caBundles[ca] = cas;
                     }
-                    auths[(mode, ca, depth)] = auth = new ClientAuth(mode, cas, depth);
+                    CrlSet? crls = null;
+                    if (crlPath is not null && !crlSets.TryGetValue(crlPath, out crls))
+                        crlSets[crlPath] = crls = LoadCrls(crlPath, cas, ssl.CrlSource, setup.Log);
+                    auths[(mode, ca, depth, crlPath)] = auth = new ClientAuth(mode, cas, depth, crls);
                 }
             }
             ssl.ClientAuth = auth;
@@ -260,6 +277,37 @@ internal sealed class SslModule : IModule
                 EncryptionPolicy = EncryptionPolicy.RequireEncryption,
             };
         }
+    }
+
+    /// <summary>
+    /// Parse and pre-check a CRL file. A CRL naming a CA from the bundle must be signed by it (a forged or corrupt
+    /// CRL fails the load, not a handshake later). CRLs from intermediates are checked against the intermediate
+    /// the client presents.
+    /// </summary>
+    private static CrlSet LoadCrls(string path, X509Certificate2Collection? cas, SourceLocation src, ILogger log)
+    {
+        List<Crl> crls;
+        try { crls = Crl.LoadFile(path); }
+        catch (Exception e) when (e is CryptographicException or IOException or UnauthorizedAccessException or FormatException)
+        {
+            throw new ConfigException($"cannot load CRL file \"{path}\": {e.Message}", src);
+        }
+        var now = DateTime.UtcNow;
+        foreach (var c in crls)
+        {
+            bool named = false, signed = false;
+            foreach (var ca in cas ?? [])
+            {
+                if (!ca.SubjectName.RawData.AsSpan().SequenceEqual(c.IssuerName)) continue;
+                named = true;
+                signed |= c.IsSignedBy(ca);
+            }
+            var issuer = new X500DistinguishedName(c.IssuerName).Name;
+            if (named && !signed) throw new ConfigException($"CRL for \"{issuer}\" in \"{path}\" is not signed by that CA", src);
+            if (c.NextUpdate is { } next && next < now)
+                log.Warn("CRL has expired; certificates it covers will be rejected until it's replaced", new("issuer", issuer), new("next_update", next.ToString("O")));
+        }
+        return new CrlSet(crls);
     }
 
     internal static SslStreamCertificateContext Load(string certPath, string keyPath, SslCertificateTrust? trust = null)

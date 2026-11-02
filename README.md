@@ -99,7 +99,8 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `ssl_verify_client off\|on\|optional\|optional_no_ca;` | http, server | `off` | Client certificates (mTLS). `on`: required. `optional`: a certificate is not required, but one that's presented must verify. `optional_no_ca`: also accepts an unknown issuer (the verdict is in `$ssl_client_verify`); expired or wrong-purpose certificates still fail. A failed check fails the TLS handshake (nginx answers 400 instead). TLS session resumption is disabled on these servers, so every connection gets the full check. |
 | `ssl_client_certificate file;` | http, server | | PEM CA bundle that client certificates must chain to. It's the *only* trust anchor: system roots are never used. Its CA names are sent to clients (not on Windows). Required for `on`/`optional`. |
 | `ssl_verify_depth n;` | http, server | `1` | Maximum chain length above the client certificate: `1` means issued directly by a CA in the bundle. Raise it for intermediates (the client must send them). |
-| `ssl_crl`, `ssl_ocsp`, `ssl_trusted_certificate` | | | Not supported, and a config error rather than silently ignored: there is no revocation checking yet. Use short-lived client certificates. |
+| `ssl_crl file;` | http, server | | PEM (any number of `X509 CRL` blocks) or DER. Like nginx (OpenSSL `CRL_CHECK_ALL`), *every* certificate in the chain below the trust anchor needs a current CRL from its issuer: so with an intermediate CA, include the root's CRL and the intermediate's. A missing, expired or not-yet-valid CRL fails the check. CRLs are read at load: reload (`SIGHUP`) to pick up new ones. Full CRLs only; delta and indirect CRLs and unknown critical extensions are a config error. Signatures: ECDSA or RSA PKCS#1 with SHA-256/384/512. |
+| `ssl_ocsp`, `ssl_trusted_certificate` | | | Not supported, and a config error rather than silently ignored. |
 | `server_tokens on\|off;` | | **`off`** | `off`: no `Server` header and no product name on error pages. `on`: `Server: httpgrl/<version>` plus the error-page footer. Note: nginx's `off` still sends a header; here `off` sends none. |
 | `access_log stdout\|off;` | | `stdout` | |
 
@@ -201,6 +202,7 @@ through without buffering (nginx's `proxy_buffering off`), and are flushed whene
 **Client certificates (mTLS).**
 - Chains are built only against `ssl_client_certificate`. There are no system roots, no AIA downloads (a client-supplied URL never makes the server connect out) and no revocation fetches. The leaf must allow TLS client authentication (EKU), be within its validity period and respect `ssl_verify_depth`.
 - SNI picks the TLS policy, and `Host` picks the server. If they land on servers with different client-certificate policies, the request gets a **421**. So a client can't do the handshake for an open name and then ask for a protected one (or the reverse, carrying a verified identity to a server that didn't ask for it).
+- With `ssl_crl`, each CRL's signature is verified against the issuing certificate of the chain being checked. A CRL that names a CA from the bundle but isn't signed by it fails the config load. A CRL that is missing or out of date for any CA in the chain fails the check closed, never open.
 - Session resumption is off where client certificates are requested. A resumed session would skip, or only partly redo, the check.
 - The connection's TLS identity can only be set by the core (`ConnectionInfo.SetTls` is internal).
 
@@ -268,7 +270,7 @@ Then add it to the list in `src/Httpgrl/Program.cs`. There is no reflection and 
 In priority order. Nothing here is implemented yet unless it's ticked.
 
 1. [x] **Reload without restart** (`SIGHUP`): re-read config and certificates; keep the old configuration if the new one fails; old connections finish on the old configuration.
-2. [ ] **Revocation for client certificates** (`ssl_crl`): signed, unexpired CRLs for every CA in the chain.
+2. [x] **Revocation for client certificates** (`ssl_crl`): signed, unexpired CRLs for every CA in the chain.
 3. [ ] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
 4. [ ] **Rate limiting**: `limit_req` and `limit_conn` zones.
 5. [ ] **Hardening**: fuzzing the request, upstream-response and config parsers; long-running soak tests under load; CI on Windows and macOS.

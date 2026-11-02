@@ -1,4 +1,5 @@
 using System.Net.Security;
+using System.Numerics;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
@@ -129,16 +130,82 @@ internal static class ClientAuthTests
             T.True(!alice.Contains("admin", StringComparison.Ordinal));
         });
 
+        T.Add("crl: revoked certificates are rejected, and a CRL that doesn't list one passes", async () =>
+        {
+            var crl = CrlPem(P.Root, P.Alice);
+            await using var s = TestServer.Start(Conf("on", "ssl_crl {DIR}/crl.pem;"), d => { Populate(d); File.WriteAllText(Path.Combine(d, "crl.pem"), crl); });
+            T.Eq(Rejected, await Get(s.Port, "secure.test", P.Alice));
+            T.True(Body(await Get(s.Port, "secure.test", P.Carol)).StartsWith("SUCCESS|CN=carol|", StringComparison.Ordinal));
+            T.Contains("certificate revoked", s.LogText());
+        });
+
+        T.Add("crl: every CA below the root needs a current CRL (CRL_CHECK_ALL); revoking an intermediate revokes its leaves", async () =>
+        {
+            async Task<string> Bob(string crls)
+            {
+                await using var s = TestServer.Start(Conf("on", "ssl_verify_depth 2; ssl_crl {DIR}/crl.pem;"), d => { Populate(d); File.WriteAllText(Path.Combine(d, "crl.pem"), crls); });
+                var r = await Get(s.Port, "secure.test", P.Bob, [P.Intermediate]);
+                return r == Rejected ? Rejected + s.LogText() : Body(r);
+            }
+            T.Contains("unable to get certificate CRL", await Bob(CrlPem(P.Root)));
+            T.True((await Bob(CrlPem(P.Root) + CrlPem(P.Intermediate))).StartsWith("SUCCESS|CN=bob|", StringComparison.Ordinal));
+            T.Contains("certificate revoked", await Bob(CrlPem(P.Root) + CrlPem(P.Intermediate, P.Bob)));
+            T.Contains("certificate revoked", await Bob(CrlPem(P.Root, P.Intermediate) + CrlPem(P.Intermediate)));
+            var expired = CrlPem(P.Root, DateTimeOffset.UtcNow.AddDays(-2), DateTimeOffset.UtcNow.AddDays(-1));
+            T.Contains("CRL has expired", await Bob(expired + CrlPem(P.Intermediate)));
+            // Revocation failures are never "unknown CA only": optional_no_ca rejects them too.
+            await using var s2 = TestServer.Start(Conf("optional_no_ca", "ssl_crl {DIR}/crl.pem;"), d => { Populate(d); File.WriteAllText(Path.Combine(d, "crl.pem"), CrlPem(P.Root, P.Alice)); });
+            T.Eq(Rejected, await Get(s2.Port, "secure.test", P.Alice));
+        });
+
+        T.Add("crl: forged, malformed and unsupported CRLs fail the config load", () =>
+        {
+            // Same issuer name as the trusted root, different key.
+            using var forgerKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var req = new CertificateRequest("CN=test root", forgerKey, HashAlgorithmName.SHA256);
+            req.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+            req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+            req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+            using var forger = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+            string Load(string crl) => T.Throws<ConfigException>(() => TestServer.Start(Conf("on", "ssl_crl {DIR}/crl.pem;"),
+                d => { Populate(d); File.WriteAllText(Path.Combine(d, "crl.pem"), crl); })).Message;
+            T.Contains("not signed by that CA", Load(CrlPem(forger)));
+            T.Contains("cannot load CRL", Load("-----BEGIN X509 CRL-----\nMAMCAQA=\n-----END X509 CRL-----\n"));
+            T.Contains("no CRLs", Load("nothing here\n-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n"));
+            return Task.CompletedTask;
+        });
+
+        T.Add("crl: a new CRL takes effect on reload", async () =>
+        {
+            var conf = Conf("on", "ssl_crl {DIR}/crl.pem;");
+            await using var s = TestServer.Start(conf, d => { Populate(d); File.WriteAllText(Path.Combine(d, "crl.pem"), CrlPem(P.Root)); });
+            T.Eq(200, Status(await Get(s.Port, "secure.test", P.Alice)));
+            File.WriteAllText(Path.Combine(s.Dir, "crl.pem"), CrlPem(P.Root, P.Alice));
+            T.True(await s.Reload(conf));
+            T.Eq(Rejected, await Get(s.Port, "secure.test", P.Alice));
+        });
+
         T.Add("mtls: config errors (missing CA, unsupported revocation directives)", () =>
         {
             const string NoCa = """
                 http { server { listen 127.0.0.1:0 ssl; ssl_certificate {DIR}/srv.crt; ssl_certificate_key {DIR}/srv.key; ssl_verify_client on; } }
                 """;
             T.Contains("ssl_client_certificate", T.Throws<ConfigException>(() => TestServer.Start(NoCa, Populate)).Message);
-            T.Contains("not supported", T.Throws<ConfigException>(() => TestServer.Start(Conf("on", "ssl_crl {DIR}/x.crl;"), Populate)).Message);
+            T.Contains("not supported", T.Throws<ConfigException>(() => TestServer.Start(Conf("on", "ssl_ocsp on;"), Populate)).Message);
             T.Contains("invalid value", T.Throws<ConfigException>(() => TestServer.Start(Conf("maybe"), Populate)).Message);
             return Task.CompletedTask;
         });
+    }
+
+    private static string CrlPem(X509Certificate2 issuer, params X509Certificate2[] revoked) =>
+        CrlPem(issuer, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1), revoked);
+
+    private static string CrlPem(X509Certificate2 issuer, DateTimeOffset thisUpdate, DateTimeOffset nextUpdate, params X509Certificate2[] revoked)
+    {
+        var b = new CertificateRevocationListBuilder();
+        foreach (var r in revoked) b.AddEntry(r, thisUpdate, X509RevocationReason.KeyCompromise);
+        var der = b.Build(issuer, BigInteger.One, nextUpdate, HashAlgorithmName.SHA256, null, thisUpdate);
+        return PemEncoding.WriteString("X509 CRL", der) + "\n";
     }
 
     /// <summary>One request over TLS; <see cref="Rejected"/> if the server refused the handshake or closed without answering.</summary>
@@ -170,7 +237,7 @@ internal static class ClientAuthTests
     /// <summary>A throwaway PKI: root → (alice, expired, server-only), root → intermediate → bob, and an unrelated CA → mallory.</summary>
     private sealed class Pki
     {
-        public readonly X509Certificate2 Root, Intermediate, Server, Alice, Bob, Mallory, Expired, ServerOnly;
+        public readonly X509Certificate2 Root, Intermediate, Server, Alice, Bob, Carol, Mallory, Expired, ServerOnly;
         public readonly string ServerKey;
 
         public Pki()
@@ -180,6 +247,7 @@ internal static class ClientAuthTests
             Intermediate = Ca("CN=test intermediate", Root, now);
             var other = Ca("CN=other root", null, now);
             Alice = Leaf("CN=alice", Root, now.AddDays(-1), now.AddDays(30), clientAuth: true);
+            Carol = Leaf("CN=carol", Root, now.AddDays(-1), now.AddDays(30), clientAuth: true);
             Bob = Leaf("CN=bob", Intermediate, now.AddDays(-1), now.AddDays(30), clientAuth: true);
             Mallory = Leaf("CN=mallory", other, now.AddDays(-1), now.AddDays(30), clientAuth: true);
             Expired = Leaf("CN=expired", Root, now.AddDays(-30), now.AddDays(-1), clientAuth: true);
