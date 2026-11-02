@@ -57,6 +57,7 @@ docker compose up --build                              # see compose.yaml
 | `src/Httpgrl.Modules.StaticFiles` | `http_index`, `http_autoindex`, `http_static`. |
 | `src/Httpgrl.Modules.Rewrite` | `http_rewrite` (`return`, `set`, `if`, `break`) and `http_map`. |
 | `src/Httpgrl.Modules.Headers` | `http_headers`: `add_header`. |
+| `src/Httpgrl.Modules.Limits` | `http_limit_req`, `http_limit_conn`. |
 | `src/Httpgrl.Modules.Proxy` | `http_proxy`: `proxy_pass`, `upstream {}`, WebSocket/Upgrade tunnelling. |
 | `src/Httpgrl` | Host executable. The compiled-in module list is in `Program.cs`. |
 | `tests/Httpgrl.Tests` | A dependency-free test runner. It runs on the JIT, and `ci.sh` also publishes and runs it as native AOT. |
@@ -134,9 +135,46 @@ location /admin {
 }
 ```
 
+### Rate and connection limits
+
+```nginx
+http {
+    limit_req_zone  $remote_net zone=perclient:10m rate=20r/s;
+    limit_req_zone  $remote_net zone=login:1m rate=10r/m;
+    limit_conn_zone $remote_net zone=conns:10m;
+
+    limit_req  zone=perclient burst=40 nodelay;    # everywhere...
+    limit_conn conns 20;
+
+    server {
+        location /login { limit_req zone=login burst=5; }   # ...and stricter here (both apply)
+        location /health { limit_req off; limit_conn off; }
+    }
+}
+```
+
+| Directive | Context | Default | Notes |
+|---|---|---|---|
+| `limit_req_zone key zone=name:size rate=Nr/s\|Nr/m;` | http | | nginx's leaky bucket per key. The key may combine variables; an empty key isn't limited (use a `map` to exempt clients). `size` is a memory budget (at least 32k; roughly 128 bytes + the key per client), so long keys can't grow a zone past it. When full, the least recently seen keys are forgotten. A key too long to fit at all is rejected. |
+| `limit_req zone=name [burst=n] [nodelay\|delay=n];` | http, server, location | | Within `burst`, excess requests are delayed to the rate (`nodelay`: served at once; `delay=n`: the first n excess served at once). Beyond it: rejected. Several per level; a request must pass all of them, and one that's rejected isn't charged to the others. Counted once per request, whatever internal redirects follow. **Deviation:** levels **merge**. A location's own `limit_req` adds to inherited ones instead of replacing them all (nginx), so a stricter `/login` limit can't silently lift the server-wide one. The same zone at an inner level replaces the outer entry; `limit_req off;` drops inherited limits. |
+| `limit_conn_zone key zone=name:size;` / `limit_conn zone n;` | http / http, server, location | | At most n requests in flight per key. A request holds its slot until it ends (a WebSocket for its whole life) and releases it however it ends, including a reset. A full zone refuses new keys. Merges across levels like `limit_req`; `limit_conn off;` too. |
+| `limit_req_status` / `limit_conn_status code;` | http, server, location | **`429`** | nginx defaults to 503, which tells clients and monitoring the server is broken. `444` drops the connection without a response. `error_page` applies to other codes. |
+| `limit_req_dry_run` / `limit_conn_dry_run on\|off;` | http, server, location | `off` | Account and log, but never delay or reject. |
+| `limit_req_log_level` / `limit_conn_log_level info\|notice\|warn\|error;` | http, server, location | `warn` | Rejections are logged at this level; delays one level lower. |
+
+Limits run at the start of the access phase, after the rewrite phase, so `return` isn't limited (as in nginx).
+Zone state survives a reload as long as the zone keeps its name, size and key. Requests still running on the old
+configuration keep counting against `limit_conn`.
+
+**Choosing a key:** `$remote_net` is the client's IPv4 address, or its IPv6 **/64**. A single IPv6 client typically
+controls a whole /64 and can rotate through 2^64 addresses, so `$binary_remote_addr` (also available) lets it
+dodge any per-address limit. `$remote_net` is the same grouping the core's per-client connection cap uses.
+Behind a proxy or CDN, key on a header that it sets and clients can't.
+
 Variables: `$uri $request_uri $args $is_args $host $server_name $scheme $https $remote_addr $remote_port`
 `$server_addr $server_port $request_method $server_protocol $document_root $request_filename $status`
-`$body_bytes_sent $request_time $connection $connection_requests $msec $time_iso8601`, `$1`..`$9` from regex
+`$body_bytes_sent $request_time $connection $connection_requests $msec $time_iso8601 $binary_remote_addr $remote_net`
+`$limit_req_status $limit_conn_status`, `$1`..`$9` from regex
 locations, and the prefix families `$http_*`, `$sent_http_*`, `$arg_*` and `$cookie_*`.
 
 TLS variables: `$ssl_protocol $ssl_server_name $ssl_client_verify` (`SUCCESS`, `FAILED:reason`, `NONE`) and, when a
@@ -236,6 +274,8 @@ through without buffering (nginx's `proxy_buffering off`), and are flushed whene
 - Session resumption is off where client certificates are requested. A resumed session would skip, or only partly redo, the check.
 - The connection's TLS identity can only be set by the core (`ConnectionInfo.SetTls` is internal).
 
+**Rate limits.** Zones are bounded by bytes, not entries, so a key built from client input can't exhaust memory. `$remote_net` keys IPv6 clients by /64. A `limit_conn` slot is released however the request ends, including resets mid-tunnel.
+
 **Sockets.**
 - Regexes use the linear-time `NonBacktracking` engine where possible. Otherwise they run with a 50 ms match timeout.
 - On Unix only `SO_REUSEADDR` is set (restarts over TIME_WAIT). .NET's `ReuseAddress` would also set `SO_REUSEPORT`, letting any same-user process silently share the port and take some of its connections. That's opt-in per socket via `listen ... reuseport`.
@@ -294,6 +334,8 @@ Then add it to the list in `src/Httpgrl/Program.cs`. There is no reflection and 
   - `UpgradeAsync(idleTimeout)`: send a `101` and get the raw duplex stream back. Bytes the client already pipelined are included. The timeout is idleness across both directions.
   - `HasErrorPage(code)`, and `inv.ReadFile(...)` for config-time files (modules have no filesystem access of their own).
 - **Lifetime:** a module instance belongs to one loaded configuration. Every reload builds fresh instances from the list in `Program.cs`, so per-configuration state can live in fields. If a module implements `IDisposable`, it is disposed once the configuration it belongs to has been replaced *and* its last connection has ended (the proxy closes its upstream pools this way).
+- **Request end:** `ctx.OnRequestEnd(callback, state)` runs exactly once when the request is over, whether it completed or the connection broke mid-request. Use it to release per-request reservations (`limit_conn` does).
+- **State across reloads:** `setup.Persistent(key, () => new T())` hands back the object the previous configuration stored under `key`, or makes a new one. Rate-limit zones use it so a `SIGHUP` doesn't reset everyone's counters. A failed reload never touches it, and keys the new configuration doesn't ask for are dropped.
 - **Header filters:** `setup.AddHeaderFilter(ctx => ...)` runs once per response just before its head is written, for handler, proxied and core-rendered responses alike (`add_header` is one).
 - **Variables:** register fixed ones in `Register` (`r.AddVariable`). Declare config-defined ones while parsing with `inv.AddVariable` (`set` and `map` do this). Uses resolve after parsing, so order in the file doesn't matter. `ctx.SetCaptures(match)` makes a regex match the source of `$1`..`$9`.
 - **Config time:** `DirectiveInvocation` has `Flag/Size/Millis/Int` parsers and `Compile` (for `$variables`). Throw `inv.Error("...")` for errors that report `file:line`.
@@ -306,7 +348,7 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 1. [x] **Reload without restart** (`SIGHUP`): re-read config and certificates; keep the old configuration if the new one fails; old connections finish on the old configuration.
 2. [x] **Revocation for client certificates** (`ssl_crl`): signed, unexpired CRLs for every CA in the chain.
 3. [x] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
-4. [ ] **Rate limiting**: `limit_req` and `limit_conn` zones.
+4. [x] **Rate limiting**: `limit_req` and `limit_conn` zones.
 5. [ ] **Hardening**: fuzzing the request, upstream-response and config parsers; long-running soak tests under load; CI on Windows and macOS.
 6. [ ] **Operations**: a status/metrics endpoint, `$request_id`, gzip/brotli (BCL `System.IO.Compression`), a systemd unit.
 7. [ ] **Proxy**: `proxy_redirect`, `proxy_buffering on`, variables in `proxy_pass`, runtime DNS re-resolution, active health checks.

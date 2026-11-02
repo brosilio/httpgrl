@@ -68,6 +68,12 @@ public abstract class HttpContext
     /// </summary>
     public abstract ValueTask<Stream> UpgradeAsync(int idleTimeoutMs);
 
+    /// <summary>
+    /// Run <paramref name="callback"/> when this request is over: after the log phase, or when the connection breaks
+    /// mid-request. Always exactly once. For releasing per-request reservations (e.g. limit_conn).
+    /// </summary>
+    public abstract void OnRequestEnd(Action<object?> callback, object? state);
+
     private Dictionary<object, object?>? _items;
     /// <summary>Scratch space for modules, keyed by a private object.</summary>
     public Dictionary<object, object?> Items => _items ??= new();
@@ -141,6 +147,26 @@ public sealed class ConnectionInfo(long id, EndPoint? remote, EndPoint? local, b
     public int Requests { get; private set; }
 
     public string RemoteAddress => Remote switch { IPEndPoint ip => ip.Address.ToString(), null => "", var e => e.ToString() ?? "" };
+
+    private string? _remoteNet;
+    /// <summary>
+    /// The client's network for per-client accounting: the IPv4 address, or the IPv6 /64 (one end-site, which can
+    /// rotate through 2^64 addresses). The same grouping the core's per-client connection cap uses.
+    /// </summary>
+    public string RemoteNet => _remoteNet ??= Remote switch
+    {
+        IPEndPoint { Address.AddressFamily: System.Net.Sockets.AddressFamily.InterNetworkV6 } ip when !ip.Address.IsIPv4MappedToIPv6 => Net64(ip.Address),
+        IPEndPoint ip => (ip.Address.IsIPv4MappedToIPv6 ? ip.Address.MapToIPv4() : ip.Address).ToString(),
+        _ => RemoteAddress,
+    };
+
+    private static string Net64(IPAddress a)
+    {
+        Span<byte> b = stackalloc byte[16];
+        a.TryWriteBytes(b, out _);
+        b[8..].Clear();
+        return new IPAddress(b).ToString() + "/64";
+    }
     public int RemotePort => Remote is IPEndPoint ip ? ip.Port : 0;
     public string LocalAddress => Local switch { IPEndPoint ip => ip.Address.ToString(), null => "", var e => e.ToString() ?? "" };
     public int LocalPort => Local is IPEndPoint ip ? ip.Port : 0;

@@ -362,6 +362,8 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         r.AddVariable("host", c => c.Request.Host.Length > 0 ? c.Request.Host : ((HttpContextImpl)c).ServerRt.PrimaryName);
         r.AddVariable("server_name", c => ((HttpContextImpl)c).ServerRt.PrimaryName);
         r.AddVariable("remote_addr", c => c.Connection.RemoteAddress);
+        r.AddVariable("binary_remote_addr", c => c.Connection.Remote is System.Net.IPEndPoint ip ? System.Text.Encoding.Latin1.GetString(ip.Address.GetAddressBytes()) : "");
+        r.AddVariable("remote_net", c => c.Connection.RemoteNet);
         r.AddVariable("remote_port", c => c.Connection.RemotePort.ToString(System.Globalization.CultureInfo.InvariantCulture));
         r.AddVariable("server_addr", c => c.Connection.LocalAddress);
         r.AddVariable("server_port", c => c.Connection.LocalPort.ToString(System.Globalization.CultureInfo.InvariantCulture));

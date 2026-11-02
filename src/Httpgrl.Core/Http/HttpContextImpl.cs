@@ -189,6 +189,23 @@ internal sealed class HttpContextImpl : HttpContext
 
     public override void SetCaptures(Match match) => LocMatch = match;
 
+    private List<(Action<object?> Callback, object? State)>? _onEnd;
+
+    public override void OnRequestEnd(Action<object?> callback, object? state) => (_onEnd ??= new()).Add((callback, state));
+
+    /// <summary>Run and clear the request-end callbacks. Safe to call more than once.</summary>
+    public void EndRequest()
+    {
+        var list = _onEnd;
+        if (list is null || list.Count == 0) return;
+        for (int i = 0; i < list.Count; i++)
+        {
+            try { list[i].Callback(list[i].State); }
+            catch (Exception e) { Log.Error("request-end callback failed", new("error", e.GetType().Name), new("detail", e.Message)); }
+        }
+        list.Clear();
+    }
+
     public override string? Capture(int n)
     {
         var m = LocMatch;

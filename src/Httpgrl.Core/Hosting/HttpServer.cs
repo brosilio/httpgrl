@@ -12,7 +12,7 @@ namespace Httpgrl.Core.Hosting;
 /// </summary>
 public sealed class HttpServer : IAsyncDisposable
 {
-    private readonly Func<HttpRuntime> _load;
+    private readonly Func<IReadOnlyDictionary<string, object>, HttpRuntime> _load;
     private readonly Logging.JsonLogger _log;
     private HttpRuntime _rt = null!;
     private ConnectionManager _mgr = null!;
@@ -30,11 +30,11 @@ public sealed class HttpServer : IAsyncDisposable
         public sealed record State(ListenBinding Binding, HttpRuntime Rt);
     }
 
-    internal HttpServer(Func<HttpRuntime> load, Logging.JsonLogger log)
+    internal HttpServer(Func<IReadOnlyDictionary<string, object>, HttpRuntime> load, Logging.JsonLogger log)
     {
         _load = load;
         _log = log;
-        _rt = load(); // configuration errors surface here, before anything is bound
+        _rt = load(new Dictionary<string, object>()); // configuration errors surface here, before anything is bound
     }
 
     /// <summary>Actual bound endpoints (port 0 resolved), in binding order.</summary>
@@ -61,14 +61,14 @@ public sealed class HttpServer : IAsyncDisposable
     /// </summary>
     public Task<bool> ReloadAsync() => ReloadAsync(_load);
 
-    internal async Task<bool> ReloadAsync(Func<HttpRuntime> load)
+    internal async Task<bool> ReloadAsync(Func<IReadOnlyDictionary<string, object>, HttpRuntime> load)
     {
         await _reloadLock.WaitAsync().ConfigureAwait(false);
         try
         {
             if (_stopping) return false;
             HttpRuntime next;
-            try { next = load(); }
+            try { next = load(_rt.Persistent); }
             catch (Exception e) when (e is ConfigException or InvalidOperationException or IOException)
             {
                 var at = (e as ConfigException)?.Where?.ToString();

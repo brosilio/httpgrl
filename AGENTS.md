@@ -72,7 +72,9 @@ These are deliberate design decisions made by the project owner, not accidents t
 `SIGHUP` builds a complete new configuration (fresh module instances) and swaps it in only if *everything*
 succeeded, including binding new listeners. Keep it that way: building a configuration must have no side
 effects on the running one (no logger level changes, no global state), and module state belongs to the
-module instance. Resources that must be closed go in `IDisposable.Dispose` on the module, which runs when
+module instance, except state deliberately carried over with `IModuleSetup.Persistent` (rate-limit zones).
+That is the only sanctioned way to keep state across a reload: a build may *adopt* the previous object, never
+mutate the running configuration. Resources that must be closed go in `IDisposable.Dispose` on the module, which runs when
 the old configuration's last connection ends. No connection outlives its configuration by more than
 `reload_drain_timeout` (enforced by the sweeper), so a reload that rotates certificates or revokes access
 actually takes effect.

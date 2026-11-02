@@ -150,6 +150,7 @@ internal sealed class Http1Session
                 keepaliveMs = ctx.Loc.Core.KeepaliveTimeoutMs;
 
                 await _rt.Pipeline.RunLogAsync(ctx).ConfigureAwait(false);
+                ctx.EndRequest();
 
                 if (!reusable || keepaliveMs <= 0 || _rt.Retired)
                 {
@@ -173,6 +174,7 @@ internal sealed class Http1Session
         }
         finally
         {
+            ctx?.EndRequest(); // a request cut short still releases what it reserved
             ctx?.Resp.ReturnBuffer();
             input.Dispose();
             _mgr.Release(_conn);

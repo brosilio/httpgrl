@@ -16,17 +16,18 @@ public static class ServerBuilder
     {
         var full = Path.GetFullPath(configPath);
         var prefix = Path.GetDirectoryName(full)!;
-        return new HttpServer(() => Build(modules(), log, prefix, p => p.ParseFile(full)), log);
+        return new HttpServer(prev => Build(modules(), log, prefix, p => p.ParseFile(full), prev), log);
     }
 
     public static HttpServer LoadText(string text, string prefix, Func<IModule[]> modules, JsonLogger log) =>
-        new(() => BuildText(text, prefix, modules(), log), log);
+        new(prev => BuildText(text, prefix, modules(), log, prev), log);
 
-    internal static HttpRuntime BuildText(string text, string prefix, IEnumerable<IModule> modules, JsonLogger log) =>
-        Build(modules, log, prefix, p => p.ParseText(text, Path.Combine(prefix, "<inline>"), prefix));
+    internal static HttpRuntime BuildText(string text, string prefix, IEnumerable<IModule> modules, JsonLogger log, IReadOnlyDictionary<string, object> previous) =>
+        Build(modules, log, prefix, p => p.ParseText(text, Path.Combine(prefix, "<inline>"), prefix), previous);
 
     /// <summary>Everything a running server needs. Side-effect free: a failed build (e.g. on reload) changes nothing.</summary>
-    private static HttpRuntime Build(IEnumerable<IModule> extra, JsonLogger log, string prefix, Func<ConfigParser, ConfigScope> parse)
+    private static HttpRuntime Build(IEnumerable<IModule> extra, JsonLogger log, string prefix, Func<ConfigParser, ConfigScope> parse,
+        IReadOnlyDictionary<string, object> previous)
     {
         IModule[] modules = [new HttpCoreModule(prefix), new SslModule(), new AccessLogModule(), .. extra];
 
@@ -43,7 +44,7 @@ public static class ServerBuilder
 
         var main = root.Get<MainConf>();
 
-        var setup = new Setup(root, log);
+        var setup = new Setup(root, log, previous);
         foreach (var m in modules) m.Configure(setup);
 
         var bindings = RoutingBuilder.Build(root, log);
@@ -59,6 +60,7 @@ public static class ServerBuilder
             Main = main,
             Events = events,
             Modules = modules,
+            Persistent = setup.Persisted,
         };
         return rt;
     }
@@ -86,8 +88,19 @@ public static class ServerBuilder
         public void AddVariablePrefix(string prefix, PrefixVariableGetter getter) => Vars.AddPrefix(prefix, getter);
     }
 
-    private sealed class Setup(ConfigScope root, ILogger log) : IModuleSetup
+    private sealed class Setup(ConfigScope root, ILogger log, IReadOnlyDictionary<string, object> previous) : IModuleSetup
     {
+        public readonly Dictionary<string, object> Persisted = new(StringComparer.Ordinal);
+
+        public T Persistent<T>(string key, Func<T> create) where T : class
+        {
+            if (Persisted.TryGetValue(key, out var mine))
+                return mine as T ?? throw new InvalidOperationException($"persistent key \"{key}\" requested with two types");
+            var v = previous.TryGetValue(key, out var old) && old is T t ? t : create();
+            Persisted[key] = v;
+            return v;
+        }
+
         private readonly List<(Phase Phase, int Order, int Seq, HttpHandler Handler)> _handlers = new();
 
         public IConfigScope Root => root;

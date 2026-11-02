@@ -267,6 +267,8 @@ internal sealed class HttpRuntime
     public required MainConf Main { get; init; }
     public required EventsConf Events { get; init; }
     public required IModule[] Modules { get; init; }
+    /// <summary>State handed to the next configuration on reload (see IModuleSetup.Persistent).</summary>
+    public required IReadOnlyDictionary<string, object> Persistent { get; init; }
 
     // ---- configuration generations (reload) ----
     // Every connection holds its generation for its whole life. A replaced generation is retired: its idle

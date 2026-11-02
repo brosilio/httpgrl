@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Httpgrl.Modules.Limits</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Modules see only the plugin API, never the engine. -->
+    <ProjectReference Include="../Httpgrl.Abstractions/Httpgrl.Abstractions.csproj" />
+    <InternalsVisibleTo Include="Httpgrl.Tests" />
+  </ItemGroup>
+</Project>

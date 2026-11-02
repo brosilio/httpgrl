@@ -22,6 +22,7 @@
     <ProjectReference Include="../Httpgrl.Modules.StaticFiles/Httpgrl.Modules.StaticFiles.csproj" />
     <ProjectReference Include="../Httpgrl.Modules.Rewrite/Httpgrl.Modules.Rewrite.csproj" />
     <ProjectReference Include="../Httpgrl.Modules.Headers/Httpgrl.Modules.Headers.csproj" />
+    <ProjectReference Include="../Httpgrl.Modules.Limits/Httpgrl.Modules.Limits.csproj" />
     <ProjectReference Include="../Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj" />
   </ItemGroup>
 </Project>

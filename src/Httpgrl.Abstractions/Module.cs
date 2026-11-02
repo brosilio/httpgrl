@@ -38,6 +38,13 @@ public interface IModuleSetup
     /// core-rendered responses alike; not for 444, which has no head). Lower <paramref name="order"/> runs first.
     /// </summary>
     void AddHeaderFilter(HeaderFilter filter, int order);
+    /// <summary>
+    /// State that outlives a reload (rate-limit zones and the like): returns the object stored under
+    /// <paramref name="key"/> by the configuration being replaced, if there is one of type <typeparamref name="T"/>,
+    /// else <paramref name="create"/>()'s result. Keys a new configuration doesn't ask for are dropped with the old
+    /// configuration. Treat what you get as live: the running configuration is using it concurrently.
+    /// </summary>
+    T Persistent<T>(string key, Func<T> create) where T : class;
 }
 
 /// <summary>Last chance to edit <c>ctx.Response.Status</c>-dependent headers. Synchronous: no I/O here.</summary>

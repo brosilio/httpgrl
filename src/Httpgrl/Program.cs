@@ -10,6 +10,8 @@ static IModule[] Modules() =>
     new Httpgrl.Modules.Rewrite.RewriteModule(),
     new Httpgrl.Modules.Rewrite.MapModule(),
     new Httpgrl.Modules.Headers.HeadersModule(),
+    new Httpgrl.Modules.Limits.LimitReqModule(),
+    new Httpgrl.Modules.Limits.LimitConnModule(),
     new Httpgrl.Modules.Proxy.ProxyModule(),
     .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(),
 ];
