@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Dependency-free test runner. Run: dotnet run -c Release (from this dir). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- The suite also publishes as native AOT, so the engine is tested exactly as it ships. -->
+    <IsAotCompatible>true</IsAotCompatible>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Httpgrl.Core/Httpgrl.Core.csproj" />
+    <ProjectReference Include="../../src/Httpgrl.Modules.StaticFiles/Httpgrl.Modules.StaticFiles.csproj" />
+    <ProjectReference Include="../../src/Httpgrl.Modules.Rewrite/Httpgrl.Modules.Rewrite.csproj" />
+    <ProjectReference Include="../../src/Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj" />
+  </ItemGroup>
+</Project>

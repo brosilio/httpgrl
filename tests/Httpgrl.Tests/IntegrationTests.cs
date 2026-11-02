@@ -1,0 +1,537 @@
+using System.Diagnostics;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using static Httpgrl.Tests.Client;
+
+namespace Httpgrl.Tests;
+
+internal static class IntegrationTests
+{
+    private const string Base = """
+        error_log stdout debug;
+        http {
+            include mime.types;
+            default_type application/octet-stream;
+            server {
+                listen 127.0.0.1:0;
+                root {DIR}/www;
+                location /list/ { autoindex on; }
+                location /listjson/ { autoindex on; autoindex_format json; alias {DIR}/www/list/; }
+                location /img { alias {DIR}/www/images/; }
+                location /spa/ { try_files $uri $uri/ /spa/index.html; }
+                location /strict/ { try_files $uri =404; }
+                location /named/ { try_files $uri @fallback; }
+                location @fallback { root {DIR}/fallback; try_files /fb.txt =500; }
+                location = /custom404.html { internal; }
+                location /errs/ { error_page 404 /custom404.html; }
+                location /errs2/ { error_page 404 =200 /custom404.html; }
+                location ~ \.secret$ { internal; }
+            }
+        }
+        """;
+
+    private static void Populate(string dir)
+    {
+        var www = Path.Combine(dir, "www");
+        Directory.CreateDirectory(Path.Combine(www, "list", "sub"));
+        Directory.CreateDirectory(Path.Combine(www, "images"));
+        Directory.CreateDirectory(Path.Combine(www, "spa"));
+        Directory.CreateDirectory(Path.Combine(www, "dir"));
+        Directory.CreateDirectory(Path.Combine(dir, "fallback"));
+        File.WriteAllText(Path.Combine(www, "index.html"), "<h1>root index</h1>");
+        File.WriteAllText(Path.Combine(www, "hello.txt"), "hello world");
+        File.WriteAllText(Path.Combine(www, "custom404.html"), "custom not found");
+        File.WriteAllText(Path.Combine(www, "x.secret"), "TOP SECRET");
+        File.WriteAllText(Path.Combine(www, "list", "a.txt"), "a");
+        File.WriteAllText(Path.Combine(www, "list", ".hidden"), "h");
+        if (!OperatingSystem.IsWindows()) File.WriteAllText(Path.Combine(www, "list", "<script>x\".txt"), "x");
+        File.WriteAllText(Path.Combine(www, "images", "cat.png"), "PNG");
+        File.WriteAllText(Path.Combine(www, "spa", "index.html"), "spa shell");
+        File.WriteAllText(Path.Combine(www, "imagessecret.txt"), "should not leak");
+        File.WriteAllText(Path.Combine(dir, "fallback", "fb.txt"), "fallback body");
+        File.WriteAllText(Path.Combine(dir, "mime.types"), "types { text/html html; text/plain txt; image/png png; }");
+        File.WriteAllBytes(Path.Combine(www, "big.bin"), RandomNumberGenerator.GetBytes(3 << 20));
+    }
+
+    private static string Get(string path, string extra = "") => $"GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{extra}\r\n";
+
+    public static void Register()
+    {
+        T.Add("http: static file, HEAD, content type", async () =>
+        {
+            await using var s = TestServer.Start(Base, Populate);
+            var r = await s.Raw(Get("/hello.txt"));
+            T.Eq(200, Status(r));
+            T.Eq("hello world", Body(r));
+            T.Eq("text/plain", Header(r, "Content-Type"));
+            T.Eq("11", Header(r, "Content-Length"));
+            T.True(Header(r, "ETag") is not null && Header(r, "Date") is not null);
+            r = await s.Raw($"HEAD /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+            T.Eq(200, Status(r));
+            T.Eq("11", Header(r, "Content-Length"));
+            T.Eq("", Body(r));
+        });
+
+        T.Add("http: large file is byte-exact", async () =>
+        {
+            await using var s = TestServer.Start(Base, Populate);
+            using var http = new HttpClient();
+            var bytes = await http.GetByteArrayAsync($"http://127.0.0.1:{s.Port}/big.bin");
+            T.True(bytes.AsSpan().SequenceEqual(File.ReadAllBytes(Path.Combine(s.Dir, "www", "big.bin"))));
+        });
+
+        T.Add("http: conditional GET and ranges", async () =>
+        {
+            await using var s = TestServer.Start(Base, Populate);
+            var r = await s.Raw(Get("/hello.txt"));
+            var etag = Header(r, "ETag")!;
+            var lm = Header(r, "Last-Modified")!;
+            T.Eq(304, Status(await s.Raw(Get("/hello.txt", $"If-None-Match: {etag}\r\n"))));
+            T.Eq(304, Status(await s.Raw(Get("/hello.txt", $"If-None-Match: \"x\", W/{etag}\r\n"))));
+            T.Eq(200, Status(await s.Raw(Get("/hello.txt", "If-None-Match: \"nope\"\r\n"))));
+            T.Eq(304, Status(await s.Raw(Get("/hello.txt", $"If-Modified-Since: {lm}\r\n"))));
+            r = await s.Raw(Get("/hello.txt", "Range: bytes=6-\r\n"));
+            T.Eq(206, Status(r));
+            T.Eq("world", Body(r));
+            T.Eq("bytes 6-10/11", Header(r, "Content-Range"));
+            r = await s.Raw(Get("/hello.txt", "Range: bytes=50-\r\n"));
+            T.Eq(416, Status(r));
+            T.Eq("bytes */11", Header(r, "Content-Range"));
+            T.Eq(200, Status(await s.Raw(Get("/hello.txt", "Range: bytes=0-1\r\nIf-Range: \"stale\"\r\n"))));
+        });
+
+        T.Add("http: index, directory redirect, autoindex", async () =>
+        {
+            await using var s = TestServer.Start(Base, Populate);
+            var r = await s.Raw(Get("/"));
+            T.Eq(200, Status(r));
+            T.Eq("<h1>root index</h1>", Body(r));
+            r = await s.Raw(Get("/dir?x=1"));
+            T.Eq(301, Status(r));
+            T.Eq("/dir/?x=1", Header(r, "Location"));
+            T.Eq(403, Status(await s.Raw(Get("/dir/"))));
+            T.Eq(404, Status(await s.Raw(Get("/missing/"))));
+            r = await s.Raw(Get("/list/"));
+            T.Eq(200, Status(r));
+            T.Contains("<a href=\"./a.txt\">a.txt</a>", r);
+            T.Contains("<a href=\"./sub/\">sub/</a>", r);
+            T.NotContains(".hidden", r);
+            if (!OperatingSystem.IsWindows())
+            {
+                T.NotContains("<script>", Body(r));
+                T.Contains("&lt;script&gt;x&quot;.txt", r);
+                T.Contains("href=\"./%3Cscript%3Ex%22.txt\"", r);
+            }
+            r = await s.Raw(Get("/listjson/"));
+            T.Eq("application/json", Header(r, "Content-Type"));
+            using var doc = System.Text.Json.JsonDocument.Parse(Body(r));
+            T.Eq("sub", doc.RootElement[0].GetProperty("name").GetString());
+            T.Eq("directory", doc.RootElement[0].GetProperty("type").GetString());
+        });
+
+        T.Add("security: traversal and alias off-by-slash", async () =>
+        {
+            await using var s = TestServer.Start(Base, Populate);
+            T.Eq(400, Status(await s.Raw(Get("/../../etc/passwd"))));
+            T.Eq(400, Status(await s.Raw(Get("/%2e%2e/%2e%2e/etc/passwd"))));
+            T.Eq(400, Status(await s.Raw(Get("/a/..%2f..%2f..%2fetc/passwd"))));
+            T.Eq("PNG", Body(await s.Raw(Get("/img/cat.png"))));
+            // Classic nginx alias bug: "location /img { alias .../images/; }" + "/img../x" escapes the alias dir.
+            var r = await s.Raw(Get("/img../imagessecret.txt"));
+            T.NotContains("should not leak", r);
+            T.Eq(404, Status(r));
+            r = await s.Raw(Get("/x.secret"));
+            T.Eq(404, Status(r));
+            T.NotContains("TOP SECRET", r);
+        });
+
+        T.Add("security: FIFO in the web root neither hangs nor serves", async () =>
+        {
+            if (OperatingSystem.IsWindows()) return;
+            await using var s = TestServer.Start(Base, d =>
+            {
+                Populate(d);
+                using var p = Process.Start("mkfifo", Path.Combine(d, "www", "pipe"))!;
+                p.WaitForExit();
+            });
+            var sw = Stopwatch.StartNew();
+            T.Eq(403, Status(await s.Raw(Get("/pipe"), 3000)));
+            T.True(sw.ElapsedMilliseconds < 1000);
+        });
+
+        T.Add("http: try_files, named location, error_page", async () =>
+        {
+            await using var s = TestServer.Start(Base, Populate);
+            T.Eq("spa shell", Body(await s.Raw(Get("/spa/some/client/route"))));
+            T.Eq(404, Status(await s.Raw(Get("/strict/nothing"))));
+            T.Eq("fallback body", Body(await s.Raw(Get("/named/nothing"))));
+            var r = await s.Raw(Get("/errs/nothing"));
+            T.Eq(404, Status(r));
+            T.Eq("custom not found", Body(r));
+            r = await s.Raw(Get("/errs2/nothing"));
+            T.Eq(200, Status(r));
+            T.Eq(404, Status(await s.Raw(Get("/custom404.html"))));
+            r = await s.Raw("POST /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc");
+            T.Eq(405, Status(r));
+            T.Eq("GET, HEAD", Header(r, "Allow"));
+        });
+
+        T.Add("http: Server header and error-page product name are off unless server_tokens on", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http {
+                  server { listen 127.0.0.1:0; root {DIR}; location /on/ { server_tokens on; } }
+                }
+                """, d => { Directory.CreateDirectory(Path.Combine(d, "on")); File.WriteAllText(Path.Combine(d, "f.txt"), "f"); File.WriteAllText(Path.Combine(d, "on", "f.txt"), "f"); });
+            var r = await s.Raw(Get("/f.txt"));
+            T.Eq(null, Header(r, "Server"));
+            r = await s.Raw(Get("/missing"));
+            T.Eq(404, Status(r));
+            T.Eq(null, Header(r, "Server"));
+            T.NotContains("httpgrl", Body(r));
+            r = await s.Raw(Get("/on/f.txt"));
+            T.Eq("httpgrl/" + Httpgrl.Core.Http.ServerInfo.Version, Header(r, "Server"));
+            T.Contains("<center>httpgrl</center>", Body(await s.Raw(Get("/on/missing"))));
+        });
+
+        T.Add("sockets: a port is shared only when every listener opts into reuseport", async () =>
+        {
+            if (OperatingSystem.IsWindows()) return;
+            await using var a = TestServer.Start("http { server { listen 127.0.0.1:0 reuseport; root {DIR}; } }");
+            int port = a.Port;
+            // Same port, also reuseport: allowed (multi-process / zero-downtime restarts).
+            await using var b = TestServer.Start($"http {{ server {{ listen 127.0.0.1:{port} reuseport; root {{DIR}}; }} }}");
+            T.Eq(port, b.Port);
+            // Without the flag the port is exclusive: a stray instance fails loudly instead of stealing traffic.
+            var e = T.Throws<IOException>(() => TestServer.Start($"http {{ server {{ listen 127.0.0.1:{port}; root {{DIR}}; }} }}"));
+            T.Contains("in use", e.Message);
+        });
+
+        T.Add("return: status, text, redirects, header-injection safe", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { default_type text/plain; server { listen 127.0.0.1:0; root {DIR};
+                    location /gone { return 410; }
+                    location /hello { return 200 "hi $uri"; }
+                    location /moved { return 301 https://example.test$request_uri; }
+                    location /bare { return https://example.test/x; }
+                    location /decoded { return 302 /to$uri; }
+                    location /nf { error_page 404 /page.txt; return 404; }
+                } }
+                """, d => File.WriteAllText(Path.Combine(d, "page.txt"), "custom"));
+            T.Eq(410, Status(await s.Raw(Get("/gone"))));
+            var r = await s.Raw(Get("/hello/x"));
+            T.Eq(200, Status(r));
+            T.Eq("hi /hello/x", Body(r));
+            T.Eq("text/plain", Header(r, "Content-Type"));
+            r = await s.Raw(Get("/moved/a?b=c"));
+            T.Eq(301, Status(r));
+            T.Eq("https://example.test/moved/a?b=c", Header(r, "Location"));
+            r = await s.Raw(Get("/bare"));
+            T.Eq(302, Status(r));
+            T.Eq("https://example.test/x", Header(r, "Location"));
+            // %0d%0a decodes into $uri; it must come back out encoded, never as a header break.
+            r = await s.Raw(Get("/decoded%0d%0aSet-Cookie:%20pwned=1"));
+            T.Eq(302, Status(r));
+            T.Eq(null, Header(r, "Set-Cookie"));
+            T.Eq("/to/decoded%0D%0ASet-Cookie:%20pwned=1", Header(r, "Location"));
+            r = await s.Raw(Get("/nf"));
+            T.Eq(404, Status(r));
+            T.Eq("custom", Body(r));
+        });
+
+        T.Add("return 444 and error_page =444 drop the connection without a byte", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR};
+                    error_page 400 =444;
+                    location /drop { return 444; }
+                    location /quiet/ { error_page 400 401 402 403 404 =444; }
+                    location /idiom/ { error_page 404 = @drop; }
+                    location @drop { return 444; }
+                } }
+                """, d => { Directory.CreateDirectory(Path.Combine(d, "quiet")); File.WriteAllText(Path.Combine(d, "quiet", "ok.txt"), "ok"); });
+            static void Dropped(string r) => T.True(r is "" or "<<RESET>>");
+            Dropped(await s.Raw(Get("/drop")));
+            Dropped(await s.Raw(Get("/quiet/missing")));
+            T.Eq("ok", Body(await s.Raw(Get("/quiet/ok.txt"))));
+            Dropped(await s.Raw(Get("/idiom/missing")));
+            Dropped(await s.Raw("GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n")); // malformed: server-level 400 =444
+            T.Eq(404, Status(await s.Raw(Get("/other")))); // drops are opt-in per code
+            T.Contains("\"status\":444", s.LogText());
+        });
+
+        T.Add("http: virtual hosts by Host header", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http {
+                  server { listen 127.0.0.1:0; server_name a.test; root {DIR}/a; }
+                  server { listen 127.0.0.1:0; server_name *.b.test; root {DIR}/b; }
+                }
+                """, d =>
+            {
+                Directory.CreateDirectory(Path.Combine(d, "a"));
+                Directory.CreateDirectory(Path.Combine(d, "b"));
+                File.WriteAllText(Path.Combine(d, "a", "w.txt"), "A");
+                File.WriteAllText(Path.Combine(d, "b", "w.txt"), "B");
+            });
+            T.Eq("A", Body(await s.Raw("GET /w.txt HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n")));
+            T.Eq("B", Body(await s.Raw("GET /w.txt HTTP/1.1\r\nHost: x.b.test:8080\r\nConnection: close\r\n\r\n")));
+            T.Eq("A", Body(await s.Raw("GET /w.txt HTTP/1.1\r\nHost: other\r\nConnection: close\r\n\r\n")));
+        });
+
+        T.Add("http: keep-alive, pipelining, chunked body drained", async () =>
+        {
+            await using var s = TestServer.Start(Base, Populate);
+            using var c = await Connect(s.Port);
+            await c.SendAsync(Encoding.ASCII.GetBytes("GET /hello.txt HTTP/1.1\r\nHost: t\r\n\r\n"));
+            T.Eq("hello world", Body(await ReadOne(c)));
+            // Two pipelined requests in one segment, the first carrying a chunked body nobody reads.
+            await c.SendAsync(Encoding.ASCII.GetBytes(
+                "GET /hello.txt HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n" +
+                "GET /index.html HTTP/1.1\r\nHost: t\r\n\r\n"));
+            T.Eq("hello world", Body(await ReadOne(c)));
+            T.Eq("<h1>root index</h1>", Body(await ReadOne(c)));
+            // HTTP/1.0 defaults to close.
+            var r = await s.Raw("GET /hello.txt HTTP/1.0\r\n\r\n");
+            T.Eq("close", Header(r, "Connection"));
+        });
+
+        T.Add("limits: oversized URI and headers", async () =>
+        {
+            await using var s = TestServer.Start(Base.Replace("http {", "http {\n large_client_header_buffers 2 1k;"), Populate);
+            T.Eq(414, Status(await s.Raw(Get("/" + new string('a', 2000)))));
+            T.Eq(431, Status(await s.Raw(Get("/", "X-Big: " + new string('b', 1500) + "\r\n"))));
+            var many = new StringBuilder();
+            for (int i = 0; i < 101; i++) many.Append($"X-{i}: v\r\n");
+            T.Eq(431, Status(await s.Raw(Get("/", many.ToString()))));
+
+        });
+
+        T.Add("dos: slow-loris header trickle is cut at client_header_timeout", async () =>
+        {
+            await using var s = TestServer.Start(Base.Replace("http {", "http {\n client_header_timeout 1s;"), Populate);
+            using var c = await Connect(s.Port);
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                // One byte every 50 ms: each read makes progress, but the head as a whole never completes in time.
+                foreach (var ch in "GET / HTTP/1.1\r\nHost: t\r\nX-a: " + new string('a', 200))
+                {
+                    await c.SendAsync(new[] { (byte)ch });
+                    await Task.Delay(50);
+                }
+            }
+            catch (SocketException) { }
+            var tail = await ReadToClose(c, 1000);
+            T.NotContains("<<TIMEOUT>>", tail);
+            T.True(sw.ElapsedMilliseconds < 3500);
+            T.Contains("request header timeout", s.LogText());
+        });
+
+        T.Add("dos: idle connection without a request is cut", async () =>
+        {
+            await using var s = TestServer.Start(Base.Replace("http {", "http {\n client_header_timeout 1s;"), Populate);
+            using var c = await Connect(s.Port);
+            var sw = Stopwatch.StartNew();
+            var r = await ReadToClose(c, 4000);
+            T.NotContains("<<TIMEOUT>>", r);
+            T.True(sw.ElapsedMilliseconds < 2500);
+        });
+
+        T.Add("dos: stalled request body is cut at client_body_timeout", async () =>
+        {
+            await using var s = TestServer.Start(Base.Replace("http {", "http {\n client_body_timeout 1s;"), Populate);
+            using var c = await Connect(s.Port);
+            await c.SendAsync(Encoding.ASCII.GetBytes("GET /hello.txt HTTP/1.1\r\nHost: t\r\nContent-Length: 1000\r\n\r\nabc"));
+            var sw = Stopwatch.StartNew();
+            var r = await ReadToClose(c, 5000);
+            T.Eq(200, Status(r)); // response goes out; draining the unread body then times out
+            T.NotContains("<<TIMEOUT>>", r);
+            T.True(sw.ElapsedMilliseconds < 3000);
+        });
+
+        T.Add("dos: per-client connection cap", async () =>
+        {
+            await using var s = TestServer.Start(Base.Replace("http {", "events { connections_per_client 3; }\nhttp {"), Populate);
+            var held = new List<Socket>();
+            for (int i = 0; i < 3; i++) held.Add(await Connect(s.Port));
+            await Task.Delay(100);
+            using var extra = await Connect(s.Port);
+            var r = await ReadToClose(extra, 2000);
+            T.True(r.Length == 0 || r.Contains("<<RESET>>"));
+            foreach (var h in held) h.Dispose();
+            await Task.Delay(100);
+            T.Eq(200, Status(await s.Raw(Get("/hello.txt"))));
+        });
+
+        T.Add("dos: full table evicts idle keep-alive connections", async () =>
+        {
+            await using var s = TestServer.Start(Base.Replace("http {", "events { worker_connections 16; connections_per_client 0; }\nhttp {"), Populate);
+            var idle = new List<Socket>();
+            for (int i = 0; i < 16; i++)
+            {
+                var c = await Connect(s.Port);
+                await c.SendAsync(Encoding.ASCII.GetBytes("GET /hello.txt HTTP/1.1\r\nHost: t\r\n\r\n"));
+                await ReadOne(c);
+                idle.Add(c);
+            }
+            T.Eq(200, Status(await s.Raw(Get("/hello.txt"))));
+            foreach (var c in idle) c.Dispose();
+        });
+
+        T.Add("api: upgrade hands over the raw connection", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; location /ws { echo_upgrade; } } }
+                """, null, [new TestModule()]);
+            using var c = await Connect(s.Port);
+            // "early" is pipelined behind the head: it must reach the module through the upgraded stream.
+            await c.SendAsync(Encoding.ASCII.GetBytes("GET /ws HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\nearly"));
+            var head = new byte[4096];
+            var sb = new StringBuilder();
+            while (!sb.ToString().Contains("\r\n\r\nearly", StringComparison.Ordinal))
+            {
+                int n = await c.ReceiveAsync(head, SocketFlags.None);
+                if (n == 0) break;
+                sb.Append(Encoding.ASCII.GetString(head, 0, n));
+            }
+            var text = sb.ToString();
+            T.Eq(101, Status(text));
+            T.Eq("echo", Header(text, "Upgrade"));
+            T.Eq("Upgrade", Header(text, "Connection"));
+            T.True(Header(text, "Transfer-Encoding") is null && Header(text, "Content-Length") is null);
+            await c.SendAsync(Encoding.ASCII.GetBytes("ping"));
+            int got = await c.ReceiveAsync(head, SocketFlags.None);
+            T.Eq("ping", Encoding.ASCII.GetString(head, 0, got));
+        });
+
+        T.Add("http: request bodies: limits, chunked decoding, 100-continue", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { client_max_body_size 1k; server { listen 127.0.0.1:0; location /body { echo_body; } } }
+                """, null, [new TestModule()]);
+            var r = await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello");
+            T.Eq("5:hello", Body(r));
+            r = await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3;x=y\r\nabc\r\n2\r\nde\r\n0\r\nTrailer: v\r\n\r\n");
+            T.Eq("5:abcde", Body(r));
+            T.Eq(413, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 2048\r\n\r\n")));
+            T.Eq(413, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n" + new string('x', 2048) + "\r\n0\r\n\r\n")));
+            T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")));
+            T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n")));
+            using var c = await Connect(s.Port);
+            await c.SendAsync(Encoding.ASCII.GetBytes("POST /body HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\n"));
+            var buf = new byte[256];
+            int n = await c.ReceiveAsync(buf, SocketFlags.None);
+            T.Eq("HTTP/1.1 100 Continue\r\n\r\n", Encoding.ASCII.GetString(buf, 0, n));
+            await c.SendAsync(Encoding.ASCII.GetBytes("ok"));
+            T.Eq("2:ok", Body(await ReadOne(c)));
+        });
+
+        T.Add("tls: handshake, SNI certificate selection, HTTP over TLS", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http {
+                  server { listen 127.0.0.1:0 ssl; server_name one.test; ssl_certificate {DIR}/one.crt; ssl_certificate_key {DIR}/one.key; root {DIR}/one; }
+                  server { listen 127.0.0.1:0 ssl; server_name two.test; ssl_certificate {DIR}/two.crt; ssl_certificate_key {DIR}/two.key; root {DIR}/two; }
+                }
+                """, d =>
+            {
+                foreach (var n in new[] { "one", "two" })
+                {
+                    WriteCert(d, n);
+                    Directory.CreateDirectory(Path.Combine(d, n));
+                    File.WriteAllText(Path.Combine(d, n, "i.txt"), n);
+                }
+            });
+            foreach (var n in new[] { "one", "two" })
+            {
+                using var c = await Connect(s.Port);
+                await using var ssl = new SslStream(new NetworkStream(c, ownsSocket: false));
+                X509Certificate? seen = null;
+                await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                {
+                    TargetHost = n + ".test",
+                    RemoteCertificateValidationCallback = (_, cert, _, _) => { seen = cert; return true; },
+                });
+                T.Contains("CN=" + n + ".test", seen!.Subject);
+                await ssl.WriteAsync(Encoding.ASCII.GetBytes($"GET /i.txt HTTP/1.1\r\nHost: {n}.test\r\nConnection: close\r\n\r\n"));
+                var resp = await new StreamReader(ssl, Encoding.ASCII).ReadToEndAsync();
+                T.Eq(200, Status(resp));
+                T.Eq(n, Body(resp));
+            }
+            // Plain HTTP on a TLS port gets nowhere.
+            T.True(Status(await s.Raw(Get("/i.txt"), 3000)) == -1);
+        });
+
+        T.Add("logging: every line from a busy server is valid JSON", async () =>
+        {
+            await using var s = TestServer.Start(Base, Populate);
+            await s.Raw(Get("/hello.txt", "User-Agent: a\"b\\cÿ\r\nReferer: x\r\n"));
+            await s.Raw(Get("/nope"));
+            await s.Raw("garbage\r\n\r\n");
+            var lines = s.LogText().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            T.True(lines.Length >= 4);
+            foreach (var l in lines) using (System.Text.Json.JsonDocument.Parse(l)) { }
+            T.Contains("\"msg\":\"access\"", string.Join('\n', lines));
+        });
+    }
+
+    private static void WriteCert(string dir, string name)
+    {
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var req = new CertificateRequest("CN=" + name + ".test", key, HashAlgorithmName.SHA256);
+        var san = new SubjectAlternativeNameBuilder();
+        san.AddDnsName(name + ".test");
+        req.CertificateExtensions.Add(san.Build());
+        using var cert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
+        File.WriteAllText(Path.Combine(dir, name + ".crt"), cert.ExportCertificatePem());
+        File.WriteAllText(Path.Combine(dir, name + ".key"), key.ExportPkcs8PrivateKeyPem());
+    }
+}
+
+/// <summary>Test-only module: exercises the exclusive-handler, body and upgrade APIs the proxy module will build on.</summary>
+internal sealed class TestModule : IModule
+{
+    public string Name => "test";
+
+    public void Register(IModuleRegistry r)
+    {
+        r.AddDirective(new()
+        {
+            Name = "echo_upgrade", Contexts = [ContextKind.Location],
+            Handler = i => { var c = i.Conf<LocationHandlerConf>(); c.Handler = Handle; c.Owner = Name; },
+        });
+        r.AddDirective(new()
+        {
+            Name = "echo_body", Contexts = [ContextKind.Location],
+            Handler = i => { var c = i.Conf<LocationHandlerConf>(); c.Handler = EchoBody; c.Owner = Name; },
+        });
+    }
+
+    private static async ValueTask<HandlerResult> EchoBody(HttpContext ctx)
+    {
+        var ms = new MemoryStream();
+        await ctx.Request.Body.CopyToAsync(ms);
+        var body = Encoding.ASCII.GetBytes(ms.Length + ":" + Encoding.ASCII.GetString(ms.ToArray()));
+        ctx.Response.ContentLength = body.Length;
+        await ctx.Response.WriteAsync(body);
+        return HandlerResult.Done;
+    }
+
+    private static async ValueTask<HandlerResult> Handle(HttpContext ctx)
+    {
+        if (ctx.Request.Headers.Get("Upgrade") != "echo") return HandlerResult.WithStatus(426);
+        ctx.Response.Status = 101;
+        ctx.Response.Headers.Set("Connection", "Upgrade");
+        ctx.Response.Headers.Set("Upgrade", "echo");
+        var stream = await ctx.UpgradeAsync(5000);
+        var buf = new byte[1024];
+        int n;
+        while ((n = await stream.ReadAsync(buf)) > 0) await stream.WriteAsync(buf.AsMemory(0, n));
+        return HandlerResult.Done;
+    }
+}

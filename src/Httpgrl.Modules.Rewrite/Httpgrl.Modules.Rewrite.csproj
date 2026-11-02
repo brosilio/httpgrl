@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Httpgrl.Modules.Rewrite</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Modules see only the plugin API, never the engine. -->
+    <ProjectReference Include="../Httpgrl.Abstractions/Httpgrl.Abstractions.csproj" />
+  </ItemGroup>
+</Project>

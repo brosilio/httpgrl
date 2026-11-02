@@ -1,0 +1,528 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using static Httpgrl.Tests.Client;
+
+namespace Httpgrl.Tests;
+
+internal static class ProxyTests
+{
+    private static string Get(string path, string extra = "") => $"GET {path} HTTP/1.1\r\nHost: front.test\r\nConnection: close\r\n{extra}\r\n";
+
+    private static string Conf(string locations, string http = "") => $$"""
+        http { {{http}} server { listen 127.0.0.1:0; root {DIR}; {{locations}} } }
+        """;
+
+    public static void Register()
+    {
+        T.Add("proxy: basic pass-through to a real upstream (httpgrl static)", async () =>
+        {
+            await using var origin = TestServer.Start("http { server { listen 127.0.0.1:0; root {DIR}; } }",
+                d => File.WriteAllText(Path.Combine(d, "f.txt"), "from origin"));
+            await using var s = TestServer.Start(Conf($"location / {{ proxy_pass http://127.0.0.1:{origin.Port}; }}"));
+            var r = await s.Raw(Get("/f.txt"));
+            T.Eq(200, Status(r));
+            T.Eq("from origin", Body(r));
+            T.Eq("text/plain", Header(r, "Content-Type"));
+            T.Eq(null, Header(r, "Server"));
+            T.True(Header(r, "ETag") is not null);
+            T.Eq(404, Status(await s.Raw(Get("/missing"))));
+            T.Eq(304, Status(await s.Raw(Get("/f.txt", $"If-None-Match: {Header(r, "ETag")}\r\n"))));
+        });
+
+        T.Add("proxy: URI mapping (prefix replacement, normalized path, raw mode)", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($$"""
+                location /api/ { proxy_pass http://127.0.0.1:{{up.Port}}/v1/; }
+                location = /exact { proxy_pass http://127.0.0.1:{{up.Port}}/other; }
+                location /raw/ { proxy_pass http://127.0.0.1:{{up.Port}}; proxy_pass_raw_uri on; }
+                location / { proxy_pass http://127.0.0.1:{{up.Port}}; }
+                """));
+            T.Contains("GET /v1/users/7?x=1 HTTP/1.1", Body(await s.Raw(Get("/api/users/7?x=1"))));
+            T.Contains("GET /other HTTP/1.1", Body(await s.Raw(Get("/exact"))));
+            // The backend gets our canonical path, never the client's traversal or double-encoding tricks.
+            T.Contains("GET /b/sp%20ace HTTP/1.1", Body(await s.Raw(Get("/a/../b/./sp%20ace"))));
+            T.Contains("GET /x%25252e HTTP/1.1", Body(await s.Raw(Get("/x%25252e"))));
+            T.Contains("GET /raw/%7e/a//b HTTP/1.1", Body(await s.Raw(Get("/raw/%7e/a//b"))));
+        });
+
+        T.Add("proxy: request headers (Host, set/remove, hop-by-hop and Connection-listed stripped)", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($$"""
+                location /default/ { proxy_pass http://127.0.0.1:{{up.Port}}; }
+                location / {
+                    proxy_pass http://127.0.0.1:{{up.Port}};
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header Accept-Encoding "";
+                    proxy_set_header Connection "upgrade";
+                }
+                """));
+            var echo = Body(await s.Raw(Get("/default/x")));
+            T.Contains($"Host: 127.0.0.1:{up.Port}\r\n", echo);
+            echo = Body(await s.Raw("GET /x HTTP/1.1\r\nHost: front.test\r\nConnection: close, X-Secret\r\nX-Secret: s\r\n" +
+                "Proxy-Authorization: Basic eA==\r\nKeep-Alive: 5\r\nTE: trailers\r\nAccept-Encoding: gzip\r\nX-Forwarded-For: 10.0.0.1\r\nX-Keep: k\r\n\r\n"));
+            T.Contains("Host: front.test\r\n", echo);
+            T.Contains("X-Forwarded-For: 10.0.0.1, 127.0.0.1\r\n", echo);
+            T.Contains("X-Real-IP: 127.0.0.1\r\n", echo);
+            T.Contains("X-Keep: k\r\n", echo);
+            foreach (var gone in new[] { "X-Secret", "Proxy-Authorization", "Keep-Alive", "TE:", "Accept-Encoding", "Connection: upgrade" })
+                T.NotContains(gone, echo);
+        });
+
+        T.Add("proxy: request bodies (Content-Length, chunked, 100-continue)", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($"location / {{ proxy_pass http://127.0.0.1:{up.Port}; }}"));
+            var echo = Body(await s.Raw("POST /p HTTP/1.1\r\nHost: f\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello"));
+            T.Contains("Content-Length: 5\r\n", echo);
+            T.True(echo.EndsWith("\r\n\r\nhello", StringComparison.Ordinal));
+            echo = Body(await s.Raw("POST /p HTTP/1.1\r\nHost: f\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n"));
+            T.Contains("Transfer-Encoding: chunked\r\n", echo);
+            T.True(echo.EndsWith("\r\n\r\nabcdefg", StringComparison.Ordinal));
+            using var c = await Connect(s.Port);
+            await c.SendAsync(Encoding.ASCII.GetBytes("POST /p HTTP/1.1\r\nHost: f\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\n"));
+            var buf = new byte[64];
+            int n = await c.ReceiveAsync(buf, SocketFlags.None);
+            T.Eq("HTTP/1.1 100 Continue\r\n\r\n", Encoding.ASCII.GetString(buf, 0, n));
+            await c.SendAsync(Encoding.ASCII.GetBytes("ok"));
+            var resp = await ReadOne(c);
+            T.NotContains("Expect:", resp);
+            T.True(resp.EndsWith("\r\n\r\nok", StringComparison.Ordinal));
+        });
+
+        T.Add("proxy: chunked upstream body is streamed and flushed as it arrives", async () =>
+        {
+            await using var up = new FakeUpstream(async (st, rd) =>
+            {
+                await rd.ReadRequestAsync();
+                await st.WriteAsync("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nfirst\n\r\n"u8.ToArray());
+                await Task.Delay(1200);
+                await st.WriteAsync("7\r\nsecond\n\r\n0\r\n\r\n"u8.ToArray());
+            });
+            await using var s = TestServer.Start(Conf($"location / {{ proxy_pass http://127.0.0.1:{up.Port}; }}"));
+            using var c = await Connect(s.Port);
+            await c.SendAsync(Encoding.ASCII.GetBytes(Get("/events")));
+            var sw = Stopwatch.StartNew();
+            var sb = new StringBuilder();
+            var buf = new byte[4096];
+            while (!sb.ToString().Contains("first", StringComparison.Ordinal))
+                sb.Append(Encoding.ASCII.GetString(buf, 0, await c.ReceiveAsync(buf, SocketFlags.None)));
+            T.True(sw.ElapsedMilliseconds < 900); // not held back until the upstream finished
+            var all = sb + await ReadToClose(c, 5000);
+            T.Contains("second", all);
+            T.Contains("\r\n0\r\n\r\n", all);
+        });
+
+        T.Add("proxy: upstream keep-alive pool reuses connections", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($$"""
+                location /pool/ { proxy_pass http://u1; }
+                location /nopool/ { proxy_pass http://u2; }
+                """, $$"""
+                upstream u1 { server 127.0.0.1:{{up.Port}}; keepalive 8; }
+                upstream u2 { server 127.0.0.1:{{up.Port}}; keepalive 0; }
+                """));
+            for (int i = 0; i < 5; i++) T.Eq(200, Status(await s.Raw(Get("/pool/x"))));
+            T.Eq(1, up.Accepted);
+            for (int i = 0; i < 3; i++) T.Eq(200, Status(await s.Raw(Get("/nopool/x"))));
+            T.Eq(4, up.Accepted);
+            T.Contains("Connection: close", up.Requests.Last());
+        });
+
+        T.Add("proxy: failover, passive health, 502 and 504", async () =>
+        {
+            int dead = FreePort();
+            await using var up = FakeUpstream.Echo();
+            await using var silent = new FakeUpstream(async (st, rd) => { await rd.ReadRequestAsync(); await Task.Delay(5000); });
+            await using var s = TestServer.Start(Conf($$"""
+                location /ha/ { proxy_pass http://ha; }
+                location /dead/ { proxy_pass http://127.0.0.1:{{dead}}; }
+                location /slow/ { proxy_pass http://127.0.0.1:{{silent.Port}}; proxy_read_timeout 1s; }
+                """, $$"""upstream ha { server 127.0.0.1:{{dead}} max_fails=1 fail_timeout=30s; server 127.0.0.1:{{up.Port}}; }"""));
+            for (int i = 0; i < 4; i++) T.Eq(200, Status(await s.Raw(Get("/ha/x"))));
+            T.Eq(1, s.LogText().Split("upstream connect failed").Length - 1); // marked down after one failure
+            T.Eq(502, Status(await s.Raw(Get("/dead/x"))));
+            var sw = Stopwatch.StartNew();
+            T.Eq(504, Status(await s.Raw(Get("/slow/x"))));
+            T.True(sw.ElapsedMilliseconds is > 800 and < 3000);
+        });
+
+        T.Add("proxy: malicious or broken upstream responses are refused", async () =>
+        {
+            static FakeUpstream Says(string raw) => new(async (st, rd) => { await rd.ReadRequestAsync(); await st.WriteAsync(Encoding.Latin1.GetBytes(raw)); });
+            await using var both = Says("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+            await using var twoCl = Says("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!");
+            await using var fold = Says("HTTP/1.1 200 OK\r\nX-A: a\r\n b\r\nContent-Length: 0\r\n\r\n");
+            await using var split = Says("HTTP/1.1 200 OK\r\nX-A: a\rSet-Cookie: x=1\r\nContent-Length: 0\r\n\r\n");
+            await using var bigHead = Says("HTTP/1.1 200 OK\r\nX-Big: " + new string('x', 20000) + "\r\nContent-Length: 0\r\n\r\n");
+            await using var badLine = Says("HTTP/1.1 2OO OK\r\nContent-Length: 0\r\n\r\n");
+            await using var badTe = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n");
+            await using var short_ = Says("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly-some");
+            await using var badChunk = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n");
+            var locs = new StringBuilder();
+            foreach (var (name, u) in new[] { ("both", both), ("twocl", twoCl), ("fold", fold), ("split", split), ("big", bigHead), ("line", badLine), ("te", badTe), ("short", short_), ("chunk", badChunk) })
+                locs.Append($"location /{name} {{ proxy_pass http://127.0.0.1:{u.Port}; }}\n");
+            await using var s = TestServer.Start(Conf(locs.ToString()));
+            foreach (var p in new[] { "/both", "/twocl", "/fold", "/split", "/big", "/line", "/te" })
+            {
+                var r = await s.Raw(Get(p));
+                if (Status(r) != 502) throw new Exception($"{p}: expected 502, got {Status(r)}");
+                T.NotContains("Set-Cookie", r);
+            }
+            // Mid-body failure after the head went out: the client must see a cut connection, not a complete message.
+            var trunc = await s.Raw(Get("/short"));
+            T.Eq(200, Status(trunc));
+            T.Eq("only-some", Body(trunc));
+            // Either nothing reached the client or a cut-off body: never a terminated chunked message.
+            var chunk = await s.Raw(Get("/chunk"));
+            T.NotContains("\r\n0\r\n\r\n", Body(chunk));
+        });
+
+        T.Add("proxy: 101 without an upgrade request is refused; h2c upgrade is never forwarded", async () =>
+        {
+            await using var rogue = new FakeUpstream(async (st, rd) => { await rd.ReadRequestAsync(); await st.WriteAsync("HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\nConnection: upgrade\r\n\r\n"u8.ToArray()); });
+            await using var echo = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($$"""
+                location /rogue { proxy_pass http://127.0.0.1:{{rogue.Port}}; }
+                location / { proxy_pass http://127.0.0.1:{{echo.Port}}; }
+                """));
+            T.Eq(502, Status(await s.Raw(Get("/rogue"))));
+            var r = await s.Raw("GET /x HTTP/1.1\r\nHost: f\r\nConnection: Upgrade, HTTP2-Settings, close\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n");
+            T.Eq(200, Status(r));
+            T.NotContains("Upgrade", Body(r));
+            T.NotContains("HTTP2-Settings", Body(r));
+        });
+
+        T.Add("proxy: WebSocket end-to-end (handshake, echo, binary, close)", async () =>
+        {
+            await using var up = FakeUpstream.WebSocketEcho();
+            await using var s = TestServer.Start(Conf($"location /ws/ {{ proxy_pass http://127.0.0.1:{up.Port}; }}"));
+            using var ws = new ClientWebSocket();
+            ws.Options.KeepAliveInterval = TimeSpan.Zero;
+            ws.Options.AddSubProtocol("chat");
+            await ws.ConnectAsync(new Uri($"ws://127.0.0.1:{s.Port}/ws/room"), default);
+            T.Eq(WebSocketState.Open, ws.State);
+            T.Eq("chat", ws.SubProtocol);
+            T.Eq("hello", await Echo(ws, "hello"));
+            var big = new string('z', 200_000); // multi-frame, larger than any proxy buffer
+            T.Eq(big, await Echo(ws, big));
+            var bin = RandomNumberGenerator.GetBytes(4096);
+            await ws.SendAsync(bin, WebSocketMessageType.Binary, true, default);
+            var back = new byte[8192];
+            var rr = await ws.ReceiveAsync(back, default);
+            T.Eq(WebSocketMessageType.Binary, rr.MessageType);
+            T.True(back.AsSpan(0, rr.Count).SequenceEqual(bin));
+            await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", default);
+            T.Eq(WebSocketCloseStatus.NormalClosure, ws.CloseStatus);
+            T.Contains("\"status\":101", s.LogText());
+        });
+
+        T.Add("proxy: WebSocket idle timeout counts both directions", async () =>
+        {
+            await using var up = FakeUpstream.WebSocketEcho();
+            await using var s = TestServer.Start(Conf($"location /ws/ {{ proxy_pass http://127.0.0.1:{up.Port}; proxy_read_timeout 1s; }}"));
+            using var ws = new ClientWebSocket();
+            ws.Options.KeepAliveInterval = TimeSpan.Zero;
+            await ws.ConnectAsync(new Uri($"ws://127.0.0.1:{s.Port}/ws/"), default);
+            // Server pushes every 400 ms for ~2.4 s while the client stays silent: must survive a 1 s idle timeout.
+            await ws.SendAsync("push"u8.ToArray(), WebSocketMessageType.Text, true, default);
+            var buf = new byte[256];
+            for (int i = 0; i < 6; i++)
+            {
+                var r = await ws.ReceiveAsync(buf, default);
+                T.Eq("tick", Encoding.ASCII.GetString(buf, 0, r.Count));
+            }
+            // Now nobody talks: the tunnel must be torn down shortly after the idle timeout.
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                using var cts = new CancellationTokenSource(5000);
+                var r = await ws.ReceiveAsync(buf, cts.Token);
+                T.True(r.MessageType == WebSocketMessageType.Close);
+            }
+            catch (WebSocketException) { }
+            T.True(sw.ElapsedMilliseconds < 3000);
+        });
+
+        T.Add("proxy: WebSocket over TLS on both sides (wss -> https upstream, verified)", async () =>
+        {
+            var dir = Path.Combine(Path.GetTempPath(), "httpgrl-wss-" + Guid.NewGuid().ToString("N")[..8]);
+            Directory.CreateDirectory(dir);
+            using var upCert = MakeCert("localhost", dir, "up");
+            await using var up = FakeUpstream.WebSocketEcho(upCert);
+            await using var s = TestServer.Start($$"""
+                http { server {
+                    listen 127.0.0.1:0 ssl; ssl_certificate {DIR}/front.crt; ssl_certificate_key {DIR}/front.key; root {DIR};
+                    location /ws/ { proxy_pass https://127.0.0.1:{{up.Port}}; proxy_ssl_name localhost; proxy_ssl_trusted_certificate {{dir}}/up.crt; }
+                } }
+                """, d => MakeCert("front.test", d, "front").Dispose());
+            using var ws = new ClientWebSocket();
+            ws.Options.KeepAliveInterval = TimeSpan.Zero;
+            ws.Options.RemoteCertificateValidationCallback = (_, _, _, _) => true;
+            await ws.ConnectAsync(new Uri($"wss://127.0.0.1:{s.Port}/ws/"), default);
+            T.Eq("secure", await Echo(ws, "secure"));
+            await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, default);
+            Directory.Delete(dir, true);
+        });
+
+        T.Add("proxy: upstream TLS is verified by default", async () =>
+        {
+            var dir = Path.Combine(Path.GetTempPath(), "httpgrl-tls-" + Guid.NewGuid().ToString("N")[..8]);
+            Directory.CreateDirectory(dir);
+            using var cert = MakeCert("localhost", dir, "up");
+            await using var up = FakeUpstream.Echo(cert);
+            await using var s = TestServer.Start(Conf($$"""
+                location /strict/ { proxy_pass https://127.0.0.1:{{up.Port}}; proxy_ssl_name localhost; }
+                location /trusted/ { proxy_pass https://127.0.0.1:{{up.Port}}; proxy_ssl_name localhost; proxy_ssl_trusted_certificate {{dir}}/up.crt; }
+                location /wrongname/ { proxy_pass https://127.0.0.1:{{up.Port}}; proxy_ssl_name other.test; proxy_ssl_trusted_certificate {{dir}}/up.crt; }
+                location /lax/ { proxy_pass https://127.0.0.1:{{up.Port}}; proxy_ssl_verify off; }
+                """));
+            T.Eq(502, Status(await s.Raw(Get("/strict/x"))));    // self-signed, not in the system store
+            T.Eq(200, Status(await s.Raw(Get("/trusted/x"))));
+            T.Eq(502, Status(await s.Raw(Get("/wrongname/x"))));
+            T.Eq(200, Status(await s.Raw(Get("/lax/x"))));
+            Directory.Delete(dir, true);
+        });
+
+        T.Add("proxy: unix socket upstream and intercept_errors", async () =>
+        {
+            if (OperatingSystem.IsWindows()) return;
+            var sock = Path.Combine(Path.GetTempPath(), "hg-" + Guid.NewGuid().ToString("N")[..8] + ".sock");
+            await using var up = new FakeUpstream(async (st, rd) =>
+            {
+                var (head, _) = await rd.ReadRequestAsync();
+                var body = head.Contains("/err", StringComparison.Ordinal) ? "upstream error page" : "via unix";
+                var status = head.Contains("/err", StringComparison.Ordinal) ? "503 Service Unavailable" : "200 OK";
+                await st.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 {status}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n{body}"));
+            }, new UnixDomainSocketEndPoint(sock));
+            await using var s = TestServer.Start(Conf($$"""
+                location /u/ { proxy_pass http://unix:{{sock}}:/; }
+                location /i/ { proxy_pass http://unix:{{sock}}:/; proxy_intercept_errors on; error_page 503 /mine.txt; }
+                location = /mine.txt { }
+                """), d => File.WriteAllText(Path.Combine(d, "mine.txt"), "our page"));
+            T.Eq("via unix", Body(await s.Raw(Get("/u/x"))));
+            var r = await s.Raw(Get("/u/err"));
+            T.Eq(503, Status(r));
+            T.Eq("upstream error page", Body(r));
+            r = await s.Raw(Get("/i/err"));
+            T.Eq(503, Status(r));
+            T.Eq("our page", Body(r));
+            File.Delete(sock);
+        });
+
+        T.Add("proxy: config validation", () =>
+        {
+            T.Contains("URI part", T.Throws<ConfigException>(() => TestServer.Start(Conf("location ~ x { proxy_pass http://127.0.0.1:1/a; }"))).Message);
+            T.Contains("variables", T.Throws<ConfigException>(() => TestServer.Start(Conf("location / { proxy_pass http://127.0.0.1:1$uri; }"))).Message);
+            T.Contains("no servers", T.Throws<ConfigException>(() => TestServer.Start(Conf("location / { proxy_pass http://e; }", "upstream e { }"))).Message);
+            T.Contains("duplicate", T.Throws<ConfigException>(() => TestServer.Start(Conf("location / { proxy_pass http://127.0.0.1:1; proxy_pass http://127.0.0.1:2; }"))).Message);
+            T.Contains("host not found", T.Throws<ConfigException>(() => TestServer.Start(Conf("location / { proxy_pass http://no-such-host.invalid; }"))).Message);
+        });
+    }
+
+    private static async Task<string> Echo(ClientWebSocket ws, string text)
+    {
+        await ws.SendAsync(Encoding.UTF8.GetBytes(text), WebSocketMessageType.Text, true, default);
+        var ms = new MemoryStream();
+        var buf = new byte[16384];
+        WebSocketReceiveResult r;
+        do
+        {
+            r = await ws.ReceiveAsync(buf, default);
+            ms.Write(buf, 0, r.Count);
+        } while (!r.EndOfMessage);
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private static int FreePort()
+    {
+        using var l = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        l.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        return ((IPEndPoint)l.LocalEndPoint!).Port; // closed on dispose: connects are refused
+    }
+
+    internal static X509Certificate2 MakeCert(string name, string dir, string file)
+    {
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var req = new CertificateRequest("CN=" + name, key, HashAlgorithmName.SHA256);
+        var san = new SubjectAlternativeNameBuilder();
+        san.AddDnsName(name);
+        req.CertificateExtensions.Add(san.Build());
+        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+        var cert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
+        File.WriteAllText(Path.Combine(dir, file + ".crt"), cert.ExportCertificatePem());
+        File.WriteAllText(Path.Combine(dir, file + ".key"), key.ExportPkcs8PrivateKeyPem());
+        return cert;
+    }
+}
+
+/// <summary>Scriptable upstream: TCP, TLS or unix socket; one handler invocation per accepted connection.</summary>
+internal sealed class FakeUpstream : IAsyncDisposable
+{
+    private readonly Socket _listener;
+    private readonly CancellationTokenSource _stop = new();
+    private int _accepted;
+    public readonly ConcurrentQueue<string> Requests = new();
+    public int Port => _listener.LocalEndPoint is IPEndPoint ip ? ip.Port : 0;
+    public int Accepted => Volatile.Read(ref _accepted);
+
+    public FakeUpstream(Func<Stream, RequestReader, Task> handler, EndPoint? at = null, X509Certificate2? cert = null)
+    {
+        at ??= new IPEndPoint(IPAddress.Loopback, 0);
+        _listener = at is UnixDomainSocketEndPoint
+            ? new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
+            : new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        _listener.Bind(at);
+        _listener.Listen(64);
+        _ = Task.Run(async () =>
+        {
+            while (!_stop.IsCancellationRequested)
+            {
+                Socket s;
+                try { s = await _listener.AcceptAsync(_stop.Token); }
+                catch (Exception) { return; }
+                Interlocked.Increment(ref _accepted);
+                _ = Task.Run(async () =>
+                {
+                    Stream st = new NetworkStream(s, ownsSocket: true);
+                    try
+                    {
+                        if (cert is not null)
+                        {
+                            var ssl = new SslStream(st);
+                            await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions { ServerCertificate = cert });
+                            st = ssl;
+                        }
+                        await handler(st, new RequestReader(st, Requests));
+                    }
+                    catch (Exception) { }
+                    finally { await st.DisposeAsync(); }
+                });
+            }
+        });
+    }
+
+    /// <summary>Keep-alive echo: body = request head + body as received.</summary>
+    public static FakeUpstream Echo(X509Certificate2? cert = null) => new(async (st, rd) =>
+    {
+        while (true)
+        {
+            var (head, body) = await rd.ReadRequestAsync();
+            if (head.Length == 0) return;
+            var payload = Encoding.Latin1.GetBytes(head).Concat(body).ToArray();
+            bool close = head.Contains("Connection: close", StringComparison.OrdinalIgnoreCase);
+            await st.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {payload.Length}\r\nServer: fake\r\n{(close ? "Connection: close\r\n" : "")}\r\n"));
+            await st.WriteAsync(payload);
+            if (close) return;
+        }
+    }, null, cert);
+
+    /// <summary>RFC 6455 server via the BCL: echoes messages; "push" makes it send six "tick"s 400 ms apart.</summary>
+    public static FakeUpstream WebSocketEcho(X509Certificate2? cert = null) => new(async (st, rd) =>
+    {
+        var (head, _) = await rd.ReadRequestAsync();
+        string? H(string n) => head.Split("\r\n").FirstOrDefault(l => l.StartsWith(n + ":", StringComparison.OrdinalIgnoreCase))?[(n.Length + 1)..].Trim();
+        if (!string.Equals(H("Upgrade"), "websocket", StringComparison.OrdinalIgnoreCase)) return;
+        var accept = Convert.ToBase64String(SHA1.HashData(Encoding.ASCII.GetBytes(H("Sec-WebSocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+        var proto = H("Sec-WebSocket-Protocol") is { } p ? $"Sec-WebSocket-Protocol: {p.Split(',')[0].Trim()}\r\n" : "";
+        await st.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n{proto}\r\n"));
+        using var ws = WebSocket.CreateFromStream(st, new WebSocketCreationOptions { IsServer = true, KeepAliveInterval = TimeSpan.Zero });
+        var buf = new byte[1 << 20];
+        while (true)
+        {
+            var r = await ws.ReceiveAsync(buf.AsMemory(), default);
+            if (r.MessageType == WebSocketMessageType.Close) { await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, default); return; }
+            int len = r.Count;
+            while (!r.EndOfMessage) { r = await ws.ReceiveAsync(buf.AsMemory(len), default); len += r.Count; }
+            if (r.MessageType == WebSocketMessageType.Text && len == 4 && Encoding.ASCII.GetString(buf, 0, 4) == "push")
+            {
+                for (int i = 0; i < 6; i++) { await Task.Delay(400); await ws.SendAsync("tick"u8.ToArray(), WebSocketMessageType.Text, true, default); }
+                continue;
+            }
+            await ws.SendAsync(buf.AsMemory(0, len), r.MessageType, true, default);
+        }
+    }, null, cert);
+
+    public async ValueTask DisposeAsync()
+    {
+        _stop.Cancel();
+        _listener.Dispose();
+        await Task.Delay(10);
+    }
+}
+
+/// <summary>Reads HTTP/1.1 requests (Content-Length or chunked) off a stream, keeping leftovers between requests.</summary>
+internal sealed class RequestReader(Stream s, ConcurrentQueue<string> log)
+{
+    private readonly List<byte> _buf = new();
+    private readonly byte[] _tmp = new byte[65536];
+
+    private async Task<bool> More()
+    {
+        int n = await s.ReadAsync(_tmp);
+        if (n == 0) return false;
+        _buf.AddRange(_tmp.AsSpan(0, n).ToArray());
+        return true;
+    }
+
+    private int Find(string pat)
+    {
+        var p = Encoding.ASCII.GetBytes(pat);
+        for (int i = 0; i + p.Length <= _buf.Count; i++)
+        {
+            int k = 0;
+            while (k < p.Length && _buf[i + k] == p[k]) k++;
+            if (k == p.Length) return i;
+        }
+        return -1;
+    }
+
+    private byte[] Take(int n)
+    {
+        var r = _buf.GetRange(0, n).ToArray();
+        _buf.RemoveRange(0, n);
+        return r;
+    }
+
+    public async Task<(string Head, byte[] Body)> ReadRequestAsync()
+    {
+        int end;
+        while ((end = Find("\r\n\r\n")) < 0)
+            if (!await More()) return ("", []);
+        var head = Encoding.Latin1.GetString(Take(end + 4));
+        log.Enqueue(head);
+        var body = new List<byte>();
+        var cl = head.Split("\r\n").FirstOrDefault(l => l.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase));
+        if (cl is not null)
+        {
+            int len = int.Parse(cl[15..].Trim());
+            while (_buf.Count < len) if (!await More()) break;
+            body.AddRange(Take(Math.Min(len, _buf.Count)));
+        }
+        else if (head.Contains("Transfer-Encoding: chunked", StringComparison.OrdinalIgnoreCase))
+        {
+            while (true)
+            {
+                int le;
+                while ((le = Find("\r\n")) < 0) if (!await More()) return (head, body.ToArray());
+                int size = Convert.ToInt32(Encoding.ASCII.GetString(Take(le + 2)).Trim().Split(';')[0], 16);
+                while (_buf.Count < size + 2) if (!await More()) return (head, body.ToArray());
+                body.AddRange(Take(size));
+                Take(2);
+                if (size == 0) break;
+            }
+        }
+        return (head, body.ToArray());
+    }
+}

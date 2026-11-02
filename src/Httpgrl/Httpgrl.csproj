@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Httpgrl.Host</RootNamespace>
+    <AssemblyName>httpgrl</AssemblyName>
+    <PublishAot>true</PublishAot>
+    <OptimizationPreference>Speed</OptimizationPreference>
+    <StripSymbols>true</StripSymbols>
+    <ServerGarbageCollector>true</ServerGarbageCollector>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <EventSourceSupport>false</EventSourceSupport>
+    <DebuggerSupport>false</DebuggerSupport>
+    <MetadataUpdaterSupport>false</MetadataUpdaterSupport>
+    <StackTraceSupport>true</StackTraceSupport>
+    <AutoreleasePoolSupport>false</AutoreleasePoolSupport>
+    <IlcGenerateMstatFile>false</IlcGenerateMstatFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Httpgrl.Core/Httpgrl.Core.csproj" />
+    <ProjectReference Include="../Httpgrl.Modules.StaticFiles/Httpgrl.Modules.StaticFiles.csproj" />
+    <ProjectReference Include="../Httpgrl.Modules.Rewrite/Httpgrl.Modules.Rewrite.csproj" />
+    <ProjectReference Include="../Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj" />
+  </ItemGroup>
+</Project>
