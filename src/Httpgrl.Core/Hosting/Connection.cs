@@ -15,6 +15,8 @@ internal sealed class Connection
     public readonly IpKey IpKey;
     public readonly long AcceptedAt;
     public int Slot = -1;
+    /// <summary>The configuration this connection runs under (set before admission).</summary>
+    public Pipeline.HttpRuntime? Generation;
 
     /// <summary>Phase deadline independent of I/O (TLS handshake, whole request head, keep-alive idle). 0 = none.</summary>
     public long BaseDeadline;
@@ -106,11 +108,22 @@ internal sealed class Connection
     }
 
     /// <summary>Hard close: RST, no lingering. Safe to call from any thread, any number of times.</summary>
-    public void Abort(string reason)
+    /// <summary>
+    /// Close now. Default is a reset (linger 0: nothing lingers in the kernel for a client we're punishing);
+    /// <paramref name="graceful"/> sends a FIN instead, for idle connections we close on our own account
+    /// (reload, shutdown), so clients see an ordinary keep-alive close and retry.
+    /// </summary>
+    public void Abort(string reason, bool graceful = false)
     {
         if (Interlocked.Exchange(ref _aborted, 1) != 0) return;
         AbortReason = reason;
-        try { Socket.LingerState = new LingerOption(true, 0); } catch (Exception e) when (e is SocketException or ObjectDisposedException) { }
+        try
+        {
+            // .NET closes abortively when a receive is pending, so a graceful close must shutdown() first.
+            if (graceful) Socket.Shutdown(SocketShutdown.Both);
+            else Socket.LingerState = new LingerOption(true, 0);
+        }
+        catch (Exception e) when (e is SocketException or ObjectDisposedException) { }
         Socket.Dispose();
         try { _cts?.Cancel(); } catch (ObjectDisposedException) { }
     }

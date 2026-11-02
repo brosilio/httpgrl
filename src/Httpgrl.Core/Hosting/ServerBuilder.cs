@@ -11,17 +11,22 @@ namespace Httpgrl.Core.Hosting;
 /// </summary>
 public static class ServerBuilder
 {
-    public static HttpServer Load(string configPath, IEnumerable<IModule> modules, JsonLogger log)
+    /// <summary>Load a configuration file. <paramref name="modules"/> is called again on every reload (fresh module state).</summary>
+    public static HttpServer Load(string configPath, Func<IModule[]> modules, JsonLogger log)
     {
         var full = Path.GetFullPath(configPath);
         var prefix = Path.GetDirectoryName(full)!;
-        return Build(modules, log, prefix, p => p.ParseFile(full));
+        return new HttpServer(() => Build(modules(), log, prefix, p => p.ParseFile(full)), log);
     }
 
-    public static HttpServer LoadText(string text, string prefix, IEnumerable<IModule> modules, JsonLogger log) =>
+    public static HttpServer LoadText(string text, string prefix, Func<IModule[]> modules, JsonLogger log) =>
+        new(() => BuildText(text, prefix, modules(), log), log);
+
+    internal static HttpRuntime BuildText(string text, string prefix, IEnumerable<IModule> modules, JsonLogger log) =>
         Build(modules, log, prefix, p => p.ParseText(text, Path.Combine(prefix, "<inline>"), prefix));
 
-    private static HttpServer Build(IEnumerable<IModule> extra, JsonLogger log, string prefix, Func<ConfigParser, ConfigScope> parse)
+    /// <summary>Everything a running server needs. Side-effect free: a failed build (e.g. on reload) changes nothing.</summary>
+    private static HttpRuntime Build(IEnumerable<IModule> extra, JsonLogger log, string prefix, Func<ConfigParser, ConfigScope> parse)
     {
         IModule[] modules = [new HttpCoreModule(prefix), new SslModule(), new AccessLogModule(), .. extra];
 
@@ -36,7 +41,6 @@ public static class ServerBuilder
         root.MergeAndFreeze();
 
         var main = root.Get<MainConf>();
-        log.MinLevel = main.LogLevel ?? LogLevel.Info;
 
         var setup = new Setup(root, log);
         foreach (var m in modules) m.Configure(setup);
@@ -53,8 +57,9 @@ public static class ServerBuilder
             DefaultRoot = Path.Combine(prefix, "html"),
             Main = main,
             Events = events,
+            Modules = modules,
         };
-        return new HttpServer(rt);
+        return rt;
     }
 
     private sealed class Registry : IModuleRegistry

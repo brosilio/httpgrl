@@ -14,6 +14,18 @@ artifacts/linux-x64/httpgrl -c conf/httpgrl.conf  # -t: test config and exit
 Output is a single ~8 MB executable. Logs go to stdout as one JSON object per line.
 `SIGTERM`/`SIGINT`/`SIGQUIT` shut down gracefully, bounded by `worker_shutdown_timeout`.
 
+**Reload** with `SIGHUP` (`kill -HUP <pid>`, `docker kill -s HUP <container>`). It re-reads the config and
+everything it references: includes, certificates, CA bundles and CRLs. Upstream hostnames are resolved again.
+- **All or nothing.** If anything fails (a syntax error, an unreadable certificate, a port that can't be bound),
+  the error is logged and the running configuration stays exactly as it was.
+- **Listeners** are kept when the same address is still configured (no dropped connections and no window where
+  it isn't listening), opened when new, and closed when removed. `backlog`/`reuseport` and `worker_connections`
+  changes need a restart; you get a warning.
+- **New connections** use the new configuration. **In-flight requests** finish on the old one and then close.
+  **Idle keep-alives** are closed at once with a normal FIN, so clients reconnect. Long-lived tunnels (WebSockets)
+  keep the old configuration until they end.
+- The old configuration's resources (upstream keep-alive pools) are released when its last connection ends.
+
 ## Docker
 
 ```sh
@@ -29,6 +41,7 @@ docker compose up --build                              # see compose.yaml
 - **Hardening:** the server writes nothing to disk, so `--read-only` and `--cap-drop ALL` just work.
 - **Files:** config is `/etc/httpgrl/httpgrl.conf` (from `conf/docker/httpgrl.conf`), mime types are `/etc/httpgrl/mime.types`, content is `/srv/www`. The bundled config is validated with `-t` during the build.
 - **Shutdown:** `docker stop` sends SIGTERM, which is a graceful shutdown bounded by `worker_shutdown_timeout`.
+- **Reload:** `docker kill -s HUP <container>` after changing a mounted config or certificate.
 - **Architecture:** the image targets the architecture it's built on (`linux-x64` or `linux-arm64`, via `TARGETARCH`). Native AOT doesn't cross-compile across architectures without a cross toolchain, so multi-arch builds run each platform under emulation.
 - **No `HEALTHCHECK`:** the image has no shell or curl to run one with. Use your orchestrator's HTTP probe against a path you serve.
 
@@ -246,10 +259,23 @@ Then add it to the list in `src/Httpgrl/Program.cs`. There is no reflection and 
   - `Response.FlushAsync()` to push buffered bytes now (streaming).
   - `UpgradeAsync(idleTimeout)`: send a `101` and get the raw duplex stream back. Bytes the client already pipelined are included. The timeout is idleness across both directions.
   - `HasErrorPage(code)`, and `inv.ReadFile(...)` for config-time files (modules have no filesystem access of their own).
+- **Lifetime:** a module instance belongs to one loaded configuration. Every reload builds fresh instances from the list in `Program.cs`, so per-configuration state can live in fields. If a module implements `IDisposable`, it is disposed once the configuration it belongs to has been replaced *and* its last connection has ended (the proxy closes its upstream pools this way).
 - **Config time:** `DirectiveInvocation` has `Flag/Size/Millis/Int` parsers and `Compile` (for `$variables`). Throw `inv.Error("...")` for errors that report `file:line`.
 - **Example:** the upgrade, exclusive-handler and body APIs are exercised by `TestModule` in `tests/Httpgrl.Tests/IntegrationTests.cs`.
 
-## Not yet / next
+## Roadmap
 
-- Also missing: `rewrite`/`set`/`if`/`map`, `add_header`, `proxy_redirect`, `proxy_buffering on`, variables in `proxy_pass`, runtime DNS re-resolution, active health checks, gzip, `limit_req`, open-file cache, `disable_symlinks`, config reload on `SIGHUP`, HTTP/2.
-- Responses use buffered `pread` + `send`. Over TLS that's unavoidable; for plaintext, a `sendfile(2)` path is a possible later optimisation.
+In priority order. Nothing here is implemented yet unless it's ticked.
+
+1. [x] **Reload without restart** (`SIGHUP`): re-read config and certificates; keep the old configuration if the new one fails; old connections finish on the old configuration.
+2. [ ] **Revocation for client certificates** (`ssl_crl`): signed, unexpired CRLs for every CA in the chain.
+3. [ ] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
+4. [ ] **Rate limiting**: `limit_req` and `limit_conn` zones.
+5. [ ] **Hardening**: fuzzing the request, upstream-response and config parsers; long-running soak tests under load; CI on Windows and macOS.
+6. [ ] **Operations**: a status/metrics endpoint, `$request_id`, gzip/brotli (BCL `System.IO.Compression`), a systemd unit.
+7. [ ] **Proxy**: `proxy_redirect`, `proxy_buffering on`, variables in `proxy_pass`, runtime DNS re-resolution, active health checks.
+8. [ ] **HTTP/2.**
+9. [ ] **Release process**: CI on push, a first `v0.x` tag, signed images.
+
+Also not yet: `rewrite`, `map ... hostnames`, OCSP, open-file cache, `disable_symlinks`, `sendfile(2)` for plaintext responses
+(responses currently use buffered `pread` + `send`; over TLS that's unavoidable anyway).

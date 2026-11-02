@@ -13,7 +13,7 @@ internal sealed class ConnectionManager : IDisposable
     private readonly int[] _free;
     private int _freeCount;
     private readonly Dictionary<IpKey, int> _perIp = new();
-    private readonly int _perIpMax;
+    private volatile int _perIpMax;
     private readonly object _lock = new();
     private readonly Thread _sweeper;
     private readonly ILogger _log;
@@ -35,6 +35,7 @@ internal sealed class ConnectionManager : IDisposable
     }
 
     public int Active => Volatile.Read(ref _active);
+    public int PerClientMax { get => _perIpMax; set => _perIpMax = value; }
     public bool Stopping => _stopping;
 
     public long NextId() => Interlocked.Increment(ref _nextId);
@@ -98,6 +99,13 @@ internal sealed class ConnectionManager : IDisposable
         return best;
     }
 
+    /// <summary>After a reload: close idle connections of retired generations now rather than at the next sweep.</summary>
+    public void RetireIdle()
+    {
+        foreach (var c in Snapshot())
+            if (c.Idle && c.Generation is { Retired: true }) c.Abort("configuration reloaded", graceful: true);
+    }
+
     /// <summary>Stop admitting; idle connections are closed on the next sweep.</summary>
     public void BeginShutdown() => _stopping = true;
 
@@ -134,6 +142,7 @@ internal sealed class ConnectionManager : IDisposable
                 long b = Volatile.Read(ref c.BaseDeadline);
                 long o = Volatile.Read(ref c.OpDeadline);
                 if (stopping && c.Idle) why = "shutdown";
+                else if (c.Idle && c.Generation is { Retired: true }) why = "configuration reloaded";
                 else if (b != 0 && now > b) why = c.Phase + " timeout";
                 else if (o != 0 && now > o) why = c.Phase + " i/o timeout";
                 else if (c.MinRate > 0)
@@ -147,8 +156,8 @@ internal sealed class ConnectionManager : IDisposable
             }
             foreach (var (c, why) in doomed)
             {
-                if (why != "shutdown") _log.Info("connection aborted", new("conn", c.Id), new("reason", why));
-                c.Abort(why);
+                if (why is not ("shutdown" or "configuration reloaded")) _log.Info("connection aborted", new("conn", c.Id), new("reason", why));
+                c.Abort(why, graceful: why is "shutdown" or "configuration reloaded");
             }
             doomed.Clear();
         }

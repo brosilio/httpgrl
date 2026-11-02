@@ -99,10 +99,20 @@ internal sealed class TestServer : IAsyncDisposable
         var ms = new MemoryStream();
         var log = new JsonLogger(Stream.Synchronized(ms), LogLevel.Debug);
         var text = config.Replace("{DIR}", dir, StringComparison.Ordinal);
-        var server = ServerBuilder.LoadText(text, dir, [new Httpgrl.Modules.Rewrite.ReturnModule(), new Httpgrl.Modules.Proxy.ProxyModule(), .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(), .. extra ?? []], log);
+        var mods = extra?.ToArray() ?? [];
+        var server = ServerBuilder.LoadText(text, dir, () => Modules(mods), log);
         server.Start();
-        return new TestServer(dir, server, log, ms);
+        return new TestServer(dir, server, log, ms) { _extra = mods };
     }
+
+    private IModule[] _extra = [];
+
+    private static IModule[] Modules(IModule[] extra) =>
+        [new Httpgrl.Modules.Rewrite.ReturnModule(), new Httpgrl.Modules.Proxy.ProxyModule(), .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(), .. extra];
+
+    /// <summary>Swap in a new configuration ({DIR} expands as in Start). Fresh first-party modules; test modules are reused.</summary>
+    public Task<bool> Reload(string config) =>
+        Server.ReloadAsync(() => ServerBuilder.BuildText(config.Replace("{DIR}", Dir, StringComparison.Ordinal), Dir, Modules(_extra), _log));
 
     public string LogText()
     {

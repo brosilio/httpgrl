@@ -36,7 +36,7 @@ using var log = JsonLogger.Stdout();
 HttpServer server;
 try
 {
-    server = ServerBuilder.Load(config, Modules(), log);
+    server = ServerBuilder.Load(config, Modules, log);
 }
 catch (ConfigException e)
 {
@@ -72,6 +72,13 @@ void OnSignal(PosixSignalContext c)
 using var sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, OnSignal);
 using var sigInt = PosixSignalRegistration.Create(PosixSignal.SIGINT, OnSignal);
 using var sigQuit = PosixSignalRegistration.Create(PosixSignal.SIGQUIT, OnSignal);
+// SIGHUP: reload configuration and certificates (nginx -s reload). A broken config is logged and ignored.
+using var sigHup = OperatingSystem.IsWindows() ? null : PosixSignalRegistration.Create(PosixSignal.SIGHUP, c =>
+{
+    c.Cancel = true;
+    log.Info("reloading", new LogField("config", Path.GetFullPath(config)));
+    _ = server.ReloadAsync();
+});
 
 var signal = await stop.Task;
 log.Info("shutting down", new("signal", signal), new("active", (long)server.ActiveConnections));

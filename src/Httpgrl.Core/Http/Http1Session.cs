@@ -132,7 +132,7 @@ internal sealed class Http1Session
                 if (req.ExpectContinue) ctx.BodyReader.SendContinue = SendContinueAsync;
 
                 bool wantsKeepAlive = req.VersionValue == HttpVersion.Http11 ? !req.ConnClose : req.ConnKeepAlive && !req.ConnClose;
-                ctx.SetKeepAlive(reject == 0 && wantsKeepAlive && info.Requests < core0.KeepaliveRequestsMax && !_mgr.Stopping);
+                ctx.SetKeepAlive(reject == 0 && wantsKeepAlive && info.Requests < core0.KeepaliveRequestsMax && !_mgr.Stopping && !_rt.Retired);
                 _conn.Phase = "processing";
 
                 if (reject != 0) await RequestPipeline.RejectAsync(ctx, reject).ConfigureAwait(false);
@@ -151,7 +151,7 @@ internal sealed class Http1Session
 
                 await _rt.Pipeline.RunLogAsync(ctx).ConfigureAwait(false);
 
-                if (!reusable || keepaliveMs <= 0)
+                if (!reusable || keepaliveMs <= 0 || _rt.Retired)
                 {
                     if (!ctx.Upgraded && clean) await LingeringCloseAsync(transport, input).ConfigureAwait(false);
                     return;
@@ -176,6 +176,7 @@ internal sealed class Http1Session
             ctx?.Resp.ReturnBuffer();
             input.Dispose();
             _mgr.Release(_conn);
+            _rt.Release();
             try { await _transport.DisposeAsync().ConfigureAwait(false); } catch (Exception) { /* already torn down */ }
             _conn.Dispose();
         }

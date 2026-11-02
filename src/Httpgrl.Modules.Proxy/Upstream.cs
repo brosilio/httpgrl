@@ -118,16 +118,32 @@ internal sealed class UpstreamGroup
         }
     }
 
+    private volatile bool _retired;
+
+    /// <summary>No more pooling: close idle connections now, and any connection handed back later.</summary>
+    public void Retire()
+    {
+        _retired = true;
+        var all = new List<UpstreamConn>();
+        lock (_lock)
+            foreach (var s in _primary.Concat(_backup)) { all.AddRange(s.Idle); s.Idle.Clear(); }
+        foreach (var c in all) c.Dispose();
+    }
+
     public void ReturnIdle(UpstreamConn c)
     {
-        if (KeepAlive <= 0 || c.Requests >= KeepAliveRequests || !c.IsReusable()) { c.Dispose(); return; }
+        if (_retired || KeepAlive <= 0 || c.Requests >= KeepAliveRequests || !c.IsReusable()) { c.Dispose(); return; }
         c.IdleSince = Environment.TickCount64;
         UpstreamConn? evicted = null;
         lock (_lock)
         {
             var idle = c.Server.Idle;
-            idle.Add(c);
-            if (idle.Count > KeepAlive) { evicted = idle[0]; idle.RemoveAt(0); }
+            if (_retired) evicted = c;
+            else
+            {
+                idle.Add(c);
+                if (idle.Count > KeepAlive) { evicted = idle[0]; idle.RemoveAt(0); }
+            }
         }
         evicted?.Dispose();
     }

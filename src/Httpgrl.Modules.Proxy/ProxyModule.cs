@@ -66,7 +66,7 @@ public sealed record UpstreamServerSpec(string Address, int Weight, int MaxFails
 /// Reverse proxy (cf. ngx_http_proxy_module + ngx_http_upstream). HTTP/1.x to upstreams over TCP, TLS or
 /// unix sockets; keep-alive pooling; passive health checks; Upgrade/WebSocket tunnelling on by default.
 /// </summary>
-public sealed class ProxyModule : IModule
+public sealed class ProxyModule : IModule, IDisposable
 {
     public static readonly ContextKind Upstream = new("upstream");
     public string Name => "http_proxy";
@@ -211,6 +211,16 @@ public sealed class ProxyModule : IModule
             if (!loc.TryGet<ProxyConf>(out var pc) || pc.Pass is null) continue;
             pc.Target = BuildTarget(pc, groups, implicitGroups);
         }
+        _groups.AddRange(groups.Values);
+        _groups.AddRange(implicitGroups.Values);
+    }
+
+    private readonly List<UpstreamGroup> _groups = new();
+
+    /// <summary>The configuration was replaced (reload) and its last connection is gone: close pooled upstream connections.</summary>
+    public void Dispose()
+    {
+        foreach (var g in _groups) g.Retire();
     }
 
     private static ProxyTarget BuildTarget(ProxyConf c, Dictionary<string, UpstreamGroup> groups, Dictionary<string, UpstreamGroup> implicitGroups)

@@ -264,4 +264,45 @@ internal sealed class HttpRuntime
     public required string DefaultRoot { get; init; }
     public required MainConf Main { get; init; }
     public required EventsConf Events { get; init; }
+    public required IModule[] Modules { get; init; }
+
+    // ---- configuration generations (reload) ----
+    // Every connection holds its generation for its whole life. A replaced generation is retired: its idle
+    // keep-alives close, busy connections finish their request without keep-alive, and once the last one is
+    // gone its modules are disposed (upstream pools and the like).
+    private int _connections;
+    private int _disposed;
+    private volatile bool _retired;
+    public bool Retired => _retired;
+
+    /// <summary>Pin this generation for a new connection; false if it was retired meanwhile (use the current one).</summary>
+    public bool TryAcquire()
+    {
+        Interlocked.Increment(ref _connections);
+        if (!_retired) return true;
+        Release();
+        return false;
+    }
+
+    public void Release()
+    {
+        if (Interlocked.Decrement(ref _connections) == 0 && _retired) DisposeModules();
+    }
+
+    public void Retire()
+    {
+        _retired = true;
+        if (Volatile.Read(ref _connections) == 0) DisposeModules();
+    }
+
+    private void DisposeModules()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        foreach (var m in Modules)
+        {
+            if (m is not IDisposable d) continue;
+            try { d.Dispose(); }
+            catch (Exception e) { Log.Error("module dispose failed", new("module", m.Name), new("error", e.Message)); }
+        }
+    }
 }

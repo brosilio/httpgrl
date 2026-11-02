@@ -61,6 +61,14 @@ These are deliberate design decisions made by the project owner, not accidents t
    - Never design for, or protect, a "dev instance's" state.
    - Never kill processes by pattern (`pkill -f`): it can hit your own shell or unrelated software. Use the exact PID.
 
+## Reload
+
+`SIGHUP` builds a complete new configuration (fresh module instances) and swaps it in only if *everything*
+succeeded, including binding new listeners. Keep it that way: building a configuration must have no side
+effects on the running one (no logger level changes, no global state), and module state belongs to the
+module instance. Resources that must be closed go in `IDisposable.Dispose` on the module, which runs when
+the old configuration's last connection ends.
+
 ## Branches and releases
 
 - **Always work on `develop`.** Commit there (or on short-lived topic branches cut from it and merged back).
