@@ -26,6 +26,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         r.AddDirective(new() { Name = "events", Contexts = main, Block = ContextKind.Events, Handler = _ => { } });
         r.AddDirective(new() { Name = "http", Contexts = main, Block = ContextKind.Http, Handler = _ => { } });
         r.AddDirective(new() { Name = "error_log", Contexts = main, MinArgs = 1, MaxArgs = 2, Handler = ErrorLog });
+        r.AddDirective(new() { Name = "reload_drain_timeout", Contexts = main, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<MainConf>().ReloadDrainTimeout = i.Millis(0) });
         r.AddDirective(new() { Name = "worker_shutdown_timeout", Contexts = main, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<MainConf>().ShutdownTimeout = i.Millis(0) });
         r.AddDirective(new() { Name = "worker_connections", Contexts = [ContextKind.Events], MinArgs = 1, MaxArgs = 1, Handler = WorkerConnections });
         r.AddDirective(new() { Name = "connections_per_client", Contexts = [ContextKind.Events], MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<EventsConf>().ConnectionsPerClient = i.Int(0) });

@@ -22,8 +22,11 @@ everything it references: includes, certificates, CA bundles and CRLs. Upstream 
   it isn't listening), opened when new, and closed when removed. `backlog`/`reuseport` and `worker_connections`
   changes need a restart; you get a warning.
 - **New connections** use the new configuration. **In-flight requests** finish on the old one and then close.
-  **Idle keep-alives** are closed at once with a normal FIN, so clients reconnect. Long-lived tunnels (WebSockets)
-  keep the old configuration until they end.
+  **Idle keep-alives** are closed at once with a normal FIN, so clients reconnect. Anything still running on the
+  old configuration after `reload_drain_timeout` (default 60s, taken from the *new* configuration) is closed with a
+  FIN: WebSockets and other upgraded tunnels, long polls, slow downloads. So a reload never leaves the old
+  configuration (its certificates, upstreams, CRLs) in force indefinitely. WebSocket clients see the connection
+  drop and reconnect, landing on the new configuration.
 - The old configuration's resources (upstream keep-alive pools) are released when its last connection ends.
 
 ## Docker
@@ -74,6 +77,7 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `include glob;` | any | | Relative paths resolve against the main config's directory. Wildcards are allowed in the file name. |
 | `error_log stdout [level];` | main | `info` | `debug info warn error`. Only stdout is supported. |
 | `worker_shutdown_timeout t;` | main | `10s` | Graceful-stop limit. |
+| `reload_drain_timeout t;` | main | `60s` | *(httpgrl-specific)* After a reload, connections still on the old configuration (tunnels, long polls, slow transfers) are closed this long after it. `0` closes them at the next sweep (within 250 ms). nginx reuses `worker_shutdown_timeout` for this and defaults to no limit. |
 | `worker_connections n;` | events | `16384` | Global connection cap. When full, the longest-idle keep-alive connection is evicted. |
 | `connections_per_client n;` | events | `256` | Cap per IPv4 address or per IPv6 /64. `0` disables it. *(httpgrl-specific)* |
 | `server`, `listen`, `server_name` | | `*:80` | `listen [addr:]port \| [v6]:port \| unix:/path [ssl] [default_server] [reuseport] [backlog=n]`. Server names can be exact, `*.x`, `x.*`, `.x`, or `~regex`. |

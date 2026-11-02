@@ -64,6 +64,29 @@ internal static class ReloadTests
             T.Eq("new", Body(await s.Raw(Get())));
         });
 
+        T.Add("reload: tunnels keep the old configuration only until reload_drain_timeout", async () =>
+        {
+            const string Ws = "http { server { listen 127.0.0.1:0; location /ws { echo_upgrade; } } }";
+            await using var s = TestServer.Start(Ws, null, [new TestModule()]);
+            using var tunnel = await Upgrade(s.Port);
+            T.True(await s.Reload("reload_drain_timeout 600ms;\n" + Ws));
+            var reloaded = Environment.TickCount64;
+            T.Eq("one", await Echo(tunnel, "one"));          // still served by the old configuration
+            using var fresh = await Upgrade(s.Port);         // new tunnels open normally
+            T.Eq("", await ReadToClose(tunnel, 5000));       // then cut, with a FIN
+            long waited = Environment.TickCount64 - reloaded;
+            T.True(waited >= 550 && waited < 2000, $"closed after {waited} ms");
+            T.Eq("two", await Echo(fresh, "two"));           // the new generation's tunnel is untouched
+            T.Contains("reload drain timeout", s.LogText());
+
+            // Default (60s): a reload doesn't cut a tunnel at once.
+            await using var s2 = TestServer.Start(Ws, null, [new TestModule()]);
+            using var t2 = await Upgrade(s2.Port);
+            T.True(await s2.Reload(Ws));
+            await Task.Delay(800);
+            T.Eq("still", await Echo(t2, "still"));
+        });
+
         T.Add("reload: listeners are opened and closed to match; a port in use fails the reload as a whole", async () =>
         {
             await using var s = TestServer.Start(Says("a"));
@@ -116,6 +139,31 @@ internal static class ReloadTests
             T.Eq(1, Volatile.Read(ref closed));
             T.Eq("up", Body(await s.Raw(Get()))); // the new generation has its own pool
         });
+    }
+
+    private static async Task<Socket> Upgrade(int port)
+    {
+        var c = await Connect(port);
+        await c.SendAsync(Encoding.ASCII.GetBytes("GET /ws HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n"));
+        var buf = new byte[4096];
+        var sb = new StringBuilder();
+        while (!sb.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+        {
+            int n = await c.ReceiveAsync(buf, SocketFlags.None);
+            if (n == 0) throw new IOException("closed during upgrade");
+            sb.Append(Encoding.ASCII.GetString(buf, 0, n));
+        }
+        T.Eq(101, Status(sb.ToString()));
+        return c;
+    }
+
+    private static async Task<string> Echo(Socket c, string text)
+    {
+        await c.SendAsync(Encoding.ASCII.GetBytes(text));
+        var buf = new byte[256];
+        using var cts = new CancellationTokenSource(3000);
+        int n = await c.ReceiveAsync(buf, SocketFlags.None, cts.Token);
+        return Encoding.ASCII.GetString(buf, 0, n);
     }
 
     private static async Task<string> ServerCertSubject(int port)

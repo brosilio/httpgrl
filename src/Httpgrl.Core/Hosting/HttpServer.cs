@@ -117,7 +117,7 @@ public sealed class HttpServer : IAsyncDisposable
             if (next.Events.MaxConnections != prev.Events.MaxConnections)
                 _rt.Log.Warn("worker_connections change needs a restart", new LogField("running", (long)prev.Events.MaxConnections));
             _mgr.PerClientMax = next.Events.PerClient;
-            prev.Retire();
+            prev.Retire(Environment.TickCount64 + next.Main.ReloadDrainTimeoutMs);
             _mgr.RetireIdle(); // old idle keep-alives close now; busy ones finish their request first
             _rt.Log.Info("configuration reloaded", new LogField("listeners", (long)next.Bindings.Count));
             return true;

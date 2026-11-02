@@ -73,7 +73,9 @@ These are deliberate design decisions made by the project owner, not accidents t
 succeeded, including binding new listeners. Keep it that way: building a configuration must have no side
 effects on the running one (no logger level changes, no global state), and module state belongs to the
 module instance. Resources that must be closed go in `IDisposable.Dispose` on the module, which runs when
-the old configuration's last connection ends.
+the old configuration's last connection ends. No connection outlives its configuration by more than
+`reload_drain_timeout` (enforced by the sweeper), so a reload that rotates certificates or revokes access
+actually takes effect.
 
 ## Branches and releases
 

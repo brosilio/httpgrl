@@ -107,8 +107,11 @@ public sealed class LocationDef : ScopeConfig<LocationDef>
 public sealed class MainConf : ScopeConfig<MainConf>
 {
     public int? ShutdownTimeout;
+    public int? ReloadDrainTimeout;
     public LogLevel? LogLevel;
     public int ShutdownTimeoutMs => ShutdownTimeout ?? 10_000;
+    /// <summary>After a reload, how long connections may stay on the old configuration (tunnels, long polls).</summary>
+    public int ReloadDrainTimeoutMs => ReloadDrainTimeout ?? 60_000;
     protected override void Inherit(MainConf parent) { }
 }
 

@@ -142,7 +142,8 @@ internal sealed class ConnectionManager : IDisposable
                 long b = Volatile.Read(ref c.BaseDeadline);
                 long o = Volatile.Read(ref c.OpDeadline);
                 if (stopping && c.Idle) why = "shutdown";
-                else if (c.Idle && c.Generation is { Retired: true }) why = "configuration reloaded";
+                else if (c.Generation is { Retired: true } g && (c.Idle || now > g.RetireDeadline))
+                    why = c.Idle ? "configuration reloaded" : "reload drain timeout";
                 else if (b != 0 && now > b) why = c.Phase + " timeout";
                 else if (o != 0 && now > o) why = c.Phase + " i/o timeout";
                 else if (c.MinRate > 0)
@@ -157,7 +158,7 @@ internal sealed class ConnectionManager : IDisposable
             foreach (var (c, why) in doomed)
             {
                 if (why is not ("shutdown" or "configuration reloaded")) _log.Info("connection aborted", new("conn", c.Id), new("reason", why));
-                c.Abort(why, graceful: why is "shutdown" or "configuration reloaded");
+                c.Abort(why, graceful: why is "shutdown" or "configuration reloaded" or "reload drain timeout");
             }
             doomed.Clear();
         }

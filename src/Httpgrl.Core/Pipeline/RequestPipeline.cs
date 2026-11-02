@@ -275,7 +275,10 @@ internal sealed class HttpRuntime
     private int _connections;
     private int _disposed;
     private volatile bool _retired;
+    private long _retireDeadline = long.MaxValue;
     public bool Retired => _retired;
+    /// <summary>Once retired: the TickCount64 after which its remaining connections are closed (reload_drain_timeout).</summary>
+    public long RetireDeadline => Volatile.Read(ref _retireDeadline);
 
     /// <summary>Pin this generation for a new connection; false if it was retired meanwhile (use the current one).</summary>
     public bool TryAcquire()
@@ -291,8 +294,9 @@ internal sealed class HttpRuntime
         if (Interlocked.Decrement(ref _connections) == 0 && _retired) DisposeModules();
     }
 
-    public void Retire()
+    public void Retire(long deadline = long.MaxValue)
     {
+        Volatile.Write(ref _retireDeadline, deadline);
         _retired = true;
         if (Volatile.Read(ref _connections) == 0) DisposeModules();
     }
