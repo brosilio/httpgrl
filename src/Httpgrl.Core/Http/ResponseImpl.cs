@@ -163,6 +163,14 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
     {
         _started = true;
         if (ctx.StatusOverride > 0 && Status == 200) Status = ctx.StatusOverride;
+        foreach (var f in ctx.Rt.Pipeline.HeaderFilters)
+        {
+            try { f(ctx); }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                ctx.Log.Error("header filter failed", new("conn", ctx.Info.Id), new("error", e.GetType().Name), new("detail", e.Message));
+            }
+        }
         int status = Status;
         if (status is < 100 or > 599) throw new InvalidOperationException($"invalid status {status}");
         bool upgrade = status == 101;

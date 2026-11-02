@@ -52,7 +52,8 @@ docker compose up --build                              # see compose.yaml
 | `src/Httpgrl.Abstractions` | **The plugin API.** It is the only thing modules reference. |
 | `src/Httpgrl.Core` | Config parser, HTTP/1.1 engine, connection management, TLS, logging. Also the core modules (`http_core`, `http_ssl`, `http_log`), which are written against the same API. |
 | `src/Httpgrl.Modules.StaticFiles` | `http_index`, `http_autoindex`, `http_static`. |
-| `src/Httpgrl.Modules.Rewrite` | `http_return`. Later: `rewrite`, `set`, `if`. |
+| `src/Httpgrl.Modules.Rewrite` | `http_rewrite` (`return`, `set`, `if`, `break`) and `http_map`. |
+| `src/Httpgrl.Modules.Headers` | `http_headers`: `add_header`. |
 | `src/Httpgrl.Modules.Proxy` | `http_proxy`: `proxy_pass`, `upstream {}`, WebSocket/Upgrade tunnelling. |
 | `src/Httpgrl` | Host executable. The compiled-in module list is in `Program.cs`. |
 | `tests/Httpgrl.Tests` | A dependency-free test runner. It runs on the JIT, and `ci.sh` also publishes and runs it as native AOT. |
@@ -84,7 +85,6 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `try_files file ... uri\|=code\|@name;` | server, location | | |
 | `error_page code ... [=[code]] uri;` | | | The nginx forms, including `= @named`. |
 | `error_page code ... =444;` | | | *(httpgrl shorthand)* For these codes, close the connection and send nothing. At server level it also applies to malformed requests. The nginx idiom `error_page 404 = @drop;` + `location @drop { return 444; }` works too, but only for requests that parsed. |
-| `return code [text];` `return 301\|302\|303\|307\|308 url;` `return url;` `return 444;` | server, location | | nginx semantics. A server-level `return` wins over the location's. Without text, the core renders the body and `error_page` applies. `$variables` in redirect URLs are re-encoded, so a decoded `$uri` can't inject headers. `444` closes the connection silently. |
 | `internal;` | location | | |
 | `types {}` / `default_type` | | built-in list / `text/plain` | `conf/mime.types` is provided. |
 | `client_header_timeout` | http, server | `10s` | Applies to the **whole** request head, not to each read. |
@@ -103,6 +103,32 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `ssl_ocsp`, `ssl_trusted_certificate` | | | Not supported, and a config error rather than silently ignored. |
 | `server_tokens on\|off;` | | **`off`** | `off`: no `Server` header and no product name on error pages. `on`: `Server: httpgrl/<version>` plus the error-page footer. Note: nginx's `off` still sends a header; here `off` sends none. |
 | `access_log stdout\|off;` | | `stdout` | |
+
+### Rewrite, map and headers
+
+The rewrite directives of a block (`return`, `set`, `if`, `break`) form a script that runs in config order. The
+server block's script runs first for every request, then the selected location's. A block's script is not
+inherited by nested locations (nginx semantics).
+
+| Directive | Context | Default | Notes |
+|---|---|---|---|
+| `return code [text];` `return 301\|302\|303\|307\|308 url;` `return url;` `return 444;` | server, location, if | | nginx semantics. Without text, the core renders the body and `error_page` applies. `$variables` in redirect URLs are re-encoded, so a decoded `$uri` can't inject headers. `444` closes the connection silently. |
+| `set $var value;` | server, location, if | | Declares `$var` (usable anywhere in the config, even before the `set`). Values are per request and survive internal redirects. Built-in variables can't be overwritten. |
+| `if (condition) { ... }` | server, location, if | | Conditions: `($var)` (false if empty or `"0"`), `$var = value`, `$var != value`, `$var ~ regex`, `~*` (case-insensitive), `!~`, `!~*`. A positive regex match sets `$1`..`$9`. **Deviation:** the block may contain only `return`, `set`, `break` and nested `if`. nginx's "if is evil" comes from `if` being a half-location where other directives misbehave; here that can't happen. For a conditional header or upstream, compute a value with `map`. File tests (`-f`, `-d`, ...) aren't supported (modules never see paths): use `try_files`. Quote regexes that contain `{`, `}` or `;`. |
+| `break;` | server, location, if | | Stops the rest of the current block's script. |
+| `map $source $result { ... }` | http | | `default value;`, exact `key value;` (case-sensitive, checked first), then `~regex value;` / `~*regex value;` in order. A regex match sets `$1`..`$9` for the value. Values may contain variables, including other maps. `\~` starts a literal key with `~`. The result is computed when used, not cached. Reference cycles between maps fail that request with a 500 and are logged; they can't recurse without bound. `hostnames` and `include` are not supported. |
+| `add_header name value [always];` | http, server, location | | Sent on 200, 201, 204, 206, 301, 302, 303, 304, 307 and 308, or on every status with `always`. An empty value (e.g. from a `map`) sends nothing. **Deviations, both deliberate:** (1) levels **merge**. A location that adds one header keeps the server's and http's (nginx drops all inherited `add_header`s as soon as a level has its own, a classic way to lose HSTS). An inner entry replaces outer entries of the same name, and `add_header X "";` removes an inherited one. (2) The header **replaces** any header of that name already in the response (from a handler or an upstream) instead of duplicating it. Framing headers (`Content-Length`, `Connection`, ...) are a config error. Values with CR, LF or NUL are dropped and logged. |
+
+```nginx
+map $scheme $hsts { https "max-age=63072000; includeSubDomains"; }
+add_header Strict-Transport-Security $hsts always;   # only over TLS
+add_header X-Content-Type-Options nosniff always;
+
+location /admin {
+    if ($ssl_client_verify != SUCCESS) { return 403; }  # with ssl_verify_client optional
+    proxy_pass http://admin;
+}
+```
 
 Variables: `$uri $request_uri $args $is_args $host $server_name $scheme $https $remote_addr $remote_port`
 `$server_addr $server_port $request_method $server_protocol $document_root $request_filename $status`
@@ -217,27 +243,29 @@ A module declares directives (and variables), stores settings in typed per-scope
 top-down, then installs phase handlers. That is the same lifecycle as an nginx module.
 
 ```csharp
-public sealed class HeadersConf : ScopeConfig<HeadersConf>
+public sealed class MethodsConf : ScopeConfig<MethodsConf>
 {
-    public List<(string Name, ComplexValue Value)>? Add;
-    protected override void Inherit(HeadersConf parent) => Add ??= parent.Add;   // unset => parent's
+    public string[]? Allowed;
+    protected override void Inherit(MethodsConf parent) => Allowed ??= parent.Allowed;   // unset => parent's
 }
 
-public sealed class AddHeaderModule : IModule
+public sealed class AllowMethodsModule : IModule
 {
-    public string Name => "http_add_header";
+    public string Name => "http_allow_methods";
 
     public void Register(IModuleRegistry r) => r.AddDirective(new()
     {
-        Name = "add_header", Contexts = ContextKind.HttpAny, MinArgs = 2, MaxArgs = 2, Repeatable = true,
-        Handler = i => (i.Conf<HeadersConf>().Add ??= new()).Add((i.Args[0], i.Compile(i.Args[1]))),
+        Name = "allow_methods", Contexts = ContextKind.HttpAny, MinArgs = 1, MaxArgs = -1,
+        Handler = i => i.Conf<MethodsConf>().Allowed = i.Args,
     });
 
-    public void Configure(IModuleSetup setup) => setup.AddHandler(Phase.Rewrite, ctx =>
+    public void Configure(IModuleSetup setup) => setup.AddHandler(Phase.Access, ctx =>
     {
-        foreach (var (n, v) in ctx.Config<HeadersConf>().Add ?? [])
-            ctx.Response.Headers.Add(n, v.Evaluate(ctx));
-        return HandlerResult.Declined;               // let the chain continue
+        var allowed = ctx.Config<MethodsConf>().Allowed;
+        if (allowed is null || Array.IndexOf(allowed, ctx.Request.Method) >= 0)
+            return new(HandlerResult.Declined);                       // let the chain continue
+        ctx.Response.Headers.Set("Allow", string.Join(", ", allowed));
+        return new(HandlerResult.WithStatus(405));                  // core renders it (or the error_page)
     }, order: 0);
 }
 ```
@@ -262,6 +290,8 @@ Then add it to the list in `src/Httpgrl/Program.cs`. There is no reflection and 
   - `UpgradeAsync(idleTimeout)`: send a `101` and get the raw duplex stream back. Bytes the client already pipelined are included. The timeout is idleness across both directions.
   - `HasErrorPage(code)`, and `inv.ReadFile(...)` for config-time files (modules have no filesystem access of their own).
 - **Lifetime:** a module instance belongs to one loaded configuration. Every reload builds fresh instances from the list in `Program.cs`, so per-configuration state can live in fields. If a module implements `IDisposable`, it is disposed once the configuration it belongs to has been replaced *and* its last connection has ended (the proxy closes its upstream pools this way).
+- **Header filters:** `setup.AddHeaderFilter(ctx => ...)` runs once per response just before its head is written, for handler, proxied and core-rendered responses alike (`add_header` is one).
+- **Variables:** register fixed ones in `Register` (`r.AddVariable`). Declare config-defined ones while parsing with `inv.AddVariable` (`set` and `map` do this). Uses resolve after parsing, so order in the file doesn't matter. `ctx.SetCaptures(match)` makes a regex match the source of `$1`..`$9`.
 - **Config time:** `DirectiveInvocation` has `Flag/Size/Millis/Int` parsers and `Compile` (for `$variables`). Throw `inv.Error("...")` for errors that report `file:line`.
 - **Example:** the upgrade, exclusive-handler and body APIs are exercised by `TestModule` in `tests/Httpgrl.Tests/IntegrationTests.cs`.
 
@@ -271,7 +301,7 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 
 1. [x] **Reload without restart** (`SIGHUP`): re-read config and certificates; keep the old configuration if the new one fails; old connections finish on the old configuration.
 2. [x] **Revocation for client certificates** (`ssl_crl`): signed, unexpired CRLs for every CA in the chain.
-3. [ ] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
+3. [x] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
 4. [ ] **Rate limiting**: `limit_req` and `limit_conn` zones.
 5. [ ] **Hardening**: fuzzing the request, upstream-response and config parsers; long-running soak tests under load; CI on Windows and macOS.
 6. [ ] **Operations**: a status/metrics endpoint, `$request_id`, gzip/brotli (BCL `System.IO.Compression`), a systemd unit.

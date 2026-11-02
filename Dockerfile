@@ -21,6 +21,7 @@ COPY src/Httpgrl.Abstractions/Httpgrl.Abstractions.csproj src/Httpgrl.Abstractio
 COPY src/Httpgrl.Core/Httpgrl.Core.csproj src/Httpgrl.Core/
 COPY src/Httpgrl.Modules.StaticFiles/Httpgrl.Modules.StaticFiles.csproj src/Httpgrl.Modules.StaticFiles/
 COPY src/Httpgrl.Modules.Rewrite/Httpgrl.Modules.Rewrite.csproj src/Httpgrl.Modules.Rewrite/
+COPY src/Httpgrl.Modules.Headers/Httpgrl.Modules.Headers.csproj src/Httpgrl.Modules.Headers/
 COPY src/Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj src/Httpgrl.Modules.Proxy/
 COPY src/Httpgrl/Httpgrl.csproj src/Httpgrl/
 COPY tests/Httpgrl.Tests/Httpgrl.Tests.csproj tests/Httpgrl.Tests/

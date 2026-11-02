@@ -1,6 +1,7 @@
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
+using System.Text.RegularExpressions;
 
 namespace Httpgrl;
 
@@ -54,8 +55,10 @@ public abstract class HttpContext
     /// <summary>MIME type for a file name by extension, per the location's <c>types</c>/<c>default_type</c>.</summary>
     public abstract string ContentTypeFor(string fileName);
     public abstract string? Variable(string name);
-    /// <summary>Regex capture from the matched location (0..9), or null.</summary>
+    /// <summary>Regex capture (0..9) from the last successful match: the location's, or a later one set by a module (e.g. <c>if</c>, <c>map</c>). Null if none.</summary>
     public abstract string? Capture(int n);
+    /// <summary>Make <paramref name="match"/> the source of <c>$1</c>..<c>$9</c> from now on (nginx: the last regex that matched wins).</summary>
+    public abstract void SetCaptures(Match match);
 
     /// <summary>
     /// Send the response head (Status must be 101) and take over the raw connection. The returned stream

@@ -118,6 +118,16 @@ public sealed class DirectiveInvocation(
     /// Read a file at config time (certificates, CA bundles...), relative to the main config's directory.
     /// Modules never touch the filesystem themselves; this is the sanctioned door, and it's closed once the server runs.
     /// </summary>
+    /// <summary>
+    /// Declare a variable while parsing (nginx's <c>set</c>/<c>map</c>). Uses of <c>$name</c> anywhere in the config,
+    /// even earlier ones, resolve to it; a name never declared is reported when parsing ends.
+    /// </summary>
+    public void AddVariable(string name, VariableGetter getter)
+    {
+        try { services.AddVariable(name, getter); }
+        catch (InvalidOperationException e) { throw Error(e.Message); }
+    }
+
     public byte[] ReadFile(string path, long maxBytes = 1 << 20)
     {
         try { return services.ReadFile(path, maxBytes); }
@@ -144,6 +154,7 @@ public interface IConfigServices
 {
     ComplexValue Compile(string raw);
     byte[] ReadFile(string path, long maxBytes);
+    void AddVariable(string name, VariableGetter getter);
 }
 
 public static class ConfigValue

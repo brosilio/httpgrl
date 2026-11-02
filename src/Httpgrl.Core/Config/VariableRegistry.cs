@@ -32,9 +32,27 @@ internal sealed class VariableRegistry
         return null;
     }
 
-    public ComplexValue Compile(string raw)
+    /// <summary>Uses of names not (yet) registered: the parts array and slot to patch once parsing has ended.</summary>
+    private readonly List<(string Name, ComplexValue.Part[] Parts, int Index, SourceLocation? At)> _pending = new();
+
+    /// <summary>
+    /// Bind every forward reference (a variable used before the <c>set</c>/<c>map</c> that declares it, as nginx
+    /// allows). Patching the compiled parts in place keeps evaluation a direct call.
+    /// </summary>
+    public void ResolvePending()
+    {
+        foreach (var (name, parts, index, at) in _pending)
+        {
+            var g = Resolve(name) ?? throw new ConfigException($"unknown variable \"${name}\"", at);
+            parts[index] = new ComplexValue.Part(null, g);
+        }
+        _pending.Clear();
+    }
+
+    public ComplexValue Compile(string raw, SourceLocation? at = null)
     {
         var parts = new List<ComplexValue.Part>();
+        var deferred = new List<(string, int)>();
         var lit = new System.Text.StringBuilder();
         int i = 0;
         while (i < raw.Length)
@@ -62,14 +80,23 @@ internal sealed class VariableRegistry
                     if (i >= raw.Length || raw[i] != '}') throw new FormatException($"missing closing \"}}\" in \"{raw}\"");
                     i++;
                 }
-                getter = Resolve(name) ?? throw new FormatException($"unknown variable \"${name}\"");
+                getter = Resolve(name) ?? Unresolved;
+                if (lit.Length > 0) { parts.Add(new(lit.ToString(), null)); lit.Clear(); }
+                if (ReferenceEquals(getter, Unresolved)) deferred.Add((name, parts.Count));
+                parts.Add(new(null, getter));
+                continue;
             }
             if (lit.Length > 0) { parts.Add(new(lit.ToString(), null)); lit.Clear(); }
             parts.Add(new(null, getter));
         }
         if (lit.Length > 0) parts.Add(new(lit.ToString(), null));
-        return new ComplexValue(raw, parts.ToArray());
+        var arr = parts.ToArray();
+        foreach (var (name, index) in deferred) _pending.Add((name, arr, index, at));
+        // ComplexValue keeps this array (not a copy), so ResolvePending's patch is what Evaluate sees.
+        return new ComplexValue(raw, arr);
     }
+
+    private static readonly VariableGetter Unresolved = _ => throw new InvalidOperationException("unresolved variable");
 
     private static VariableGetter[] MakeCaptures()
     {

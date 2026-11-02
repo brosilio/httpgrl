@@ -187,6 +187,8 @@ internal sealed class HttpContextImpl : HttpContext
 
     public override string? Variable(string name) => Rt.Vars.Resolve(name)?.Invoke(this);
 
+    public override void SetCaptures(Match match) => LocMatch = match;
+
     public override string? Capture(int n)
     {
         var m = LocMatch;

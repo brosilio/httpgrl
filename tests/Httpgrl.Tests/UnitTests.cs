@@ -253,8 +253,9 @@ internal static class UnitTests
         new Httpgrl.Core.Modules.HttpCoreModule(Path.GetTempPath()).Register(reg);
         new Httpgrl.Core.Modules.SslModule().Register(reg);
         foreach (var m in StaticFiles.Modules()) m.Register(reg);
-        new Httpgrl.Modules.Rewrite.ReturnModule().Register(reg);
+        new Httpgrl.Modules.Rewrite.RewriteModule().Register(reg);
         var root = new ConfigParser(reg.Directives, vars).ParseText(text);
+        vars.ResolvePending();
         root.MergeAndFreeze();
         return root;
     }

@@ -38,6 +38,7 @@ public static class ServerBuilder
         }
 
         var root = parse(new ConfigParser(registry.Directives, registry.Vars));
+        registry.Vars.ResolvePending();
         root.MergeAndFreeze();
 
         var main = root.Get<MainConf>();
@@ -95,6 +96,9 @@ public static class ServerBuilder
 
         public void AddHandler(Phase phase, HttpHandler handler, int order) => _handlers.Add((phase, order, _handlers.Count, handler));
 
+        private readonly List<(int Order, int Seq, HeaderFilter Filter)> _filters = new();
+        public void AddHeaderFilter(HeaderFilter filter, int order) => _filters.Add((order, _filters.Count, filter));
+
         public RequestPipeline BuildPipeline()
         {
             HttpHandler[] Of(Phase p)
@@ -103,7 +107,11 @@ public static class ServerBuilder
                 l.Sort((a, b) => a.Order != b.Order ? a.Order.CompareTo(b.Order) : a.Seq.CompareTo(b.Seq));
                 return l.ConvertAll(h => h.Handler).ToArray();
             }
-            return new RequestPipeline(Of(Phase.Rewrite), Of(Phase.Access), Of(Phase.Content), Of(Phase.Log));
+            _filters.Sort((a, b) => a.Order != b.Order ? a.Order.CompareTo(b.Order) : a.Seq.CompareTo(b.Seq));
+            return new RequestPipeline(Of(Phase.Rewrite), Of(Phase.Access), Of(Phase.Content), Of(Phase.Log))
+            {
+                HeaderFilters = _filters.ConvertAll(f => f.Filter).ToArray(),
+            };
         }
     }
 }

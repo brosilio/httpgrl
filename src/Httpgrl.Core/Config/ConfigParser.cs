@@ -31,7 +31,12 @@ internal sealed class ConfigParser(IReadOnlyDictionary<string, List<Directive>> 
         return root;
     }
 
-    public ComplexValue Compile(string raw) => vars.Compile(raw);
+    public ComplexValue Compile(string raw) => vars.Compile(raw, _current);
+
+    public void AddVariable(string name, VariableGetter getter) => vars.Add(name, getter);
+
+    /// <summary>The directive being handled (for errors about variables resolved after parsing).</summary>
+    private SourceLocation _current;
 
     public byte[] ReadFile(string path, long maxBytes)
     {
@@ -127,6 +132,7 @@ internal sealed class ConfigParser(IReadOnlyDictionary<string, List<Directive>> 
             }
         }
 
+        _current = src;
         var inv = new DirectiveInvocation(name, args, src, scope, child, raw, this);
         try { d.Handler(inv); }
         catch (ConfigException) { throw; }
@@ -254,7 +260,8 @@ internal sealed class Lexer(string text, string file)
             if (c == quote)
             {
                 _pos++;
-                if (_pos < text.Length && text[_pos] is not (' ' or '\t' or '\r' or '\n' or ';' or '{' or '}'))
+                // ')' closes an if condition: if ($a = "x")
+                if (_pos < text.Length && text[_pos] is not (' ' or '\t' or '\r' or '\n' or ';' or '{' or '}' or ')'))
                     throw new ConfigException($"unexpected \"{text[_pos]}\" after quoted string", At(_line));
                 return sb.ToString();
             }

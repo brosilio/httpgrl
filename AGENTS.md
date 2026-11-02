@@ -61,6 +61,12 @@ These are deliberate design decisions made by the project owner, not accidents t
    - Never design for, or protect, a "dev instance's" state.
    - Never kill processes by pattern (`pkill -f`): it can hit your own shell or unrelated software. Use the exact PID.
 
+## Deliberate nginx deviations worth protecting
+
+- `if` blocks accept only rewrite directives (`return`, `set`, `break`, `if`). Don't let other modules register into
+  the `if` context: that recreates nginx's "if is evil". Conditional behaviour goes through `map` variables.
+- `add_header` merges across levels, and replaces same-named response headers. Both prevent silently losing security headers.
+
 ## Reload
 
 `SIGHUP` builds a complete new configuration (fresh module instances) and swaps it in only if *everything*

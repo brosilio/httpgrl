@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/Httpgrl.Abstractions/Httpgrl.Abstractions.csproj" />
     <Project Path="src/Httpgrl.Core/Httpgrl.Core.csproj" />
+    <Project Path="src/Httpgrl.Modules.Headers/Httpgrl.Modules.Headers.csproj" />
     <Project Path="src/Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj" />
     <Project Path="src/Httpgrl.Modules.Rewrite/Httpgrl.Modules.Rewrite.csproj" />
     <Project Path="src/Httpgrl.Modules.StaticFiles/Httpgrl.Modules.StaticFiles.csproj" />

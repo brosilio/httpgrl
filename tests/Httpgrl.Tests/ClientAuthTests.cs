@@ -185,6 +185,17 @@ internal static class ClientAuthTests
             T.Eq(Rejected, await Get(s.Port, "secure.test", P.Alice));
         });
 
+        T.Add("mtls: optional client certificates, required per location with if", async () =>
+        {
+            await using var s = TestServer.Start(Conf("optional").Replace("return 200 \"$ssl_client_verify|$ssl_client_s_dn|$ssl_client_fingerprint\";", """
+                location / { return 200 "public"; }
+                location /admin { if ($ssl_client_verify != SUCCESS) { return 403; } return 200 "admin $ssl_client_s_dn"; }
+                """), Populate);
+            T.Eq("public", Body(await Get(s.Port, "secure.test", null)));
+            T.Eq(403, Status(await GetPath(s.Port, null, "/admin")));
+            T.Eq("admin CN=alice", Body(await GetPath(s.Port, P.Alice, "/admin")));
+        });
+
         T.Add("mtls: config errors (missing CA, unsupported revocation directives)", () =>
         {
             const string NoCa = """
@@ -196,6 +207,9 @@ internal static class ClientAuthTests
             return Task.CompletedTask;
         });
     }
+
+    private static Task<string> GetPath(int port, X509Certificate2? cert, string path) =>
+        Get(port, "secure.test", cert, path: path);
 
     private static string CrlPem(X509Certificate2 issuer, params X509Certificate2[] revoked) =>
         CrlPem(issuer, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1), revoked);
@@ -210,7 +224,7 @@ internal static class ClientAuthTests
 
     /// <summary>One request over TLS; <see cref="Rejected"/> if the server refused the handshake or closed without answering.</summary>
     private static async Task<string> Get(int port, string sni, X509Certificate2? cert, X509Certificate2[]? chain = null,
-        string? host = null, SslProtocols protocols = SslProtocols.None, string extraHeaders = "")
+        string? host = null, SslProtocols protocols = SslProtocols.None, string extraHeaders = "", string path = "/")
     {
         using var c = await Connect(port);
         await using var ssl = new SslStream(new NetworkStream(c, ownsSocket: false));
@@ -227,7 +241,7 @@ internal static class ClientAuthTests
             await ssl.AuthenticateAsClientAsync(opts, cts.Token);
             // Under TLS 1.3 the server judges our certificate after our side of the handshake is done:
             // a rejection arrives as an alert on the first read.
-            await ssl.WriteAsync(Encoding.ASCII.GetBytes($"GET / HTTP/1.1\r\nHost: {host ?? sni}\r\nConnection: close\r\n{extraHeaders}\r\n"), cts.Token);
+            await ssl.WriteAsync(Encoding.ASCII.GetBytes($"GET {path} HTTP/1.1\r\nHost: {host ?? sni}\r\nConnection: close\r\n{extraHeaders}\r\n"), cts.Token);
             var resp = await new StreamReader(ssl, Encoding.Latin1).ReadToEndAsync(cts.Token);
             return resp.Length == 0 ? Rejected : resp;
         }

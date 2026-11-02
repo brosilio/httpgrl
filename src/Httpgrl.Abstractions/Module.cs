@@ -33,7 +33,15 @@ public interface IModuleSetup
     IEnumerable<IConfigScope> ScopesOf(ContextKind kind);
     /// <summary>Install a phase handler. Lower <paramref name="order"/> runs first.</summary>
     void AddHandler(Phase phase, HttpHandler handler, int order);
+    /// <summary>
+    /// Install a header filter: called once per response, just before its head is written (handler, proxied and
+    /// core-rendered responses alike; not for 444, which has no head). Lower <paramref name="order"/> runs first.
+    /// </summary>
+    void AddHeaderFilter(HeaderFilter filter, int order);
 }
+
+/// <summary>Last chance to edit <c>ctx.Response.Status</c>-dependent headers. Synchronous: no I/O here.</summary>
+public delegate void HeaderFilter(HttpContext ctx);
 
 /// <summary>Request processing phases, in execution order (subset of nginx's).</summary>
 public enum Phase

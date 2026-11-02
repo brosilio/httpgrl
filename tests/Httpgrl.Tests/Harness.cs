@@ -108,7 +108,7 @@ internal sealed class TestServer : IAsyncDisposable
     private IModule[] _extra = [];
 
     private static IModule[] Modules(IModule[] extra) =>
-        [new Httpgrl.Modules.Rewrite.ReturnModule(), new Httpgrl.Modules.Proxy.ProxyModule(), .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(), .. extra];
+        [new Httpgrl.Modules.Rewrite.RewriteModule(), new Httpgrl.Modules.Rewrite.MapModule(), new Httpgrl.Modules.Headers.HeadersModule(), new Httpgrl.Modules.Proxy.ProxyModule(), .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(), .. extra];
 
     /// <summary>Swap in a new configuration ({DIR} expands as in Start). Fresh first-party modules; test modules are reused.</summary>
     public Task<bool> Reload(string config) =>

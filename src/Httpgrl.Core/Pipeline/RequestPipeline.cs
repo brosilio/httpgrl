@@ -11,6 +11,8 @@ internal sealed class RequestPipeline(HttpHandler[] rewrite, HttpHandler[] acces
 {
     private const int MaxRedirects = 10;
 
+    public HeaderFilter[] HeaderFilters { get; init; } = [];
+
     public async ValueTask RunAsync(HttpContextImpl ctx)
     {
         try { await ProcessAsync(ctx).ConfigureAwait(false); }

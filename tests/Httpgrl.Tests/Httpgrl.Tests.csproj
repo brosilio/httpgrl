@@ -11,6 +11,7 @@
     <ProjectReference Include="../../src/Httpgrl.Core/Httpgrl.Core.csproj" />
     <ProjectReference Include="../../src/Httpgrl.Modules.StaticFiles/Httpgrl.Modules.StaticFiles.csproj" />
     <ProjectReference Include="../../src/Httpgrl.Modules.Rewrite/Httpgrl.Modules.Rewrite.csproj" />
+    <ProjectReference Include="../../src/Httpgrl.Modules.Headers/Httpgrl.Modules.Headers.csproj" />
     <ProjectReference Include="../../src/Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj" />
   </ItemGroup>
 </Project>
