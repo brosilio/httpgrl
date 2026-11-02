@@ -1,0 +1,16 @@
+# docker compose up --build
+services:
+  httpgrl:
+    build: .
+    image: httpgrl:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./conf/html:/srv/www:ro
+      # - ./my.conf:/etc/httpgrl/httpgrl.conf:ro
+    # The server writes nothing to disk and needs no privileges.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 15s   # a little over worker_shutdown_timeout
+    restart: unless-stopped

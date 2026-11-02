@@ -14,6 +14,24 @@ artifacts/linux-x64/httpgrl -c conf/httpgrl.conf  # -t: test config and exit
 Output is a single ~8 MB executable. Logs go to stdout as one JSON object per line.
 `SIGTERM`/`SIGINT`/`SIGQUIT` shut down gracefully, bounded by `worker_shutdown_timeout`.
 
+## Docker
+
+```sh
+docker build -t httpgrl .                              # native AOT binary on a distroless, non-root base (~32 MB)
+docker run --rm -p 8080:8080 --read-only --cap-drop ALL httpgrl
+docker run --rm -p 8080:8080 -v "$PWD/site:/srv/www:ro" -v "$PWD/my.conf:/etc/httpgrl/httpgrl.conf:ro" httpgrl
+docker build --target test .                           # run the test suite inside the build
+docker compose up --build                              # see compose.yaml
+```
+
+- **Base image:** `mcr.microsoft.com/dotnet/runtime-deps:10.0-noble-chiseled`. That's libc, OpenSSL and CA certificates; no shell, no package manager. The binary needs no .NET runtime.
+- **User and port:** runs as the non-root `app` user (uid 1654), so it listens on 8080. Map it with `-p 80:8080`.
+- **Hardening:** the server writes nothing to disk, so `--read-only` and `--cap-drop ALL` just work.
+- **Files:** config is `/etc/httpgrl/httpgrl.conf` (from `conf/docker/httpgrl.conf`), mime types are `/etc/httpgrl/mime.types`, content is `/srv/www`. The bundled config is validated with `-t` during the build.
+- **Shutdown:** `docker stop` sends SIGTERM, which is a graceful shutdown bounded by `worker_shutdown_timeout`.
+- **Architecture:** the image targets the architecture it's built on (`linux-x64` or `linux-arm64`, via `TARGETARCH`). Native AOT doesn't cross-compile across architectures without a cross toolchain, so multi-arch builds run each platform under emulation.
+- **No `HEALTHCHECK`:** the image has no shell or curl to run one with. Use your orchestrator's HTTP probe against a path you serve.
+
 ## Layout
 
 | Project | Role |
