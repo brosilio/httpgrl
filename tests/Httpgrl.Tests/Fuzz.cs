@@ -202,7 +202,7 @@ internal static class Fuzz
     {
         if (p.Length == 0 || p[0] != '/') throw new Finding($"path \"{p}\" not absolute");
         if (p.Contains("//", StringComparison.Ordinal)) throw new Finding($"path \"{p}\" has an empty segment");
-        if (p.Contains('\0')) throw new Finding("path contains NUL");
+        foreach (char c in p) if (c < ' ' || c == (char)0x7f) throw new Finding($"path contains control character 0x{(int)c:x2}");
         foreach (var seg in p.Split('/'))
             if (seg is "." or "..") throw new Finding($"path \"{p}\" has a dot segment");
         for (int k = 0; k < p.Length; k++)

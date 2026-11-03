@@ -57,6 +57,14 @@ public abstract class HttpContext
     public abstract string? Variable(string name);
     /// <summary>Regex capture (0..9) from the last successful match: the location's, or a later one set by a module (e.g. <c>if</c>, <c>map</c>). Null if none.</summary>
     public abstract string? Capture(int n);
+    /// <summary>
+    /// Change the request URI in place (nginx's <c>rewrite</c>): <paramref name="path"/> is in decoded form and is
+    /// normalized by the core; <paramref name="query"/> is the new query string without '?' (characters that can't
+    /// appear on a request line are percent-encoded). With <paramref name="reselectLocation"/>, the location is chosen
+    /// again for the new path (internal locations are reachable, as with any internal redirect). False if the path is
+    /// invalid (e.g. escapes above "/"); nothing changes then. <c>$request_uri</c> keeps the original.
+    /// </summary>
+    public abstract bool SetUri(string path, string query, bool reselectLocation);
     /// <summary>Make <paramref name="match"/> the source of <c>$1</c>..<c>$9</c> from now on (nginx: the last regex that matched wins).</summary>
     public abstract void SetCaptures(Match match);
 

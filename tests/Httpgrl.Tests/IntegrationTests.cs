@@ -233,11 +233,14 @@ internal static class IntegrationTests
             r = await s.Raw(Get("/bare"));
             T.Eq(302, Status(r));
             T.Eq("https://example.test/x", Header(r, "Location"));
-            // %0d%0a decodes into $uri; it must come back out encoded, never as a header break.
+            // %0d%0a would decode into $uri: control characters in a path are refused outright...
             r = await s.Raw(Get("/decoded%0d%0aSet-Cookie:%20pwned=1"));
-            T.Eq(302, Status(r));
+            T.Eq(400, Status(r));
             T.Eq(null, Header(r, "Set-Cookie"));
-            T.Eq("/to/decoded%0D%0ASet-Cookie:%20pwned=1", Header(r, "Location"));
+            // ...and what does decode (spaces, non-ASCII) comes back out encoded in the Location header.
+            r = await s.Raw(Get("/decoded%20%C3%A9"));
+            T.Eq(302, Status(r));
+            T.Eq("/to/decoded%20%C3%A9", Header(r, "Location"));
             r = await s.Raw(Get("/nf"));
             T.Eq(404, Status(r));
             T.Eq("custom", Body(r));

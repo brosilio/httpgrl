@@ -28,7 +28,10 @@ internal static class UriNormalizer
                 b = (byte)((hi << 4) | lo);
                 i += 2;
             }
-            if (b == 0) return null;
+            // No control characters in a path, encoded or not (stricter than nginx): no legitimate path has one, and a
+            // decoded CR/LF would reach headers via $uri, and slip past anchored regexes ("$" also matches before a
+            // final newline, in .NET as in PCRE).
+            if (b < 0x20 || b == 0x7f) return null;
             buf[n++] = b;
         }
         n = Resolve(buf[..n]);
@@ -41,7 +44,8 @@ internal static class UriNormalizer
     /// <summary>Normalize an already-decoded path (internal redirect targets). Returns null if invalid.</summary>
     public static string? NormalizeDecoded(string path)
     {
-        if (path.Length == 0 || path[0] != '/' || path.Contains('\0')) return null;
+        if (path.Length == 0 || path[0] != '/') return null;
+        foreach (char c in path) if (c < ' ' || c == (char)0x7f) return null;
         if (!NeedsResolve(path)) return path;
         int max = Encoding.UTF8.GetMaxByteCount(path.Length);
         Span<byte> buf = max <= 2048 ? stackalloc byte[max] : new byte[max];

@@ -83,10 +83,9 @@ internal static class ProxyTests
             var fixedUri = Body(await s.Raw(Get("/uri/x?y=1")));
             T.Contains("GET /fixed?y=1 HTTP/1.1", fixedUri);       // a URI part with variables replaces the request URI
             T.Contains("Host: echo", fixedUri);
-            var rawResp = await s.Raw(Get("/raw/a%20b%0d%0aX:%201"));
-            var raw = Body(rawResp);
-            T.Contains("GET /raw/a%20b%0D%0AX:%201 HTTP/1.1", raw); // a decoded $uri can't break the request line
-            T.True(!raw.Contains("\r\nX: 1", StringComparison.Ordinal));
+            var raw = Body(await s.Raw(Get("/raw/a%20b%C3%A9")));
+            T.Contains("GET /raw/a%20b%C3%A9 HTTP/1.1", raw);       // a decoded $uri can't break the request line
+            T.Eq(400, Status(await s.Raw(Get("/raw/a%0d%0aX:%201")))); // and control characters never get in at all
 
             T.Contains("needs upstream blocks", T.Throws<ConfigException>(() => TestServer.Start(Conf("location / { proxy_pass http://$host; }"))).Message);
         });

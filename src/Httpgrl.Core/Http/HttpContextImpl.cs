@@ -200,6 +200,36 @@ internal sealed class HttpContextImpl : HttpContext
 
     public override void SetCaptures(Match match) => LocMatch = match;
 
+    public override bool SetUri(string path, string query, bool reselectLocation)
+    {
+        var p = UriNormalizer.NormalizeDecoded(path);
+        if (p is null) return false;
+        Req.PathValue = p;
+        Req.QueryValue = EscapeQuery(query);
+        if (reselectLocation)
+        {
+            Internal = true;
+            var loc = ServerRt.Find(p, out var m);
+            SelectLocation(loc, m);
+        }
+        return true;
+    }
+
+    /// <summary>A query built from decoded parts may hold spaces, CR/LF or non-ASCII: encode what can't go on a request line.</summary>
+    private static string EscapeQuery(string q)
+    {
+        bool clean = true;
+        foreach (char c in q) if (c is <= ' ' or >= (char)0x7f or '#') { clean = false; break; }
+        if (clean) return q;
+        var sb = new System.Text.StringBuilder(q.Length + 16);
+        foreach (byte b in System.Text.Encoding.UTF8.GetBytes(q))
+        {
+            if (b is > (byte)' ' and < 0x7f and not (byte)'#') sb.Append((char)b);
+            else sb.Append('%').Append("0123456789ABCDEF"[b >> 4]).Append("0123456789ABCDEF"[b & 15]);
+        }
+        return sb.ToString();
+    }
+
     public Hosting.ConnectionManager? Mgr;
     public override ServerStats Stats() => Mgr?.Stats() ?? default;
 

@@ -67,6 +67,54 @@ internal static class ScriptTests
             T.True(Status(await s.Raw(Req("/"))) != 500); // break skipped the return; content phase ran
         });
 
+        T.Add("rewrite: last, break, no flag, redirects, argument rules, internal locations, cycles", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR}/www;
+                  rewrite ^/old/(.*)$ /new/$1 last;                       # server level: the location follows the new URI
+                  rewrite ^/away$ http://example.test/there;              # absolute: a 302
+                  location /new/ { return 200 "new:$uri:$args"; }
+                  location /chain/ { rewrite ^/chain/(.*)$ /step/$1; rewrite ^/step/(.*)$ /final/$1; }
+                  location /final/ { return 200 "final:$uri"; }
+                  location /brk/ { rewrite ^/brk/(.*)$ /static/$1 break; } # stays here and serves the file
+                  location /static/ { return 200 "wrong location"; }
+                  location /loop/ { rewrite ^/loop/(.*)$ /loop/$1 last; }
+                  location /args/ { rewrite ^/args/(.*)$ /new/$1?x=1; }
+                  location /noargs/ { rewrite ^/noargs/(.*)$ /new/$1?; }
+                  location /redir/ { rewrite ^/redir/(.*)$ /new/$1 redirect; }
+                  location /perm/ { rewrite ^ https://other.test$uri permanent; }
+                  location /int { internal; return 200 "internal"; }
+                  location /toint/ { rewrite ^ /int last; }
+                  location /esc/ { rewrite ^/esc/(.*)$ /../../$1 break; }
+                  location /sp/ { rewrite ^/sp/(.*)$ /new/x?q=$1; }
+                  location /cond/ { if ($arg_go) { rewrite ^ /new/cond last; } return 200 "stayed"; }
+                } }
+                """, d => { Directory.CreateDirectory(Path.Combine(d, "www", "static")); File.WriteAllText(Path.Combine(d, "www", "static", "f.txt"), "file"); });
+            T.Eq("new:/new/a:", Body(await s.Raw(Req("/old/a"))));
+            var away = await s.Raw(Req("/away"));
+            T.Eq(302, Status(away));
+            T.Eq("http://example.test/there", Header(away, "Location"));
+            T.Eq("final:/final/x", Body(await s.Raw(Req("/chain/x"))));
+            T.Eq("file", Body(await s.Raw(Req("/brk/f.txt"))));
+            T.Eq(500, Status(await s.Raw(Req("/loop/x"))));
+            T.Eq("new:/new/a:x=1&y=2", Body(await s.Raw(Req("/args/a?y=2"))));
+            T.Eq("new:/new/a:", Body(await s.Raw(Req("/noargs/a?y=2"))));
+            var redir = await s.Raw(Req("/redir/a?y=2"));
+            T.Eq(302, Status(redir));
+            T.Eq("/new/a?y=2", Header(redir, "Location"));
+            var perm = await s.Raw(Req("/perm/x"));
+            T.Eq(301, Status(perm));
+            T.Eq("https://other.test/perm/x", Header(perm, "Location"));
+            T.Eq("internal", Body(await s.Raw(Req("/toint/z"))));
+            T.Eq(404, Status(await s.Raw(Req("/int"))));
+            T.Eq(500, Status(await s.Raw(Req("/esc/x"))));                 // can't climb above /
+            T.Eq("new:/new/x:q=a%20b%C3%A9", Body(await s.Raw(Req("/sp/a%20b%C3%A9")))); // decoded capture re-encoded in the query
+            T.Eq(400, Status(await s.Raw(Req("/sp/a%0d%0aSet-Cookie:%20x"))));                 // control characters never get in
+            T.Eq("stayed", Body(await s.Raw(Req("/cond/"))));
+            T.Eq("new:/new/cond:go=1", Body(await s.Raw(Req("/cond/?go=1"))));
+            T.Contains("invalid flag", T.Throws<ConfigException>(() => TestServer.Start("http { server { listen 127.0.0.1:0; rewrite ^ /x sometimes; } }")).Message);
+        });
+
         T.Add("if: only rewrite directives inside; file tests and bad syntax are config errors", () =>
         {
             string Err(string loc) => T.Throws<ConfigException>(() => TestServer.Start($$"""http { server { listen 127.0.0.1:0; location / { {{loc}} } } }""")).Message;
@@ -165,11 +213,16 @@ internal static class ScriptTests
 
         T.Add("add_header: a variable carrying CR/LF never splits the response", async () =>
         {
-            await using var s = TestServer.Start("""http { server { listen 127.0.0.1:0; add_header X-Path $uri always; location / { return 200 ok; } } }""");
+            await using var s = TestServer.Start("""http { server { listen 127.0.0.1:0; add_header X-Path $uri always; add_header X-Set $v always; location / { set $v "a\r\nSet-Cookie: pwned"; return 200 ok; } } }""");
+            // First defence: control characters never get into a path.
             var r = await s.Raw(Req("/a%0d%0aSet-Cookie:%20pwned"));
+            T.Eq(400, Status(r));
             T.True(!r.Contains("\r\nSet-Cookie", StringComparison.OrdinalIgnoreCase));
-            T.Eq(200, Status(r)); // the path is legal; the header is what's refused
-            T.Eq(null, Header(r, "X-Path"));
+            // Second defence: a value that does carry CR/LF (here from set) is dropped, never sent.
+            var r2 = await s.Raw(Req("/x"));
+            T.Eq(200, Status(r2));
+            T.True(!r2.Contains("\r\nSet-Cookie", StringComparison.OrdinalIgnoreCase));
+            T.Eq(null, Header(r2, "X-Set"));
             T.Contains("add_header value dropped", s.LogText());
         });
     }
