@@ -264,6 +264,7 @@ server {
 | `upstream_resolve_interval t\|off;` | http | `30s` | **Deviation:** every upstream hostname (in `upstream` blocks and `proxy_pass`) is re-resolved this often through the system resolver (`/etc/hosts`, nsswitch, DNS). nginx resolves once unless you use a `resolver` and `resolve`. A failed or empty answer keeps the last good addresses. Peers whose address stays keep their failure counts and pooled connections; removed ones finish in-flight requests and close their idle connections. `off` resolves once at load. The system resolver doesn't report TTLs, hence an interval. |
 | `proxy_set_header name value;` | http, server, location | | An empty value removes the header. Setting any header at a level replaces the inherited list (nginx). `Host` defaults to the upstream's authority (`$proxy_host`). `Connection`/`Upgrade` are accepted but ignored, because the module manages them. |
 | `proxy_hide_header name;` | | | Drop a response header coming from the upstream. |
+| `proxy_buffering on\|off;` / `proxy_buffers n size;` | http, server, location | `on`, `8 8k` | With buffering, the upstream body is read into memory (up to n×size) while the client is being written to, so the upstream connection goes back to the pool as soon as the body is in, however slowly the client reads. Bodies that arrived with the head take a fast path; bodies known to be larger than the buffer are streamed (buffering couldn't free the upstream early, so it would only cost). The client is flushed whenever the buffer runs dry, so streamed responses (SSE, long polls) still arrive promptly. An upstream's `X-Accel-Buffering: no` turns it off for that response, and the header isn't forwarded. **Deviation:** nothing spills to disk; past the buffer, backpressure applies. A truncated buffered body becomes a clean 502 rather than a cut-off 200. `proxy_max_temp_file_size`, `proxy_temp_path`, `proxy_busy_buffers_size` and `proxy_temp_file_write_size` are accepted and ignored with a warning. |
 | `proxy_redirect default\|off;` / `proxy_redirect redirect replacement;` | http, server, location | `default` | Rewrites `Location` and the URL in `Refresh` from the upstream. `default` maps the `proxy_pass` URL to the location: with `location /one/ { proxy_pass http://app:8080/two/; }`, `http://app:8080/two/x` becomes `/one/x`. That needs a prefix or exact location, so regex and named locations get no default mapping. Prefix rules match case-insensitively and replace the prefix; `~regex` / `~*regex` rules replace the whole value and can use `$1`..`$9`; replacements may contain variables. The first matching rule wins. A level with rules replaces the inherited list; `off` turns rewriting off. |
 | `proxy_http_version 1.0\|1.1;` | | **`1.1`** | nginx defaults to 1.0. 1.1 is required for keep-alive and Upgrade. |
 | `proxy_connect_timeout` / `proxy_send_timeout` / `proxy_read_timeout` | | `10s` / `60s` / `60s` | Connect timeout includes the TLS handshake. Send/read are per operation. For upgraded tunnels, `proxy_read_timeout` is the idle timeout counted across *both* directions. |
@@ -301,6 +302,10 @@ heap growth (garbage awaiting a full GC, which is normal) from native growth (wh
 ```sh
 dotnet run -c Release --project tests/Httpgrl.Tests -- --soak artifacts/linux-x64/httpgrl 300   # add --no-reload to isolate reloads
 ```
+
+**Benchmark.** There's no wrk dependency: `--bench url [seconds] [connections]` runs a keep-alive load generator. On one
+box, proxying to a second httpgrl with buffering on: about 54k req/s for 1 KiB responses and about 2 GiB/s for 1 MiB,
+level with buffering off.
 
 A finding prints the seed, iteration and input, which reproduce it exactly. It's dependency-free and not
 coverage-guided, so it's a complement to, not a replacement for, a coverage-guided fuzzer.
@@ -433,7 +438,7 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 4. [x] **Rate limiting**: `limit_req` and `limit_conn` zones.
 5. [ ] **Hardening**: ~~fuzzing the parsers~~ (done: request, URI, chunked, upstream, config, CRL); ~~soak test~~ (done: `--soak`); CI on Windows and macOS.
 6. [x] **Operations**: status/metrics endpoint (`stub_status`), `$request_id`, `allow`/`deny`, gzip/brotli, a hardened systemd unit.
-7. [ ] **Proxy**: ~~`proxy_redirect`~~, ~~runtime DNS re-resolution~~, ~~active health checks~~, ~~variables in `proxy_pass`~~ (done); `proxy_buffering on`.
+7. [x] **Proxy**: `proxy_redirect`, runtime DNS re-resolution, active health checks, variables in `proxy_pass` (upstream names only), `proxy_buffering`.
 8. [ ] **HTTP/2.**
 9. [ ] **Release process**: CI on push, a first `v0.x` tag, signed images.
 

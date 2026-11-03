@@ -3,6 +3,7 @@ using System.Buffers.Text;
 using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using System.Security.Authentication;
+using System.IO.Pipelines;
 using System.Text;
 
 namespace Httpgrl.Modules.Proxy;
@@ -366,17 +367,19 @@ internal static class ProxyHandler
         }
 
         r.Status = up.Status;
+        // A body known to exceed the buffer can't free the upstream early (backpressure holds it until the client has
+        // nearly everything), so buffering it would be pure overhead: stream it.
+        bool buffered = conf.Buffering && up.Framing != BodyFraming.None
+            && !(up.Framing == BodyFraming.Length && up.ContentLength > conf.BuffersTotal)
+            && !string.Equals(up.Headers.Find(h => h.Name.Equals("X-Accel-Buffering", StringComparison.OrdinalIgnoreCase)).Value, "no", StringComparison.OrdinalIgnoreCase);
         CopyHeaders(ctx, conf, up, r.Headers, hidden);
         if (up.ContentLength >= 0 && up.Framing is BodyFraming.Length or BodyFraming.None) r.ContentLength = up.ContentLength;
 
+        if (buffered) return await RelayBufferedAsync(ctx, conf, t, conn, up).ConfigureAwait(false);
+
         try
         {
-            switch (up.Framing)
-            {
-                case BodyFraming.Length: await CopyLengthAsync(conn, r, up.ContentLength, conf.ReadTimeoutMs).ConfigureAwait(false); break;
-                case BodyFraming.Chunked: await CopyChunkedAsync(conn, r, conf.ReadTimeoutMs).ConfigureAwait(false); break;
-                case BodyFraming.UntilClose: await CopyUntilCloseAsync(conn, r, conf.ReadTimeoutMs).ConfigureAwait(false); break;
-            }
+            await CopyBodyAsync(conn, new DirectSink(r), up, conf.ReadTimeoutMs).ConfigureAwait(false);
         }
         catch (UpstreamException e)
         {
@@ -398,12 +401,105 @@ internal static class ProxyHandler
         return HandlerResult.Done;
     }
 
+    private static ValueTask CopyBodyAsync(UpstreamConn conn, BodySink sink, UpstreamResponse up, int timeoutMs) => up.Framing switch
+    {
+        BodyFraming.Length => CopyLengthAsync(conn, sink, up.ContentLength, timeoutMs),
+        BodyFraming.Chunked => CopyChunkedAsync(conn, sink, timeoutMs),
+        BodyFraming.UntilClose => CopyUntilCloseAsync(conn, sink, timeoutMs),
+        _ => ValueTask.CompletedTask,
+    };
+
+    /// <summary>
+    /// proxy_buffering: a producer reads the upstream body into a bounded in-memory pipe and hands the connection back
+    /// to the pool as soon as the body is complete, however slowly the client reads. The client side flushes whenever
+    /// the pipe runs dry, so streamed responses still arrive promptly. Past the buffer size, backpressure applies
+    /// (nothing spills to disk). Failures keep their meaning: an upstream failure reaches the client side as an
+    /// UpstreamException (502, or a cut connection once the head is out); a client failure closes the upstream.
+    /// </summary>
+    private static async ValueTask<HandlerResult> RelayBufferedAsync(HttpContext ctx, ProxyConf conf, ProxyTarget t, UpstreamConn conn, UpstreamResponse up)
+    {
+        long limit = conf.BuffersTotal;
+        // Fast path: the whole body already arrived with the head (most small responses). Copy it out, hand the
+        // connection back at once, then write: no pipe, no second task.
+        if (up.Framing == BodyFraming.Length && up.ContentLength <= conn.Buffered && up.ContentLength <= limit)
+        {
+            int len = (int)up.ContentLength;
+            var copy = ArrayPool<byte>.Shared.Rent(Math.Max(1, len));
+            try
+            {
+                conn.Buf.AsSpan(conn.Start, len).CopyTo(copy);
+                conn.Start += len;
+                if (up.KeepAlive && conn.Buffered == 0) t.Group.ReturnIdle(conn);
+                else conn.Dispose();
+                await ctx.Response.WriteAsync(copy.AsMemory(0, len)).ConfigureAwait(false);
+            }
+            finally { ArrayPool<byte>.Shared.Return(copy); }
+            return HandlerResult.Done;
+        }
+        var pipe = new Pipe(new PipeOptions(pauseWriterThreshold: limit, resumeWriterThreshold: limit / 2, minimumSegmentSize: 16384, useSynchronizationContext: false));
+        int state = 0; // 0 running, 1 producer finished (connection handed back), 2 consumer gave up
+        var producer = ProduceAsync();
+        var r = ctx.Response;
+        var reader = pipe.Reader;
+        try
+        {
+            while (true)
+            {
+                if (!reader.TryRead(out var res))
+                {
+                    await r.FlushAsync().ConfigureAwait(false); // about to wait for the upstream: give the client what we have
+                    res = await reader.ReadAsync().ConfigureAwait(false);
+                }
+                foreach (var seg in res.Buffer) await r.WriteAsync(seg).ConfigureAwait(false);
+                reader.AdvanceTo(res.Buffer.End);
+                if (res.IsCompleted) break;
+            }
+            await reader.CompleteAsync().ConfigureAwait(false);
+        }
+        catch (UpstreamException e)
+        {
+            await reader.CompleteAsync().ConfigureAwait(false);
+            if (ctx.Aborted.IsCancellationRequested) return HandlerResult.Drop;
+            ctx.Log.Warn("upstream failed mid-response", new("upstream", conn.Server.Display), new("uri", ctx.Request.RawTarget), new("error", e.Message));
+            return HandlerResult.WithStatus(502);
+        }
+        catch (Exception e)
+        {
+            await reader.CompleteAsync(e).ConfigureAwait(false);
+            if (Interlocked.CompareExchange(ref state, 2, 0) == 0) conn.Dispose(); // unblocks a producer waiting on the upstream
+            await producer.ConfigureAwait(false);
+            throw;
+        }
+        await producer.ConfigureAwait(false);
+        return HandlerResult.Done;
+
+        async Task ProduceAsync()
+        {
+            var writer = pipe.Writer; // runs inline until its first real wait, then beside the consumer
+            try
+            {
+                await CopyBodyAsync(conn, new PipeSink(writer), up, conf.ReadTimeoutMs).ConfigureAwait(false);
+                await writer.CompleteAsync().ConfigureAwait(false);
+            }
+            catch (Exception e)
+            {
+                conn.Dispose();
+                await writer.CompleteAsync(e is UpstreamException ? e : new UpstreamException("upstream read failed: " + e.Message)).ConfigureAwait(false);
+                return;
+            }
+            if (Interlocked.CompareExchange(ref state, 1, 0) != 0) return; // the client side already gave up and closed it
+            if (up.KeepAlive && up.Framing != BodyFraming.UntilClose && conn.Buffered == 0) t.Group.ReturnIdle(conn);
+            else conn.Dispose();
+        }
+    }
+
     private static void CopyHeaders(HttpContext ctx, ProxyConf conf, UpstreamResponse up, HeaderCollection into, List<string>? hidden)
     {
         var rules = conf.RedirectRules;
         foreach (var (name, value) in up.Headers)
         {
             if (IsHopByHop(name) || up.IsConnectionListed(name)) continue;
+            if (name.Equals("X-Accel-Buffering", StringComparison.OrdinalIgnoreCase)) continue; // addressed to us, as in nginx
             if (hidden is not null && hidden.Exists(x => x.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
             var v = value;
             if (rules.Length > 0)
@@ -440,15 +536,15 @@ internal static class ProxyHandler
     }
 
     /// <summary>Read more from upstream, flushing what the client already has first (we're about to block).</summary>
-    private static async ValueTask<int> FillAsync(UpstreamConn conn, HttpResponse r, int timeoutMs)
+    private static async ValueTask<int> FillAsync(UpstreamConn conn, BodySink r, int timeoutMs)
     {
-        await r.FlushAsync().ConfigureAwait(false);
+        await r.BeforeUpstreamWaitAsync().ConfigureAwait(false);
         try { return await conn.FillAsync(timeoutMs).ConfigureAwait(false); }
         catch (OperationCanceledException) { throw new UpstreamException("upstream read timed out"); }
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException) { throw new UpstreamException("upstream read failed: " + e.Message); }
     }
 
-    private static async ValueTask CopyLengthAsync(UpstreamConn conn, HttpResponse r, long remaining, int timeoutMs)
+    private static async ValueTask CopyLengthAsync(UpstreamConn conn, BodySink r, long remaining, int timeoutMs)
     {
         while (remaining > 0)
         {
@@ -461,7 +557,7 @@ internal static class ProxyHandler
         }
     }
 
-    private static async ValueTask CopyUntilCloseAsync(UpstreamConn conn, HttpResponse r, int timeoutMs)
+    private static async ValueTask CopyUntilCloseAsync(UpstreamConn conn, BodySink r, int timeoutMs)
     {
         while (true)
         {
@@ -474,7 +570,7 @@ internal static class ProxyHandler
         }
     }
 
-    private static async ValueTask CopyChunkedAsync(UpstreamConn conn, HttpResponse r, int timeoutMs)
+    private static async ValueTask CopyChunkedAsync(UpstreamConn conn, BodySink r, int timeoutMs)
     {
         while (true)
         {
@@ -501,7 +597,7 @@ internal static class ProxyHandler
         }
     }
 
-    private static async ValueTask<int> LineAsync(UpstreamConn conn, HttpResponse r, int timeoutMs)
+    private static async ValueTask<int> LineAsync(UpstreamConn conn, BodySink r, int timeoutMs)
     {
         while (true)
         {
@@ -636,4 +732,29 @@ internal sealed class HeadWriter
     }
 
     public byte[] ToArray() => _b.AsSpan(0, _n).ToArray();
+}
+
+/// <summary>Where relayed body bytes go: straight to the client, or into the proxy_buffering pipe.</summary>
+internal abstract class BodySink
+{
+    public abstract ValueTask WriteAsync(ReadOnlyMemory<byte> data);
+    /// <summary>Called before a read that may block on the upstream.</summary>
+    public abstract ValueTask BeforeUpstreamWaitAsync();
+}
+
+internal sealed class DirectSink(HttpResponse r) : BodySink
+{
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> data) => r.WriteAsync(data);
+    public override ValueTask BeforeUpstreamWaitAsync() => r.FlushAsync(); // the client gets what we have before we wait
+}
+
+internal sealed class PipeSink(PipeWriter w) : BodySink
+{
+    public override async ValueTask WriteAsync(ReadOnlyMemory<byte> data)
+    {
+        var res = await w.WriteAsync(data).ConfigureAwait(false); // waits while the buffer is full (backpressure)
+        if (res.IsCompleted) throw new OperationCanceledException("client side gave up");
+    }
+
+    public override ValueTask BeforeUpstreamWaitAsync() => ValueTask.CompletedTask;
 }

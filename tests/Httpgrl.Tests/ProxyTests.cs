@@ -21,6 +21,41 @@ internal static class ProxyTests
 
     public static void Register()
     {
+        T.Add("proxy_buffering: a slow client doesn't hold the upstream connection; off and X-Accel-Buffering: no stream", async () =>
+        {
+            var big = new byte[8 << 20];
+            async Task<int> UpstreamConnectionsUsed(string proxyConf, bool accelNo)
+            {
+                await using var up = new FakeUpstream(async (st, rd) =>
+                {
+                    while (true)
+                    {
+                        var (head, _) = await rd.ReadRequestAsync();
+                        if (head.Length == 0) return;
+                        bool small = head.Contains("/small", StringComparison.Ordinal);
+                        var body = small ? "ok"u8.ToArray() : big;
+                        await st.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {body.Length}\r\n{(accelNo ? "X-Accel-Buffering: no\r\n" : "")}\r\n"));
+                        await st.WriteAsync(body);
+                    }
+                });
+                await using var s = TestServer.Start(Conf($"location / {{ proxy_pass http://up; {proxyConf} }}", $"upstream up {{ server 127.0.0.1:{up.Port}; keepalive 4; }}"));
+                // A client that never reads, with a tiny receive window.
+                using var slow = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { ReceiveBufferSize = 4096 };
+                await slow.ConnectAsync(System.Net.IPAddress.Loopback, s.Port);
+                await slow.SendAsync(Encoding.ASCII.GetBytes("GET /big HTTP/1.1\r\nHost: t\r\n\r\n"));
+                await Task.Delay(1500); // let the server read what it's allowed to
+                var r = await s.Raw(Get("/small"));
+                T.Eq("ok", Body(r));
+                var header = new byte[4096];
+                int n = await slow.ReceiveAsync(header, SocketFlags.None);
+                T.True(!Encoding.ASCII.GetString(header, 0, n).Contains("X-Accel-Buffering", StringComparison.OrdinalIgnoreCase));
+                return up.Accepted;
+            }
+            T.Eq(1, await UpstreamConnectionsUsed("proxy_buffers 64 1m;", accelNo: false)); // body fully buffered: connection reused
+            T.Eq(2, await UpstreamConnectionsUsed("proxy_buffers 64 1m; proxy_buffering off;", accelNo: false));
+            T.Eq(2, await UpstreamConnectionsUsed("proxy_buffers 64 1m;", accelNo: true));
+        });
+
         T.Add("proxy: variables in proxy_pass choose among upstream blocks only (never an arbitrary host)", async () =>
         {
             await using var a = new FakeUpstream(Answers("A"));
@@ -336,6 +371,7 @@ internal static class ProxyTests
             var locs = new StringBuilder();
             foreach (var (name, u) in new[] { ("both", both), ("twocl", twoCl), ("fold", fold), ("split", split), ("big", bigHead), ("line", badLine), ("te", badTe), ("short", short_), ("chunk", badChunk) })
                 locs.Append($"location /{name} {{ proxy_pass http://127.0.0.1:{u.Port}; }}\n");
+            locs.Append($"location /streamed-short {{ proxy_pass http://127.0.0.1:{short_.Port}; proxy_buffering off; }}\n");
             await using var s = TestServer.Start(Conf(locs.ToString()));
             foreach (var p in new[] { "/both", "/twocl", "/fold", "/split", "/big", "/line", "/te" })
             {
@@ -343,8 +379,10 @@ internal static class ProxyTests
                 if (Status(r) != 502) throw new Exception($"{p}: expected 502, got {Status(r)}");
                 T.NotContains("Set-Cookie", r);
             }
-            // Mid-body failure after the head went out: the client must see a cut connection, not a complete message.
-            var trunc = await s.Raw(Get("/short"));
+            // Buffered: the truncation is noticed before anything reached the client, so it gets a clean 502.
+            T.Eq(502, Status(await s.Raw(Get("/short"))));
+            // Streamed, the head already went out: the client must see a cut connection, not a complete message.
+            var trunc = await s.Raw(Get("/streamed-short"));
             T.Eq(200, Status(trunc));
             T.Eq("only-some", Body(trunc));
             // Either nothing reached the client or a cut-off body: never a terminated chunked message.

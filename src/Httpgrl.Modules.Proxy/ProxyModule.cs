@@ -27,7 +27,11 @@ public sealed class ProxyConf : ScopeConfig<ProxyConf>
     public List<(string Name, ComplexValue Value)>? SetHeaders; // a level that sets any replaces the inherited list
     public List<string>? HideHeaders;
     public int? HttpVersion, ConnectTimeout, SendTimeout, ReadTimeout, BufferSize, NextUpstreamTries;
-    public bool? InterceptErrors, Upgrade, RawUri, SslVerify, SslServerName;
+    public bool? InterceptErrors, Upgrade, RawUri, SslVerify, SslServerName, BufferingOn;
+    public long? Buffers;
+    public bool Buffering => BufferingOn ?? true;
+    /// <summary>proxy_buffers total, in memory (nginx: 8 × 4k|8k before spilling to disk; nothing spills here).</summary>
+    public long BuffersTotal => Buffers ?? 64 * 1024;
     public string? SslName;
     public X509Certificate2Collection? SslTrusted;
     public SslProtocols? SslProtocols;
@@ -61,6 +65,8 @@ public sealed class ProxyConf : ScopeConfig<ProxyConf>
         SslTrusted ??= p.SslTrusted;
         SslProtocols ??= p.SslProtocols;
         Redirects ??= p.Redirects;
+        BufferingOn ??= p.BufferingOn;
+        Buffers ??= p.Buffers;
     }
 }
 
@@ -127,6 +133,21 @@ public sealed class ProxyModule : IModule, IDisposable
             Name = "upstream_resolve_interval", Contexts = [ContextKind.Http], MinArgs = 1, MaxArgs = 1,
             Handler = i => _resolveIntervalMs = i.Args[0] == "off" ? 0 : i.Millis(0) is var ms && ms >= 100 ? ms : throw i.Error("must be at least 100ms, or off"),
         });
+        r.AddDirective(new() { Name = "proxy_buffering", Contexts = http, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<ProxyConf>().BufferingOn = i.Flag(0) });
+        r.AddDirective(new()
+        {
+            Name = "proxy_buffers", Contexts = http, MinArgs = 2, MaxArgs = 2,
+            Handler = i =>
+            {
+                int n = i.Int(0);
+                long size = i.Size(1);
+                long total = n * size;
+                if (n < 1 || size < 1024 || total > 64L << 20) throw i.Error("expected a count and a size of at least 1k, at most 64m in total");
+                i.Conf<ProxyConf>().Buffers = total;
+            },
+        });
+        foreach (var n in new[] { "proxy_busy_buffers_size", "proxy_max_temp_file_size", "proxy_temp_file_write_size", "proxy_temp_path" })
+            r.AddDirective(new() { Name = n, Contexts = http, MaxArgs = -1, Handler = i => _ignoredSeen.Add((i.Name, i.Source)) });
         r.AddDirective(new() { Name = "proxy_redirect", Contexts = http, MinArgs = 1, MaxArgs = 2, Repeatable = true, Handler = Redirect });
         r.AddDirective(new() { Name = "proxy_hide_header", Contexts = http, MinArgs = 1, MaxArgs = 1, Repeatable = true, Handler = i => (i.Conf<ProxyConf>().HideHeaders ??= new()).Add(i.Args[0]) });
         r.AddDirective(new()
@@ -293,6 +314,8 @@ public sealed class ProxyModule : IModule, IDisposable
 
     public void Configure(IModuleSetup setup)
     {
+        foreach (var (name, src) in _ignoredSeen)
+            setup.Log.Warn("directive ignored: proxy_buffering is memory-only here (nothing is written to disk)", new("directive", name), new("at", src.ToString()));
         var groups = new Dictionary<string, UpstreamGroup>(StringComparer.OrdinalIgnoreCase);
         foreach (var scope in setup.ScopesOf(Upstream))
         {
@@ -360,6 +383,7 @@ public sealed class ProxyModule : IModule, IDisposable
 
     private readonly List<UpstreamGroup> _groups = new();
     private readonly List<HealthChecker> _checkers = new();
+    private readonly List<(string, SourceLocation)> _ignoredSeen = new();
 
     /// <summary>Apply <paramref name="f"/> to every target of every location (fixed and variable ones).</summary>
     private static void Enrich(IModuleSetup setup, Func<ProxyTarget, ProxyTarget> f)
