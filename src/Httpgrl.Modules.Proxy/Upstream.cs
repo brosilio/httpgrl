@@ -22,6 +22,9 @@ internal sealed class UpstreamServer(EndPoint endPoint, string name, int weight,
     internal readonly List<UpstreamConn> Idle = new();
     /// <summary>DNS no longer returns this address: finish what's in flight, pool nothing more.</summary>
     internal volatile bool Removed;
+    /// <summary>Failed its active health check: never picked until it passes again.</summary>
+    internal volatile bool CheckFailed;
+    internal int CheckFails, CheckPasses; // owned by the health checker
 
     internal bool Available(long now) => !Down && (MaxFails == 0 || Fails < MaxFails || now - FailedAt > FailTimeoutMs);
 }
@@ -91,6 +94,11 @@ internal sealed class UpstreamGroup
         return true;
     }
 
+    public UpstreamServer[] Snapshot()
+    {
+        lock (_lock) return [.. _primary, .. _backup];
+    }
+
     public string Describe()
     {
         lock (_lock) return string.Join(", ", _primary.Concat(_backup).Select(s => s.Display));
@@ -113,7 +121,7 @@ internal sealed class UpstreamGroup
         int total = 0;
         foreach (var s in peers)
         {
-            if (s.Down || tried.Contains(s) || (healthyOnly && !s.Available(now))) continue;
+            if (s.Down || s.CheckFailed || tried.Contains(s) || (healthyOnly && !s.Available(now))) continue;
             s.CurrentWeight += s.Weight;
             total += s.Weight;
             if (best is null || s.CurrentWeight > best.CurrentWeight) best = s;
@@ -354,6 +362,84 @@ internal sealed class DnsRefresher(List<UpstreamGroup> groups, int intervalMs, F
                     log.Warn("upstream DNS refresh failed; keeping previous addresses", new("upstream", g.Name), new("host", spec.Host), new("error", e.Message));
                 }
             }
+        }
+    }
+
+    public void Stop()
+    {
+        try { _stop.Cancel(); } catch (ObjectDisposedException) { }
+    }
+}
+
+internal sealed record HealthCheckSpec(string Uri, int IntervalMs, int TimeoutMs, int Fails, int Passes, int StatusMin, int StatusMax, string? Host);
+
+/// <summary>
+/// Active health checks for one upstream group: every interval, a GET of the check URI on each peer (in parallel), over
+/// the scheme and TLS settings the group is proxied with. A peer that fails <c>fails</c> checks in a row is taken out
+/// of rotation; <c>passes</c> good checks bring it back. Started on first use, stopped with its configuration.
+/// </summary>
+internal sealed class HealthChecker(UpstreamGroup group, HealthCheckSpec spec, ProxyTarget target, ILogger log)
+{
+    private int _started;
+    private readonly CancellationTokenSource _stop = new();
+    private readonly byte[] _request = System.Text.Encoding.ASCII.GetBytes(
+        $"GET {spec.Uri} HTTP/1.1\r\nHost: {spec.Host ?? target.HostHeader}\r\nUser-Agent: httpgrl-health-check\r\nConnection: close\r\n\r\n");
+
+    public void EnsureStarted()
+    {
+        if (Volatile.Read(ref _started) != 0 || Interlocked.Exchange(ref _started, 1) != 0) return;
+        _ = Task.Run(LoopAsync);
+    }
+
+    private async Task LoopAsync()
+    {
+        while (!_stop.IsCancellationRequested)
+        {
+            var peers = group.Snapshot();
+            var checks = new Task[peers.Length];
+            for (int k = 0; k < peers.Length; k++) checks[k] = CheckAsync(peers[k]);
+            await Task.WhenAll(checks).ConfigureAwait(false);
+            try { await Task.Delay(spec.IntervalMs, _stop.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    private async Task CheckAsync(UpstreamServer s)
+    {
+        if (s.Down || s.Removed) return;
+        string? failure = null;
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        cts.CancelAfter(spec.TimeoutMs);
+        UpstreamConn? conn = null;
+        try
+        {
+            conn = await UpstreamConn.ConnectAsync(s, target, spec.TimeoutMs, 8192, cts.Token).ConfigureAwait(false);
+            await conn.WriteAsync(_request, spec.TimeoutMs).ConfigureAwait(false);
+            var r = await UpstreamResponse.ReadAsync(conn, 8192, spec.TimeoutMs, requestWasHead: false).ConfigureAwait(false);
+            if (r.Status < spec.StatusMin || r.Status > spec.StatusMax) failure = $"status {r.Status}";
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { return; }
+        catch (Exception e) when (e is System.Net.Sockets.SocketException or IOException or OperationCanceledException or UpstreamException or System.Security.Authentication.AuthenticationException)
+        {
+            failure = e is OperationCanceledException ? "timed out" : e.Message;
+        }
+        finally { conn?.Dispose(); }
+
+        if (failure is null)
+        {
+            s.CheckFails = 0;
+            if (s.CheckFailed && ++s.CheckPasses >= spec.Passes)
+            {
+                s.CheckFailed = false;
+                log.Info("upstream peer passed its health check; back in rotation", new("upstream", group.Name), new("peer", s.Display));
+            }
+            return;
+        }
+        s.CheckPasses = 0;
+        if (!s.CheckFailed && ++s.CheckFails >= spec.Fails)
+        {
+            s.CheckFailed = true;
+            log.Warn("upstream peer failed its health check; out of rotation", new("upstream", group.Name), new("peer", s.Display), new("reason", failure));
         }
     }
 

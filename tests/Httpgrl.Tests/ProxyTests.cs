@@ -21,6 +21,49 @@ internal static class ProxyTests
 
     public static void Register()
     {
+        T.Add("proxy: active health checks take failing peers out of rotation and bring them back", async () =>
+        {
+            int bHealth = 200, aHealth = 200;
+            Func<Stream, RequestReader, Task> Peer(string name, Func<int> health) => async (st, rd) =>
+            {
+                while (true)
+                {
+                    var (head, _) = await rd.ReadRequestAsync();
+                    if (head.Length == 0) return;
+                    bool check = head.StartsWith("GET /healthz ", StringComparison.Ordinal);
+                    int code = check ? health() : 200;
+                    var body = check ? "" : name;
+                    await st.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 {code} X\r\nContent-Length: {body.Length}\r\n{(check ? "Connection: close\r\n" : "")}\r\n{body}"));
+                    if (check) return;
+                }
+            };
+            await using var a = new FakeUpstream(Peer("A", () => Volatile.Read(ref aHealth)));
+            await using var b = new FakeUpstream(Peer("B", () => Volatile.Read(ref bHealth)));
+            await using var s = TestServer.Start(Conf("location / { proxy_pass http://app; }", $$"""
+                upstream app { server 127.0.0.1:{{a.Port}}; server 127.0.0.1:{{b.Port}}; health_check uri=/healthz interval=100ms timeout=1s fails=2 passes=2; }
+                """));
+            async Task<string> Bodies(int n) { var sb = new StringBuilder(); for (int k = 0; k < n; k++) sb.Append(Body(await s.Raw(Get("/")))); return sb.ToString(); }
+            T.True((await Bodies(6)).Contains('B'));
+
+            Volatile.Write(ref bHealth, 503);
+            await Eventually(async () => await Bodies(6) == "AAAAAA");
+            T.Contains("out of rotation", s.LogText());
+
+            Volatile.Write(ref bHealth, 200);
+            await Eventually(async () => (await Bodies(6)).Contains('B'));
+            T.Contains("back in rotation", s.LogText());
+
+            Volatile.Write(ref aHealth, 500);
+            Volatile.Write(ref bHealth, 500);
+            await Eventually(async () => Status(await s.Raw(Get("/"))) == 502); // all actively down: no blind retries
+
+            string Err(string hc) => T.Throws<ConfigException>(() => TestServer.Start(Conf("location / { proxy_pass http://app; }", $"upstream app {{ server 127.0.0.1:1; health_check {hc}; }}"))).Message;
+            T.Contains("invalid status", Err("status=600"));
+            T.Contains("at least 100ms", Err("interval=10ms"));
+            T.Contains("invalid uri", Err("uri=healthz"));
+            T.Contains("invalid parameter", Err("bogus=1"));
+        });
+
         T.Add("proxy: upstream hostnames are re-resolved; DNS failures keep the last good addresses", async () =>
         {
             int port = FreePort();

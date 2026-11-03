@@ -62,6 +62,7 @@ public sealed class UpstreamConf : ScopeConfig<UpstreamConf>
     public string Name = "";
     public readonly List<UpstreamServerSpec> Servers = new();
     public int? KeepAlive, KeepAliveTimeout, KeepAliveRequests;
+    internal HealthCheckSpec? HealthCheck;
     protected override void Inherit(UpstreamConf parent) { }
 }
 
@@ -95,6 +96,7 @@ public sealed class ProxyModule : IModule, IDisposable
 
         r.AddDirective(new() { Name = "upstream", Contexts = [ContextKind.Http], MinArgs = 1, MaxArgs = 1, Block = Upstream, Repeatable = true, Handler = i => i.Block!.Get<UpstreamConf>().Name = i.Args[0] });
         r.AddDirective(new() { Name = "server", Contexts = up, MinArgs = 1, MaxArgs = -1, Repeatable = true, Handler = UpstreamServer });
+        r.AddDirective(new() { Name = "health_check", Contexts = up, MaxArgs = -1, Handler = HealthCheck });
         r.AddDirective(new() { Name = "keepalive", Contexts = up, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<UpstreamConf>().KeepAlive = i.Int(0) });
         r.AddDirective(new() { Name = "keepalive_timeout", Contexts = up, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<UpstreamConf>().KeepAliveTimeout = i.Millis(0) });
         r.AddDirective(new() { Name = "keepalive_requests", Contexts = up, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<UpstreamConf>().KeepAliveRequests = i.Int(0) });
@@ -196,6 +198,41 @@ public sealed class ProxyModule : IModule, IDisposable
         i.Conf<UpstreamConf>().Servers.Add(new UpstreamServerSpec(i.Args[0], weight, maxFails, failTimeout, backup, down, i.Source, resolve));
     }
 
+    private static void HealthCheck(DirectiveInvocation i)
+    {
+        string uri = "/";
+        string? host = null;
+        int interval = 5000, timeout = 2000, fails = 1, passes = 1, min = 200, max = 399;
+        foreach (var a in i.Args)
+        {
+            int eq = a.IndexOf('=');
+            if (eq <= 0) throw i.Error($"invalid parameter \"{a}\"");
+            var (k, v) = (a[..eq], a[(eq + 1)..]);
+            switch (k)
+            {
+                case "uri":
+                    if (!v.StartsWith('/') || v.Any(c => c <= ' ' || c == 0x7f)) throw i.Error($"invalid uri \"{v}\"");
+                    uri = v;
+                    break;
+                case "host":
+                    if (v.Length == 0 || v.Any(c => c <= ' ' || c == 0x7f || c == '/')) throw i.Error($"invalid host \"{v}\"");
+                    host = v;
+                    break;
+                case "interval": interval = ConfigValue.TryParseMillis(v, out var iv) && iv >= 100 ? iv : throw i.Error("interval must be at least 100ms"); break;
+                case "timeout": timeout = ConfigValue.TryParseMillis(v, out var tv) && tv > 0 ? tv : throw i.Error("invalid timeout"); break;
+                case "fails": fails = int.TryParse(v, out var f) && f is >= 1 and <= 100 ? f : throw i.Error("fails must be 1..100"); break;
+                case "passes": passes = int.TryParse(v, out var p) && p is >= 1 and <= 100 ? p : throw i.Error("passes must be 1..100"); break;
+                case "status":
+                    var parts = v.Split('-');
+                    if (parts.Length is < 1 or > 2 || !int.TryParse(parts[0], out min) || !int.TryParse(parts[^1], out max) || min is < 100 or > 599 || max < min || max > 599)
+                        throw i.Error($"invalid status \"{v}\"; expected e.g. 200 or 200-399");
+                    break;
+                default: throw i.Error($"invalid parameter \"{a}\"");
+            }
+        }
+        i.Conf<UpstreamConf>().HealthCheck = new HealthCheckSpec(uri, interval, timeout, fails, passes, min, max, host);
+    }
+
     private static void Pass(DirectiveInvocation i)
     {
         var c = i.Conf<ProxyConf>();
@@ -268,6 +305,24 @@ public sealed class ProxyModule : IModule, IDisposable
         }
         _groups.AddRange(groups.Values);
         _groups.AddRange(implicitGroups.Values);
+
+        // Health checks probe with the scheme/TLS settings of the (first) location that proxies to the group.
+        var checkers = new Dictionary<UpstreamGroup, HealthChecker>();
+        foreach (var scope in setup.ScopesOf(Upstream))
+        {
+            var u = scope.Get<UpstreamConf>();
+            if (u.HealthCheck is null) continue;
+            var g = groups[u.Name];
+            ProxyTarget? first = null;
+            foreach (var loc in setup.ScopesOf(ContextKind.Location))
+                if (loc.TryGet<ProxyConf>(out var pc) && pc.Target is { } t && t.Group == g) { first = t; break; }
+            if (first is null) continue; // nobody proxies to it
+            checkers[g] = new HealthChecker(g, u.HealthCheck, first, setup.Log);
+        }
+        _checkers.AddRange(checkers.Values);
+        if (checkers.Count > 0)
+            foreach (var loc in setup.ScopesOf(ContextKind.Location))
+                if (loc.TryGet<ProxyConf>(out var pc) && pc.Target is { } t && checkers.TryGetValue(t.Group, out var hc)) pc.Target = t with { Health = hc };
         if (_resolveIntervalMs > 0 && _groups.Exists(g => g.Resolvable.Length > 0))
         {
             _refresher = new DnsRefresher(_groups.FindAll(g => g.Resolvable.Length > 0), _resolveIntervalMs, _resolve, setup.Log);
@@ -277,6 +332,7 @@ public sealed class ProxyModule : IModule, IDisposable
     }
 
     private readonly List<UpstreamGroup> _groups = new();
+    private readonly List<HealthChecker> _checkers = new();
 
     /// <summary>
     /// "default" maps the proxy_pass URL to the location's prefix (nginx): with
@@ -311,6 +367,7 @@ public sealed class ProxyModule : IModule, IDisposable
     public void Dispose()
     {
         _refresher?.Stop();
+        foreach (var c in _checkers) c.Stop();
         foreach (var g in _groups) g.Retire();
     }
 
@@ -483,4 +540,5 @@ internal sealed record RedirectRule(string? Prefix, Regex? Regex, ComplexValue R
 internal sealed record ProxyTarget(UpstreamGroup Group, bool Tls, string HostHeader, int Port, string? UriPart, string? LocationPrefix, SslClientAuthenticationOptions? Ssl)
 {
     public DnsRefresher? Dns { get; init; }
+    public HealthChecker? Health { get; init; }
 }
