@@ -25,6 +25,9 @@ public sealed class HttpCoreConf : ScopeConfig<HttpCoreConf>
     public long? ClientMaxBodySize;
     public int? LargeHeaderCount, LargeHeaderSize;
     public bool? ServerTokens;
+    /// <summary>disable_symlinks: null/off; "" = check from "/"; otherwise an absolute prefix, or "$document_root".</summary>
+    public string? DisableSymlinksFrom;
+    public bool? DisableSymlinks;
 
     public int KeepaliveTimeoutMs => KeepaliveTimeout ?? 60_000;
     public int KeepaliveRequestsMax => KeepaliveRequests ?? 1000;
@@ -63,6 +66,7 @@ public sealed class HttpCoreConf : ScopeConfig<HttpCoreConf>
         LargeHeaderCount ??= p.LargeHeaderCount;
         LargeHeaderSize ??= p.LargeHeaderSize;
         ServerTokens ??= p.ServerTokens;
+        if (DisableSymlinks is null) { DisableSymlinks = p.DisableSymlinks; DisableSymlinksFrom = p.DisableSymlinksFrom; }
     }
 }
 

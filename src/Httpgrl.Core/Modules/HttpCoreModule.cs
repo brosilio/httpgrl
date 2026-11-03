@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.RegularExpressions;
@@ -16,6 +17,35 @@ internal sealed class HttpCoreModule(string prefix) : IModule
     private static readonly string[] Ignored = ["user", "worker_processes", "worker_rlimit_nofile", "pid", "daemon", "master_process", "use", "multi_accept", "sendfile", "tcp_nopush", "tcp_nodelay"];
     private readonly List<(string, SourceLocation)> _ignoredSeen = new();
     private static readonly ContextKind TypesKind = new("types");
+
+    private static void DisableSymlinks(DirectiveInvocation i)
+    {
+        var c = i.Conf<HttpCoreConf>();
+        switch (i.Args[0])
+        {
+            case "off":
+                if (i.Args.Length > 1) throw i.Error("\"off\" takes no parameters");
+                c.DisableSymlinks = false;
+                c.DisableSymlinksFrom = null;
+                return;
+            case "on": break;
+            case "if_not_owner": throw i.Error("\"if_not_owner\" is not supported (file ownership isn't available portably); use \"on\"");
+            default: throw i.Error($"invalid value \"{i.Args[0]}\"; expected on or off");
+        }
+        if (OperatingSystem.IsWindows()) throw i.Error("not supported on Windows");
+        if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsFreeBSD()
+            && !(OperatingSystem.IsLinux() && RuntimeInformation.ProcessArchitecture is Architecture.X64 or Architecture.Arm64))
+            throw i.Error("not supported on this platform");
+        string from = "";
+        if (i.Args.Length == 2)
+        {
+            if (!i.Args[1].StartsWith("from=", StringComparison.Ordinal)) throw i.Error($"invalid parameter \"{i.Args[1]}\"");
+            from = i.Args[1][5..];
+            if (from != "$document_root" && !System.IO.Path.IsPathFullyQualified(from)) throw i.Error("from= must be $document_root or an absolute path");
+        }
+        c.DisableSymlinks = true;
+        c.DisableSymlinksFrom = from;
+    }
 
     public void Register(IModuleRegistry r)
     {
@@ -59,6 +89,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         r.AddDirective(new() { Name = "send_min_rate", Contexts = http, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().SendMinRate = (int)Math.Min(i.Size(0), int.MaxValue) });
         r.AddDirective(new() { Name = "client_max_body_size", Contexts = http, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().ClientMaxBodySize = i.Size(0) });
         r.AddDirective(new() { Name = "large_client_header_buffers", Contexts = [ContextKind.Http, ContextKind.Server], MinArgs = 2, MaxArgs = 2, Handler = LargeHeaders });
+        r.AddDirective(new() { Name = "disable_symlinks", Contexts = http, MinArgs = 1, MaxArgs = 2, Handler = DisableSymlinks });
         r.AddDirective(new() { Name = "server_tokens", Contexts = http, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().ServerTokens = i.Flag(0) });
 
         RegisterVariables(r);

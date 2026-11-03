@@ -123,13 +123,25 @@ internal sealed class HttpContextImpl : HttpContext
     }
 
     public override ResourceKind Probe(string uriPath) =>
-        MapPath(uriPath) is { } p ? Files.LocalFiles.Probe(p) : ResourceKind.Missing;
+        MapPath(uriPath) is { } p ? Files.LocalFiles.Probe(p, NoSymlinksFrom(p)) : ResourceKind.Missing;
+
+    /// <summary>disable_symlinks: the prefix of <paramref name="full"/> in which symlinks are still followed, or null when off.</summary>
+    private string? NoSymlinksFrom(string full)
+    {
+        var core = Loc.Core;
+        if (core.DisableSymlinks != true) return null;
+        var from = core.DisableSymlinksFrom!;
+        if (from == "$document_root") from = DocumentRoot() ?? "";
+        from = from.TrimEnd('/');
+        // A prefix that isn't one (e.g. an alias outside it) checks the whole path: stricter, never looser.
+        return from.Length > 0 && full.StartsWith(from + "/", StringComparison.Ordinal) ? from : "";
+    }
 
     public override OpenResult OpenFile(string uriPath, out FileResource? file)
     {
         file = null;
         if (MapPath(uriPath) is not { } p) return OpenResult.NotFound;
-        var r = Files.LocalFiles.Open(p, out var handle, out long length, out var mtime);
+        var r = Files.LocalFiles.Open(p, NoSymlinksFrom(p), out var handle, out long length, out var mtime);
         if (r == OpenResult.Ok) file = new Files.LocalFileResource(handle!, length, mtime, ContentTypeFor(p));
         return r;
     }
@@ -137,7 +149,7 @@ internal sealed class HttpContextImpl : HttpContext
     public override OpenResult ListDirectory(string uriPath, int maxEntries, List<DirectoryEntry> entries, out bool truncated)
     {
         truncated = false;
-        return MapPath(uriPath) is { } p ? Files.LocalFiles.List(p, maxEntries, entries, out truncated) : OpenResult.NotFound;
+        return MapPath(uriPath) is { } p ? Files.LocalFiles.List(p, NoSymlinksFrom(p), maxEntries, entries, out truncated) : OpenResult.NotFound;
     }
 
     /// <summary>

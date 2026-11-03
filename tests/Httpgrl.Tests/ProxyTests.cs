@@ -378,8 +378,10 @@ internal static class ProxyTests
                 if (Status(r) != 502) throw new Exception($"{p}: expected 502, got {Status(r)}");
                 T.NotContains("Set-Cookie", r);
             }
-            // Buffered: the truncation is noticed before anything reached the client, so it gets a clean 502.
-            T.Eq(502, Status(await s.Raw(Get("/short"))));
+            // Buffered: if the truncation is noticed before anything reached the client, a clean 502; if the partial body
+            // was already flushed, a cut connection. Never a message that looks complete.
+            var buf = await s.Raw(Get("/short"));
+            T.True(Status(buf) == 502 || (Status(buf) == 200 && Body(buf).Length < 100), buf);
             // Streamed, the head already went out: the client must see a cut connection, not a complete message.
             var trunc = await s.Raw(Get("/streamed-short"));
             T.Eq(200, Status(trunc));

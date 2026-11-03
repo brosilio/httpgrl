@@ -9,8 +9,17 @@ namespace Httpgrl.Core.Files;
 /// </summary>
 internal static partial class LocalFiles
 {
-    public static ResourceKind Probe(string path)
+    public static ResourceKind Probe(string path, string? noSymlinksFrom)
     {
+        if (noSymlinksFrom is not null)
+        {
+            // Resolve through the same no-follow walk as Open: a path that walks into a symlink doesn't exist.
+            int fd = WalkNoFollow(path, noSymlinksFrom, finalIsDirectory: null, out _);
+            if (fd < 0) return ResourceKind.Missing;
+            using var h = new SafeFileHandle(fd, ownsHandle: true);
+            try { return (File.GetAttributes(h) & FileAttributes.Directory) != 0 ? ResourceKind.Directory : ResourceKind.File; }
+            catch (IOException) { return ResourceKind.Missing; }
+        }
         if (Directory.Exists(path)) return ResourceKind.Directory;
         if (File.Exists(path)) return ResourceKind.File;
         return ResourceKind.Missing;
@@ -20,7 +29,7 @@ internal static partial class LocalFiles
     /// Open for reading. On Unix with O_NONBLOCK, so a FIFO can't park the thread in open(2), and
     /// O_CLOEXEC, so descriptors never leak into child processes. Only seekable (regular) files are returned.
     /// </summary>
-    public static OpenResult Open(string path, out SafeFileHandle? handle, out long length, out DateTime mtimeUtc)
+    public static OpenResult Open(string path, string? noSymlinksFrom, out SafeFileHandle? handle, out long length, out DateTime mtimeUtc)
     {
         handle = null;
         length = 0;
@@ -37,16 +46,20 @@ internal static partial class LocalFiles
         }
         else
         {
-            int flags = OperatingSystem.IsLinux() ? 0x800 | 0x80000         // O_NONBLOCK | O_CLOEXEC
-                      : OperatingSystem.IsFreeBSD() ? 0x4 | 0x100000
-                      : 0x4 | 0x1000000;                                     // macOS
-            int fd = Open(path, flags);
+            int fd, errno = 0;
+            if (noSymlinksFrom is null)
+            {
+                fd = Open(path, F.NonBlock | F.CloExec);
+                if (fd < 0) errno = Marshal.GetLastPInvokeError();
+            }
+            else fd = WalkNoFollow(path, noSymlinksFrom, finalIsDirectory: false, out errno);
             if (fd < 0)
             {
-                return Marshal.GetLastPInvokeError() switch
+                return errno switch
                 {
                     2 or 20 or 36 or 63 => OpenResult.NotFound,  // ENOENT, ENOTDIR, ENAMETOOLONG (linux, bsd)
                     1 or 13 or 40 or 62 => OpenResult.Forbidden, // EPERM, EACCES, ELOOP (linux, bsd)
+                    31 when OperatingSystem.IsFreeBSD() => OpenResult.Forbidden, // EMLINK: O_NOFOLLOW hit a symlink
                     _ => OpenResult.Error,
                 };
             }
@@ -66,9 +79,15 @@ internal static partial class LocalFiles
         return OpenResult.Ok;
     }
 
-    public static OpenResult List(string path, int max, List<DirectoryEntry> into, out bool truncated)
+    public static OpenResult List(string path, string? noSymlinksFrom, int max, List<DirectoryEntry> into, out bool truncated)
     {
         truncated = false;
+        if (noSymlinksFrom is not null)
+        {
+            int fd = WalkNoFollow(path, noSymlinksFrom, finalIsDirectory: true, out int errno);
+            if (fd < 0) return errno is 2 or 20 ? OpenResult.NotFound : OpenResult.Forbidden;
+            Close(fd);
+        }
         if (!Directory.Exists(path)) return OpenResult.NotFound;
         try
         {
@@ -80,6 +99,7 @@ internal static partial class LocalFiles
                 {
                     if (fi.LinkTarget is not null)
                     {
+                        if (noSymlinksFrom is not null) continue; // couldn't be opened anyway: don't list it
                         if (fi.ResolveLinkTarget(true) is not { Exists: true } target) continue; // broken link
                         into.Add(new DirectoryEntry(fi.Name, target is DirectoryInfo, target is FileInfo tf ? tf.Length : 0, target.LastWriteTimeUtc));
                     }
@@ -98,8 +118,65 @@ internal static partial class LocalFiles
         return OpenResult.Ok;
     }
 
+    /// <summary>open(2) flags for this platform (Linux values are those of x86-64 and arm64).</summary>
+    private static class F
+    {
+        public static readonly int NonBlock = OperatingSystem.IsLinux() ? 0x800 : 0x4;
+        public static readonly int CloExec = OperatingSystem.IsLinux() ? 0x80000 : OperatingSystem.IsFreeBSD() ? 0x100000 : 0x1000000;
+        public static readonly int NoFollow = OperatingSystem.IsLinux() ? 0x20000 : 0x100;
+        public static readonly int Directory = OperatingSystem.IsLinux() ? 0x10000 : OperatingSystem.IsFreeBSD() ? 0x20000 : 0x100000;
+    }
+
+    /// <summary>
+    /// disable_symlinks: open <paramref name="path"/> without following a symlink in any component after
+    /// <paramref name="from"/> (symlinks inside the prefix itself are followed). One openat(O_NOFOLLOW) per component,
+    /// each relative to the directory just opened, so there's no window for a symlink to be swapped in between a check
+    /// and the open (what nginx does too). Returns a descriptor, or -1 with errno.
+    /// </summary>
+    private static int WalkNoFollow(string path, string from, bool? finalIsDirectory, out int errno)
+    {
+        errno = 0;
+        int dir = Open(from.Length == 0 ? "/" : from, F.Directory | F.CloExec);
+        if (dir < 0) { errno = Marshal.GetLastPInvokeError(); return -1; }
+        var rest = path.AsSpan(from.Length).Trim('/');
+        int consumed = path.Length - path.AsSpan(from.Length).TrimStart('/').Length;
+        while (true)
+        {
+            int slash = rest.IndexOf('/');
+            var name = (slash < 0 ? rest : rest[..slash]).ToString();
+            bool last = slash < 0;
+            int flags = F.NoFollow | F.CloExec | F.NonBlock;
+            bool wantDir = !last || finalIsDirectory == true;
+            if (wantDir) flags |= F.Directory;
+            int fd = name.Length == 0 ? Dup(dir) : OpenAt(dir, name, flags);
+            if (fd < 0)
+            {
+                errno = Marshal.GetLastPInvokeError();
+                // With O_DIRECTORY, Linux reports a symlink as ENOTDIR: tell it apart from a real non-directory, so a
+                // symlink is always "forbidden" (ELOOP) and a missing directory stays "not found". (Only to classify a
+                // refusal, so checking after the fact is fine.)
+                if (errno == 20 && wantDir && new FileInfo(path[..(consumed + name.Length)]).LinkTarget is not null)
+                    errno = OperatingSystem.IsLinux() ? 40 : 62;
+            }
+            Close(dir);
+            if (fd < 0 || last) return fd;
+            dir = fd;
+            consumed += name.Length + 1;
+            rest = rest[(slash + 1)..];
+        }
+    }
+
     [LibraryImport("libc", EntryPoint = "open", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial int Open(string path, int flags);
+
+    [LibraryImport("libc", EntryPoint = "openat", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int OpenAt(int dirfd, string path, int flags);
+
+    [LibraryImport("libc", EntryPoint = "dup", SetLastError = true)]
+    private static partial int Dup(int fd);
+
+    [LibraryImport("libc", EntryPoint = "close")]
+    private static partial int Close(int fd);
 }
 
 internal sealed class LocalFileResource(SafeFileHandle handle, long length, DateTime mtimeUtc, string contentType) : FileResource

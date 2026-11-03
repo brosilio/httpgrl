@@ -434,6 +434,57 @@ internal static class IntegrationTests
             T.Eq("2:ok", Body(await ReadOne(c)));
         });
 
+        T.Add("disable_symlinks: symlinks below the checked prefix are refused, race-free; listings hide them", async () =>
+        {
+            if (OperatingSystem.IsWindows()) return;
+            void Populate(string d)
+            {
+                var www = Path.Combine(d, "www");
+                Directory.CreateDirectory(Path.Combine(www, "sub"));
+                Directory.CreateDirectory(Path.Combine(d, "outside"));
+                File.WriteAllText(Path.Combine(www, "real.txt"), "real");
+                File.WriteAllText(Path.Combine(www, "sub", "in.txt"), "in");
+                File.WriteAllText(Path.Combine(d, "outside", "secret.txt"), "secret");
+                File.CreateSymbolicLink(Path.Combine(www, "link.txt"), Path.Combine(www, "real.txt"));
+                File.CreateSymbolicLink(Path.Combine(www, "escape.txt"), Path.Combine(d, "outside", "secret.txt"));
+                Directory.CreateSymbolicLink(Path.Combine(www, "linkdir"), Path.Combine(www, "sub"));
+                Directory.CreateSymbolicLink(Path.Combine(d, "rootlink"), www);
+            }
+            // Default (as nginx): symlinks are followed, even out of the root.
+            await using (var s = TestServer.Start("http { server { listen 127.0.0.1:0; root {DIR}/www; } }", Populate))
+                T.Eq("secret", Body(await s.Raw(Get("/escape.txt"))));
+
+            await using (var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR}/www; disable_symlinks on;
+                  location /try/ { try_files /link.txt /real.txt =404; }
+                  location /idx/ { alias {DIR}/www/; autoindex on; autoindex_format json; }
+                } }
+                """, Populate))
+            {
+                T.Eq("real", Body(await s.Raw(Get("/real.txt"))));
+                T.Eq("in", Body(await s.Raw(Get("/sub/in.txt"))));
+                T.Eq(403, Status(await s.Raw(Get("/link.txt"))));
+                T.Eq(403, Status(await s.Raw(Get("/escape.txt"))));
+                T.Eq(403, Status(await s.Raw(Get("/linkdir/in.txt"))));
+                T.Eq(404, Status(await s.Raw(Get("/real.txt/x"))));       // a real non-directory is still "not found"
+                T.Eq(404, Status(await s.Raw(Get("/nope/x"))));
+                T.Eq("real", Body(await s.Raw(Get("/try/x"))));            // the symlinked candidate doesn't exist for try_files
+                var listing = Body(await s.Raw(Get("/idx/")));
+                T.Contains("real.txt", listing);
+                T.True(!listing.Contains("link.txt") && !listing.Contains("escape.txt") && !listing.Contains("linkdir"), listing);
+            }
+
+            // A root reached through a symlink: "on" checks the whole path; from=$document_root trusts the root itself.
+            await using (var s = TestServer.Start("http { server { listen 127.0.0.1:0; root {DIR}/rootlink; disable_symlinks on; } }", Populate))
+                T.Eq(403, Status(await s.Raw(Get("/real.txt"))));
+            await using (var s = TestServer.Start("http { server { listen 127.0.0.1:0; root {DIR}/rootlink; disable_symlinks on from=$document_root; } }", Populate))
+            {
+                T.Eq("real", Body(await s.Raw(Get("/real.txt"))));
+                T.Eq(403, Status(await s.Raw(Get("/link.txt"))));
+            }
+            T.Contains("if_not_owner", T.Throws<ConfigException>(() => TestServer.Start("http { server { listen 127.0.0.1:0; disable_symlinks if_not_owner; } }")).Message);
+        });
+
         T.Add("tls: handshake, SNI certificate selection, HTTP over TLS", async () =>
         {
             await using var s = TestServer.Start("""
