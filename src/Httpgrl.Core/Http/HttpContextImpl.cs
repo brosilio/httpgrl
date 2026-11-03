@@ -41,6 +41,17 @@ internal sealed class RequestImpl : HttpRequest
         ContentLengthValue = -1;
         ChunkedValue = ExpectContinue = ConnClose = ConnKeepAlive = ConnUpgrade = false;
         HeaderList.Clear();
+        _id = null;
+    }
+
+    private string? _id;
+    public override string Id => _id ??= NewId();
+
+    private static string NewId()
+    {
+        Span<byte> b = stackalloc byte[16];
+        System.Security.Cryptography.RandomNumberGenerator.Fill(b);
+        return Convert.ToHexStringLower(b);
     }
 }
 
@@ -188,6 +199,9 @@ internal sealed class HttpContextImpl : HttpContext
     public override string? Variable(string name) => Rt.Vars.Resolve(name)?.Invoke(this);
 
     public override void SetCaptures(Match match) => LocMatch = match;
+
+    public Hosting.ConnectionManager? Mgr;
+    public override ServerStats Stats() => Mgr?.Stats() ?? default;
 
     private List<(Action<object?> Callback, object? State)>? _onEnd;
 

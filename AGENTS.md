@@ -95,3 +95,5 @@ actually takes effect.
 - Every parser of untrusted bytes has a target in `tests/Httpgrl.Tests/Fuzz.cs` with its invariants. A new parser
   (or a new way to accept input in an existing one) gets a target or a stronger invariant in the same change.
 - Keep README.md current: the directive table, the security model and the module guide.
+- New module project: `scripts/new-module-project.sh Name` (csproj with the Abstractions-only reference, plus its
+  registration in the solution, host, tests and Dockerfile). Then list the module in `Program.cs` and `Harness.cs`.

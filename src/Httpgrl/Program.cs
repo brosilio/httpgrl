@@ -12,6 +12,8 @@ static IModule[] Modules() =>
     new Httpgrl.Modules.Headers.HeadersModule(),
     new Httpgrl.Modules.Limits.LimitReqModule(),
     new Httpgrl.Modules.Limits.LimitConnModule(),
+    new Httpgrl.Modules.Access.AccessModule(),
+    new Httpgrl.Modules.Status.StatusModule(),
     new Httpgrl.Modules.Proxy.ProxyModule(),
     .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(),
 ];

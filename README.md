@@ -62,6 +62,8 @@ docker compose up --build                              # see compose.yaml
 | `src/Httpgrl.Modules.Rewrite` | `http_rewrite` (`return`, `set`, `if`, `break`) and `http_map`. |
 | `src/Httpgrl.Modules.Headers` | `http_headers`: `add_header`. |
 | `src/Httpgrl.Modules.Limits` | `http_limit_req`, `http_limit_conn`. |
+| `src/Httpgrl.Modules.Access` | `http_access`: `allow`, `deny`. |
+| `src/Httpgrl.Modules.Status` | `http_stub_status`: status and metrics endpoint. |
 | `src/Httpgrl.Modules.Proxy` | `http_proxy`: `proxy_pass`, `upstream {}`, WebSocket/Upgrade tunnelling. |
 | `src/Httpgrl` | Host executable. The compiled-in module list is in `Program.cs`. |
 | `tests/Httpgrl.Tests` | A dependency-free test runner. It runs on the JIT, and `ci.sh` also publishes and runs it as native AOT. |
@@ -170,6 +172,17 @@ Limits run at the start of the access phase, after the rewrite phase, so `return
 Zone state survives a reload as long as the zone keeps its name, size and key. Requests still running on the old
 configuration keep counting against `limit_conn`.
 
+### Access control and status
+
+| Directive | Context | Default | Notes |
+|---|---|---|---|
+| `allow address\|CIDR\|unix:\|all;` / `deny ...;` | http, server, location | | Checked in order; the first match decides; no match allows. Denied: 403 (`error_page 403 =444` drops instead). As in nginx, a level with its own rules replaces the inherited list. **Deviation:** a network with host bits set (`192.168.1.1/24`) is a config error rather than silently masked. Runs after `limit_req`/`limit_conn` (nginx's order). |
+| `stub_status [nginx\|prometheus\|json];` | location | `nginx` | Server-wide counters. `nginx` is byte-compatible with nginx's output, so existing exporters work. `prometheus` is the text exposition format, with responses by status class, reloads and dropped log lines added. Counters cover the process lifetime (they survive reloads); "requests" counts completed requests. Restrict it with `allow`/`deny`. |
+
+```nginx
+location = /metrics { stub_status prometheus; allow 10.0.0.0/8; deny all; }
+```
+
 **Choosing a key:** `$remote_net` is the client's IPv4 address, or its IPv6 **/64**. A single IPv6 client typically
 controls a whole /64 and can rotate through 2^64 addresses, so `$binary_remote_addr` (also available) lets it
 dodge any per-address limit. `$remote_net` is the same grouping the core's per-client connection cap uses.
@@ -178,7 +191,12 @@ Behind a proxy or CDN, key on a header that it sets and clients can't.
 Variables: `$uri $request_uri $args $is_args $host $server_name $scheme $https $remote_addr $remote_port`
 `$server_addr $server_port $request_method $server_protocol $document_root $request_filename $status`
 `$body_bytes_sent $request_time $connection $connection_requests $msec $time_iso8601 $binary_remote_addr $remote_net`
-`$limit_req_status $limit_conn_status`, `$1`..`$9` from regex
+`$limit_req_status $limit_conn_status $request_id`
+
+`$request_id` is 32 random hex characters, made on first use and stable for the request, and is in every access-log
+line. Pass it upstream with `proxy_set_header X-Request-ID $request_id;`. To keep an id a trusted proxy in
+front already set: `map $http_x_request_id $rid { "" $request_id; default $http_x_request_id; }`. Don't do
+that for untrusted clients: they choose the value., `$1`..`$9` from regex
 locations, and the prefix families `$http_*`, `$sent_http_*`, `$arg_*` and `$cookie_*`.
 
 TLS variables: `$ssl_protocol $ssl_server_name $ssl_client_verify` (`SUCCESS`, `FAILED:reason`, `NONE`) and, when a
@@ -361,6 +379,7 @@ Then add it to the list in `src/Httpgrl/Program.cs`. There is no reflection and 
   - `UpgradeAsync(idleTimeout)`: send a `101` and get the raw duplex stream back. Bytes the client already pipelined are included. The timeout is idleness across both directions.
   - `HasErrorPage(code)`, and `inv.ReadFile(...)` for config-time files (modules have no filesystem access of their own).
 - **Lifetime:** a module instance belongs to one loaded configuration. Every reload builds fresh instances from the list in `Program.cs`, so per-configuration state can live in fields. If a module implements `IDisposable`, it is disposed once the configuration it belongs to has been replaced *and* its last connection has ended (the proxy closes its upstream pools this way).
+- **Counters:** `ctx.Stats()` returns a `ServerStats` snapshot (connections by state, requests, responses by class, reloads, dropped log lines, uptime). `stub_status` is built on it.
 - **Request end:** `ctx.OnRequestEnd(callback, state)` runs exactly once when the request is over, whether it completed or the connection broke mid-request. Use it to release per-request reservations (`limit_conn` does).
 - **State across reloads:** `setup.Persistent(key, () => new T())` hands back the object the previous configuration stored under `key`, or makes a new one. Rate-limit zones use it so a `SIGHUP` doesn't reset everyone's counters. A failed reload never touches it, and keys the new configuration doesn't ask for are dropped.
 - **Header filters:** `setup.AddHeaderFilter(ctx => ...)` runs once per response just before its head is written, for handler, proxied and core-rendered responses alike (`add_header` is one).
@@ -377,7 +396,7 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 3. [x] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
 4. [x] **Rate limiting**: `limit_req` and `limit_conn` zones.
 5. [ ] **Hardening**: ~~fuzzing the parsers~~ (done: request, URI, chunked, upstream, config, CRL); ~~soak test~~ (done: `--soak`); CI on Windows and macOS.
-6. [ ] **Operations**: a status/metrics endpoint, `$request_id`, gzip/brotli (BCL `System.IO.Compression`), a systemd unit.
+6. [ ] **Operations**: ~~status/metrics endpoint~~, ~~`$request_id`~~, ~~`allow`/`deny`~~ (done); gzip/brotli (BCL `System.IO.Compression`), a systemd unit.
 7. [ ] **Proxy**: `proxy_redirect`, `proxy_buffering on`, variables in `proxy_pass`, runtime DNS re-resolution, active health checks.
 8. [ ] **HTTP/2.**
 9. [ ] **Release process**: CI on push, a first `v0.x` tag, signed images.

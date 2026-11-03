@@ -68,6 +68,9 @@ public abstract class HttpContext
     /// </summary>
     public abstract ValueTask<Stream> UpgradeAsync(int idleTimeoutMs);
 
+    /// <summary>Server-wide counters, as of now (status/metrics endpoints). Takes a short scan of the connection table.</summary>
+    public abstract ServerStats Stats();
+
     /// <summary>
     /// Run <paramref name="callback"/> when this request is over: after the log phase, or when the connection breaks
     /// mid-request. Always exactly once. For releasing per-request reservations (e.g. limit_conn).
@@ -99,6 +102,12 @@ public abstract class HttpRequest
     /// <summary>Body stream enforcing size limits and timeouts. Reading it sends "100 Continue" if the client expects it.</summary>
     public abstract Stream Body { get; }
 
+    /// <summary>
+    /// A unique id for this request: 32 lowercase hex characters from a CSPRNG (nginx's <c>$request_id</c>). Made on
+    /// first use and stable for the request, internal redirects included.
+    /// </summary>
+    public abstract string Id { get; }
+
     public bool HasBody => ContentLength > 0 || IsChunked;
     public bool IsGetOrHead => ReferenceEquals(Method, HttpMethods.Get) || ReferenceEquals(Method, HttpMethods.Head);
     public bool IsHead => ReferenceEquals(Method, HttpMethods.Head);
@@ -126,6 +135,16 @@ public abstract class HttpResponse
     public abstract ValueTask FlushAsync();
     public abstract ValueTask SendFileAsync(FileResource file, long offset, long count);
 }
+
+/// <summary>
+/// A snapshot of server-wide counters. Totals count since the process started (they survive reloads).
+/// Reading: TLS handshake or request head; Writing: processing a request (including tunnels); Waiting: idle keep-alive.
+/// </summary>
+public readonly record struct ServerStats(
+    long Active, long Accepted, long Handled, long Requests,
+    int Reading, int Writing, int Waiting,
+    long Responses1xx, long Responses2xx, long Responses3xx, long Responses4xx, long Responses5xx,
+    long Reloads, long DroppedLogLines, TimeSpan Uptime, string Version);
 
 public sealed class ConnectionInfo(long id, EndPoint? remote, EndPoint? local, bool isTls)
 {

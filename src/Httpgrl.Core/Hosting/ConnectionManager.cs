@@ -35,6 +35,44 @@ internal sealed class ConnectionManager : IDisposable
     }
 
     public int Active => Volatile.Read(ref _active);
+
+    // ---- counters for ServerStats (process lifetime; the manager outlives reloads) ----
+    private long _accepted, _refused, _requests, _reloads;
+    private readonly long[] _byClass = new long[6];
+    private readonly long _startedAt = Environment.TickCount64;
+    public Func<long>? DroppedLogLines;
+
+    public void CountAccepted() => Interlocked.Increment(ref _accepted);
+    public void CountReload() => Interlocked.Increment(ref _reloads);
+
+    /// <summary>One finished request (444 counts as 4xx).</summary>
+    public void CountResponse(int status)
+    {
+        Interlocked.Increment(ref _requests);
+        int k = status / 100;
+        if ((uint)k < 6) Interlocked.Increment(ref _byClass[k]);
+    }
+
+    public ServerStats Stats()
+    {
+        int reading = 0, writing = 0, waiting = 0;
+        var slots = _slots;
+        for (int i = 0; i < slots.Length; i++)
+        {
+            var c = Volatile.Read(ref slots[i]);
+            if (c is null) continue;
+            if (c.Idle) waiting++;
+            else if (c.Phase is "request header" or "tls handshake") reading++;
+            else writing++;
+        }
+        long accepted = Interlocked.Read(ref _accepted);
+        return new ServerStats(Active, accepted, accepted - Interlocked.Read(ref _refused), Interlocked.Read(ref _requests),
+            reading, writing, waiting,
+            Interlocked.Read(ref _byClass[1]), Interlocked.Read(ref _byClass[2]), Interlocked.Read(ref _byClass[3]),
+            Interlocked.Read(ref _byClass[4]), Interlocked.Read(ref _byClass[5]),
+            Interlocked.Read(ref _reloads), DroppedLogLines?.Invoke() ?? 0,
+            TimeSpan.FromMilliseconds(Environment.TickCount64 - _startedAt), Http.ServerInfo.Version);
+    }
     public int PerClientMax { get => _perIpMax; set => _perIpMax = value; }
     public bool Stopping => _stopping;
 
@@ -46,13 +84,13 @@ internal sealed class ConnectionManager : IDisposable
         Connection? evict = null;
         lock (_lock)
         {
-            if (_stopping) { refusal = "shutting down"; return false; }
+            if (_stopping) { refusal = "shutting down"; _refused++; return false; }
             _perIp.TryGetValue(c.IpKey, out int n);
-            if (_perIpMax > 0 && n >= _perIpMax) { refusal = "per-client connection limit"; return false; }
+            if (_perIpMax > 0 && n >= _perIpMax) { refusal = "per-client connection limit"; _refused++; return false; }
             if (_freeCount == 0)
             {
                 evict = OldestIdleLocked();
-                if (evict is null) { refusal = "connection limit"; return false; }
+                if (evict is null) { refusal = "connection limit"; _refused++; return false; }
                 ReleaseLocked(evict);
             }
             int slot = _free[--_freeCount];

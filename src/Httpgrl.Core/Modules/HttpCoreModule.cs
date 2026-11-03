@@ -374,6 +374,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         r.AddVariable("status", c => c.Response.Status.ToString(System.Globalization.CultureInfo.InvariantCulture));
         r.AddVariable("body_bytes_sent", c => c.Response.BodyBytesSent.ToString(System.Globalization.CultureInfo.InvariantCulture));
         r.AddVariable("request_time", c => c.Elapsed.TotalSeconds.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
+        r.AddVariable("request_id", c => c.Request.Id);
         r.AddVariable("connection", c => c.Connection.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
         r.AddVariable("connection_requests", c => c.Connection.Requests.ToString(System.Globalization.CultureInfo.InvariantCulture));
         r.AddVariable("msec", _ => (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0).ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));

@@ -73,7 +73,7 @@ internal sealed class Http1Session
             }
             _transport = transport;
 
-            ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport };
+            ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport, Mgr = _mgr };
             var lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders);
             int keepaliveMs = core0.KeepaliveTimeoutMs;
             bool first = true;
@@ -103,7 +103,7 @@ internal sealed class Http1Session
                     if (_binding.Ssl || !Migrate()) return;
                     core0 = _hosts.Default.Root.Core;
                     lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders);
-                    ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport };
+                    ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport, Mgr = _mgr };
                 }
                 if (!first)
                 {
@@ -165,6 +165,7 @@ internal sealed class Http1Session
 
                 await _rt.Pipeline.RunLogAsync(ctx).ConfigureAwait(false);
                 ctx.EndRequest();
+                _mgr.CountResponse(ctx.Resp.Status);
 
                 if (!reusable || keepaliveMs <= 0 || (_rt.Retired && _binding.Ssl))
                 {

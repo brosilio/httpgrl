@@ -26,6 +26,9 @@ public sealed class JsonLogger : ILogger, IDisposable
     private readonly Stream _out;
     private readonly Thread _thread;
     private long _dropped;
+    private long _droppedTotal;
+    /// <summary>Lines dropped because the output couldn't keep up, since start.</summary>
+    public long DroppedTotal => Interlocked.Read(ref _droppedTotal);
     private volatile LogLevel _min;
 
     public JsonLogger(Stream output, LogLevel min = LogLevel.Info)
@@ -51,7 +54,7 @@ public sealed class JsonLogger : ILogger, IDisposable
         {
             line = Format(LogLevel.Error, "log format error", [new("error", e.Message), new("orig_msg", message)]);
         }
-        if (!_queue.Writer.TryWrite(line)) Interlocked.Increment(ref _dropped);
+        if (!_queue.Writer.TryWrite(line)) { Interlocked.Increment(ref _dropped); Interlocked.Increment(ref _droppedTotal); }
     }
 
     private static byte[] Format(LogLevel level, string message, ReadOnlySpan<LogField> fields)

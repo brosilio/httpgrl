@@ -51,7 +51,7 @@ public sealed class HttpServer : IAsyncDisposable
     public void Start()
     {
         _log.MinLevel = _rt.Main.LogLevel ?? LogLevel.Info;
-        _mgr = new ConnectionManager(_rt.Events.MaxConnections, _rt.Events.PerClient, _rt.Log);
+        _mgr = new ConnectionManager(_rt.Events.MaxConnections, _rt.Events.PerClient, _rt.Log) { DroppedLogLines = () => _log.DroppedTotal };
         var opened = OpenNew(_rt);
         lock (_listeners)
             foreach (var (key, s, b) in opened) _listeners[key] = new Listener(s, b, _rt);
@@ -121,6 +121,7 @@ public sealed class HttpServer : IAsyncDisposable
                 _rt.Log.Warn("worker_connections change needs a restart", new LogField("running", (long)prev.Events.MaxConnections));
             _mgr.PerClientMax = next.Events.PerClient;
             prev.Retire(Environment.TickCount64 + next.Main.ReloadDrainTimeoutMs);
+            _mgr.CountReload();
             _mgr.RetireIdle(); // old idle keep-alives close now; busy ones finish their request first
             _rt.Log.Info("configuration reloaded", new LogField("listeners", (long)next.Bindings.Count));
             return true;
@@ -235,6 +236,7 @@ public sealed class HttpServer : IAsyncDisposable
             EndPoint? remote;
             try { remote = s.RemoteEndPoint; }
             catch (SocketException) { s.Dispose(); continue; }
+            _mgr.CountAccepted();
             var conn = new Connection(_mgr.NextId(), s, IpKey.From(remote));
             // Pin a generation; a reload between reading and pinning just means we read again.
             Listener.State st;

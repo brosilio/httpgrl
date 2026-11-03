@@ -34,6 +34,7 @@ internal sealed class AccessLogModule : IModule
         ctx.Log.Write(LogLevel.Info, "access",
         [
             new("conn", ctx.Connection.Id),
+            new("request_id", req.Id),
             new("remote", ctx.Connection.RemoteAddress),
             new("method", req.Method),
             new("uri", req.RawTarget),
