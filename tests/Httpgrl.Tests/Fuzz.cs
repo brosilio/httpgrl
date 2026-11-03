@@ -1,0 +1,377 @@
+using System.Diagnostics;
+using System.Net.Sockets;
+using System.Numerics;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using Httpgrl.Core.Config;
+using Httpgrl.Core.Hosting;
+using Httpgrl.Core.Http;
+using Httpgrl.Core.Logging;
+using Httpgrl.Core.Modules;
+using Httpgrl.Core.Pipeline;
+using Httpgrl.Modules.Proxy;
+
+namespace Httpgrl.Tests;
+
+/// <summary>
+/// Dependency-free mutation fuzzing of everything that parses untrusted (or semi-trusted) bytes. Each target states
+/// which exceptions are legitimate rejections and which invariants an accepted input must satisfy; anything else is
+/// a bug. Inputs derive from (seed, iteration) alone, so a failure reproduces exactly from the printed numbers.
+///
+/// The test suite runs a short fixed-seed pass of every target. Long runs:
+///   dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz [target|all] [seconds] [seed]
+/// </summary>
+internal static class Fuzz
+{
+    /// <summary><c>Run</c> returns true when the parser accepted the input (reported, so a run that never gets past the first check is visible).</summary>
+    private sealed record Target(string Name, byte[][] Seeds, byte[][] Dict, Func<byte[], bool> Run, int MaxLen = 16 * 1024);
+
+    public sealed class Finding(string message) : Exception(message);
+
+    private static readonly Lazy<Target[]> All = new(() =>
+    [
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(),
+    ]);
+
+    public static void Register()
+    {
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl" })
+        {
+            int iterations = name == "config" ? 3_000 : 20_000;
+            T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
+            {
+                var t = Array.Find(All.Value, x => x.Name == name)!;
+                var (failure, _, _) = Run(t, seed: 1, iterations, deadline: long.MaxValue, parallel: true);
+                if (failure is not null) throw new Finding(failure);
+            });
+        }
+    }
+
+    /// <summary>Long-running mode. Exit code 1 on the first finding.</summary>
+    public static int RunCli(string[] args)
+    {
+        string which = args.Length > 1 ? args[1] : "all";
+        int seconds = args.Length > 2 ? int.Parse(args[2]) : 60;
+        int seed = args.Length > 3 ? int.Parse(args[3]) : Environment.TickCount & 0x7fffffff;
+        var targets = which == "all" ? All.Value : [Array.Find(All.Value, t => t.Name == which) ?? throw new ArgumentException($"unknown target \"{which}\"")];
+        long perTarget = seconds * 1000L / targets.Length;
+        foreach (var t in targets)
+        {
+            var (failure, done, accepted) = Run(t, seed, long.MaxValue, Environment.TickCount64 + perTarget, parallel: true);
+            Console.WriteLine($"fuzz {t.Name}: {done} inputs ({100.0 * accepted / Math.Max(1, done):F1}% accepted), seed {seed}{(failure is null ? ", no findings" : "")}");
+            if (failure is not null)
+            {
+                Console.WriteLine(failure);
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    private static (string? Failure, long Done, long Accepted) Run(Target t, int seed, long iterations, long deadline, bool parallel)
+    {
+        string? failure = null;
+        long done = 0, accepted = 0, next = -1;
+        void Worker()
+        {
+            while (Volatile.Read(ref failure) is null)
+            {
+                long i = Interlocked.Increment(ref next);
+                if (i >= iterations || ((i & 63) == 0 && Environment.TickCount64 > deadline)) return;
+                var input = Input(t, seed, i);
+                var sw = Stopwatch.StartNew();
+                try { if (t.Run(input)) Interlocked.Increment(ref accepted); }
+                catch (Exception e)
+                {
+                    Interlocked.CompareExchange(ref failure, Report(t, seed, i, input, e), null);
+                    return;
+                }
+                if (sw.ElapsedMilliseconds > 2000)
+                {
+                    Interlocked.CompareExchange(ref failure, Report(t, seed, i, input, new Finding($"slow input: {sw.ElapsedMilliseconds} ms")), null);
+                    return;
+                }
+                Interlocked.Increment(ref done);
+            }
+        }
+        int n = parallel ? Math.Max(1, Environment.ProcessorCount) : 1;
+        var threads = new Thread[n];
+        for (int k = 0; k < n; k++) (threads[k] = new Thread(Worker, 16 << 20) { IsBackground = true }).Start();
+        foreach (var th in threads) th.Join();
+        return (failure, done, accepted);
+    }
+
+    private static string Report(Target t, int seed, long i, byte[] input, Exception e)
+    {
+        var shown = input.Length > 600 ? input[..600] : input;
+        var sb = new StringBuilder();
+        foreach (byte b in shown) sb.Append(b is >= 0x20 and < 0x7f and not (byte)'\\' ? (char)b : $"\\x{b:x2}");
+        return $"[{t.Name}] seed {seed} iteration {i}: {e.GetType().Name}: {e.Message}\n  input ({input.Length} bytes): {sb}{(input.Length > 600 ? "..." : "")}\n  at {e.StackTrace?.Split('\n').FirstOrDefault()?.Trim()}";
+    }
+
+    // ---------------------------------------------------------------- mutation
+
+    private static byte[] Input(Target t, int seed, long i)
+    {
+        var r = new Random(HashCode.Combine(seed, i, t.Name.Length));
+        var data = new List<byte>(t.Seeds[r.Next(t.Seeds.Length)]);
+        int ops = 1 + r.Next(r.Next(2) == 0 ? 3 : 12);
+        for (int k = 0; k < ops; k++) Mutate(r, data, t);
+        if (data.Count > t.MaxLen) data.RemoveRange(t.MaxLen, data.Count - t.MaxLen);
+        return data.ToArray();
+    }
+
+    private static readonly byte[] Interesting = [0, (byte)'\r', (byte)'\n', (byte)' ', (byte)'\t', (byte)':', (byte)'%', (byte)';', (byte)'{', (byte)'}', (byte)'"', (byte)'\\', (byte)'/', (byte)'.', (byte)'0', (byte)'9', (byte)'f', 0x7f, 0x80, 0xc0, 0xff];
+
+    private static void Mutate(Random r, List<byte> d, Target t)
+    {
+        int Pos() => d.Count == 0 ? 0 : r.Next(d.Count + 1);
+        switch (r.Next(10))
+        {
+            case 0 when d.Count > 0: { int p = r.Next(d.Count); d[p] ^= (byte)(1 << r.Next(8)); break; }
+            case 1 when d.Count > 0: d[r.Next(d.Count)] = Interesting[r.Next(Interesting.Length)]; break;
+            case 2 or 3: d.InsertRange(Pos(), t.Dict[r.Next(t.Dict.Length)]); break;
+            case 4 when d.Count > 0: { int p = r.Next(d.Count); d.RemoveRange(p, Math.Min(d.Count - p, 1 + r.Next(16))); break; }
+            case 5 when d.Count > 0: { int p = r.Next(d.Count); int len = Math.Min(d.Count - p, 1 + r.Next(64)); d.InsertRange(Pos(), d.GetRange(p, len)); break; }
+            case 6 when d.Count > 0: { int p = r.Next(d.Count); d.RemoveRange(p, Math.Min(d.Count - p, 1 + r.Next(8))); d.InsertRange(p, t.Dict[r.Next(t.Dict.Length)]); break; } // replace
+            case 7 when d.Count > 0: { int p = r.Next(d.Count); d.RemoveRange(p, d.Count - p); break; } // truncate
+            case 8: { var other = t.Seeds[r.Next(t.Seeds.Length)]; int p = r.Next(other.Length + 1); d.InsertRange(Pos(), other[p..]); break; } // splice
+            default: d.Insert(Pos(), Interesting[r.Next(Interesting.Length)]); break;
+        }
+    }
+
+    private static byte[][] B(params string[] s) => Array.ConvertAll(s, x => Encoding.Latin1.GetBytes(x));
+
+    // ---------------------------------------------------------------- targets
+
+    private static readonly HeadLimits Lim = new(8192, 32768, 100);
+
+    /// <summary>The request head: framing, Host, target. A wrong "accept" here is request smuggling.</summary>
+    private static Target RequestTarget() => new("request",
+        B("GET / HTTP/1.1\r\nHost: a.test\r\n\r\n",
+          "POST /up?x=1 HTTP/1.1\r\nHost: a.test:8080\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\n",
+          "POST /c HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n",
+          "GET /a/%2e%2e/b//c?q#f HTTP/1.0\r\n\r\n",
+          "GET http://a.test/x HTTP/1.1\r\nHost: a.test\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\n",
+          "OPTIONS * HTTP/1.1\r\nHost: [::1]:80\r\n\r\n",
+          "\r\nHEAD /caf%C3%A9 HTTP/1.1\r\nhost: A.Test\r\nX-A: 1\r\nX-B:\t2 \r\nCookie: a=b\r\n\r\n"),
+        B("\r\n", "\n", "\r", " ", "\t", ":", ": ", "Content-Length: ", "Content-Length: 0\r\n", "Transfer-Encoding: chunked\r\n",
+          "Transfer-Encoding: ", "chunked", "identity", "Host: ", "Host: x\r\n", "%", "%00", "%2e", "%2E%2e", "%2f", "%c0%af", "%ff", "/../",
+          "/./", "//", "?", "#", "HTTP/1.1", "HTTP/1.0", "HTTP/2.0", "HTTP/1.10", "\0", "\x7f", "\xff", "99999999999999999999", "-1", "+5",
+          "0x10", ",", "Connection: close\r\n", "Expect: 100-continue\r\n", "Upgrade: h2c\r\n", "*", "@", "[::1]", ":8080", "a.test.", "GET ", "CONNECT "),
+        data =>
+        {
+            using var inb = new InputBuffer(Math.Max(16, data.Length));
+            data.CopyTo(inb.Buf, 0);
+            inb.End = data.Length;
+            int headLen = RequestParser.FindHeadEnd(inb);
+            if (headLen < 0)
+            {
+                int inc = RequestParser.CheckIncomplete(inb.Data, Lim);
+                if (inc != 0 && inc is < 400 or > 599) throw new Finding($"CheckIncomplete returned {inc}");
+                return false;
+            }
+            if (headLen > data.Length) throw new Finding($"head length {headLen} > input {data.Length}");
+            var req = new RequestImpl();
+            int rc = RequestParser.Parse(data.AsSpan(0, headLen), req, Lim);
+            if (rc != 0)
+            {
+                if (rc is < 400 or > 599) throw new Finding($"Parse returned {rc}");
+                return false;
+            }
+            if (req.ContentLengthValue >= 0 && req.ChunkedValue) throw new Finding("accepted both Content-Length and chunked");
+            if (req.ContentLengthValue < -1) throw new Finding($"negative Content-Length {req.ContentLengthValue}");
+            if (req.ChunkedValue && req.VersionValue == HttpVersion.Http10) throw new Finding("chunked on HTTP/1.0");
+            if (req.VersionValue == HttpVersion.Http11 && req.HostValue.Length == 0) throw new Finding("HTTP/1.1 without Host accepted");
+            foreach (char c in req.HostValue)
+                if (char.IsAsciiLetterUpper(c) || c is '\r' or '\n' or '\0' or ' ' or '/' or '\\' or '@') throw new Finding($"bad host \"{req.HostValue}\"");
+            foreach (char c in req.MethodValue)
+                if (c > 0x7f || !HttpChars.IsToken((byte)c)) throw new Finding($"bad method \"{req.MethodValue}\"");
+            if (!(req.PathValue == "*" && req.MethodValue == HttpMethods.Options)) CheckPath(req.PathValue);
+            foreach (char c in req.QueryValue)
+                if (c is '\r' or '\n' or '\0' or ' ' or '#') throw new Finding($"bad query \"{req.QueryValue}\"");
+            var h = req.Headers;
+            for (int k = 0; k < h.Count; k++)
+                foreach (char c in h.ValueAt(k))
+                    if (c is '\r' or '\n' or '\0') throw new Finding("control character in a header value");
+            return true;
+        });
+
+    private static void CheckPath(string p)
+    {
+        if (p.Length == 0 || p[0] != '/') throw new Finding($"path \"{p}\" not absolute");
+        if (p.Contains("//", StringComparison.Ordinal)) throw new Finding($"path \"{p}\" has an empty segment");
+        if (p.Contains('\0')) throw new Finding("path contains NUL");
+        foreach (var seg in p.Split('/'))
+            if (seg is "." or "..") throw new Finding($"path \"{p}\" has a dot segment");
+        for (int k = 0; k < p.Length; k++)
+            if (char.IsSurrogate(p[k]) && !(char.IsHighSurrogate(p[k]) && k + 1 < p.Length && char.IsLowSurrogate(p[++k])))
+                throw new Finding("path has an unpaired surrogate");
+    }
+
+    private static Target UriTarget() => new("uri",
+        B("/", "/a/b/../c", "/%2e%2e/x", "/a//b/./c/", "/caf%C3%A9/%F0%9F%98%80", "/a%2fb", "/x/..", "/%2E%2E%2F%2E%2E%2Fetc%2Fpasswd"),
+        B("%", "%2e", "%2E", "%2f", "%5c", "%00", "%c0%ae", "%e0%80%ae", "%ff", "/", "..", ".", "//", "\\", "\0", "%%", "%2", "\xc3", "\xa9"),
+        data =>
+        {
+            var p = UriNormalizer.NormalizeRaw(data);
+            if (p is null) return false;
+            CheckPath(p);
+            if (UriNormalizer.NormalizeDecoded(p) is { } again && again != p) throw new Finding($"not stable: \"{p}\" -> \"{again}\"");
+            return true;
+        }, MaxLen: 4096);
+
+    /// <summary>Chunked request bodies: the other half of smuggling safety.</summary>
+    private static Target ChunkedTarget() => new("chunked",
+        B("5\r\nhello\r\n0\r\n\r\n", "3;ext=1\r\nabc\r\n0\r\nTrailer: x\r\n\r\n", "a\r\n0123456789\r\n1\r\nx\r\n0\r\n\r\nGET / HTTP/1.1\r\n\r\n", "0\r\n\r\n",
+          "1\r\n\r\r\nA\r\n0000000000\r\n0\r\n\r\n"),
+        B("\r\n", "\n", "\r", ";", "0", "f", "F", "ffffffffffffffff", "7fffffff", "-1", " ", "\t", "0x", "+1", "Trailer: v\r\n", "\0", "1\r\na\r\n"),
+        data =>
+        {
+            using var sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            var conn = new Connection(1, sock, default);
+            using var inb = new InputBuffer(64);
+            var body = new BodyStream(conn, inb) { MaxSize = 1 << 20 };
+            body.Reset(new MemoryStream(data), -1, chunked: true);
+            var buf = new byte[512];
+            long total = 0;
+            try
+            {
+                int n;
+                while ((n = body.ReadAsync(buf).AsTask().GetAwaiter().GetResult()) > 0)
+                {
+                    total += n;
+                    if (total > data.Length) throw new Finding($"decoded {total} bytes from {data.Length}");
+                }
+            }
+            catch (HttpBodyException e) when (e.Status is 400 or 413 or 431) { return false; }
+            if (!body.IsComplete) throw new Finding("EOF reported without the terminating chunk");
+            return true;
+        }, MaxLen: 4096);
+
+    /// <summary>Upstream response heads: a hostile backend must not be able to split or desync our response.</summary>
+    private static Target UpstreamTarget() => new("upstream",
+        B("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\n",
+          "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+          "HTTP/1.0 302 Found\r\nLocation: /x\r\nConnection: keep-alive\r\n\r\n",
+          "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: x-foo, close\r\nX-Foo: 1\r\n\r\n",
+          "HTTP/1.1 304 Not Modified\r\nETag: \"a\"\r\n\r\n", "HTTP/1.1 204\r\n\r\n"),
+        B("\r\n", "\n", "\r", " ", "\t", ":", "Content-Length: ", "Content-Length: 5\r\n", "Transfer-Encoding: chunked\r\n", "Transfer-Encoding: ",
+          "chunked, gzip", "Connection: ", "close", "keep-alive", "HTTP/1.1 ", "HTTP/1.0 ", "HTTP/2 ", "999", "000", "100", "\0", "\x7f", "\xff",
+          "99999999999999999999", "-1"),
+        data =>
+        {
+            int end = data.AsSpan().IndexOf("\r\n\r\n"u8);
+            if (end < 0) return false; // ReadAsync only ever hands over a complete head
+            var r = new UpstreamResponse();
+            try { r.Parse(data.AsSpan(0, end + 4), requestWasHead: (data.Length & 1) == 1); }
+            catch (UpstreamException) { return false; }
+            if (r.Status is < 100 or > 999) throw new Finding($"status {r.Status}");
+            if (r.Framing == BodyFraming.Chunked && r.ContentLength >= 0) throw new Finding("chunked framing with a Content-Length");
+            if (r.Framing == BodyFraming.UntilClose && r.KeepAlive) throw new Finding("close-delimited body on a kept-alive connection");
+            foreach (var (name, value) in r.Headers)
+            {
+                foreach (char c in name)
+                    if (c > 0x7f || !HttpChars.IsToken((byte)c)) throw new Finding($"bad header name \"{name}\"");
+                foreach (char c in value)
+                    if (c is '\r' or '\n' or '\0') throw new Finding("control character in an upstream header value");
+            }
+            return true;
+        }, MaxLen: 8192);
+
+    /// <summary>The config parser and every module's directive handlers: errors must be ConfigExceptions with a location, never crashes.</summary>
+    private static Target ConfigTarget()
+    {
+        var seeds = new List<string>
+        {
+            File.Exists("conf/httpgrl.conf") ? File.ReadAllText("conf/httpgrl.conf").Replace("include", "#") : "http { server { listen 80; } }",
+            """
+            worker_shutdown_timeout 5s; reload_drain_timeout 1m; error_log stdout info;
+            events { worker_connections 1024; connections_per_client 64; }
+            http {
+              map $http_user_agent $ua { default a; ~*bot b; "~^x(\d+)" "c$1"; }
+              limit_req_zone $remote_net zone=r:64k rate=10r/s;
+              limit_conn_zone $remote_net zone=c:64k;
+              limit_req zone=r burst=5 nodelay; limit_conn c 10;
+              add_header X-A "$ua" always;
+              upstream app { server 127.0.0.1:9000 weight=2 max_fails=3; server 127.0.0.2:9000 backup; keepalive 8; }
+              server {
+                listen 127.0.0.1:8080 default_server reuseport backlog=128; server_name a.test *.b.test ~^c\d+$;
+                root /srv; index index.html; autoindex on; error_page 404 /404.html; error_page 403 =444;
+                set $x "y"; if ($request_method = POST) { return 405; } if ($uri ~ "^/i/(\d+)$") { set $id $1; }
+                location / { try_files $uri $uri/ =404; }
+                location = /exact { return 200 "ok $x"; }
+                location ^~ /p/ { proxy_pass http://app/; proxy_set_header X-Id $id; proxy_read_timeout 30s; }
+                location ~* \.(png|jpg)$ { expires_is_not_a_directive_so_mutations_must_handle_unknowns; }
+                location @named { return 302 https://$host$request_uri; }
+              }
+            }
+            """.Replace("expires_is_not_a_directive_so_mutations_must_handle_unknowns", "internal"),
+        };
+        var dict = B("{", "}", ";", "\"", "'", "\\", "$", "${", "#", "\n", " ", "(", ")", "~", "~*", "=", "^~", "@", "*", "location", "server",
+            "http", "map", "if", "set", "return", "listen", "proxy_pass", "limit_req", "add_header", "error_page", "try_files", "alias",
+            "zone=", "rate=", "burst=", "1r/s", "0", "-1", "99999999999999999999", "1k", "10m", "1s", "on", "off", "$uri", "$1", "$nope",
+            "http://", "unix:", "[::]:80", "\0", "\xff", "default", "*.x", "~^a(", "{1000}");
+        return new Target("config", seeds.ConvertAll(s => Encoding.UTF8.GetBytes(s)).ToArray(), dict, data =>
+        {
+            var text = Encoding.UTF8.GetString(data);
+            if (text.Contains("include", StringComparison.Ordinal)) return false; // would read the real filesystem
+            try { ParseAll(text); return true; }
+            catch (ConfigException) { return false; }
+        }, MaxLen: 4096);
+    }
+
+    private static readonly ILogger NullLog = new JsonLogger(Stream.Null, LogLevel.Error);
+
+    /// <summary>Parse with every module's directives, resolve variables, merge, and compile routing. No I/O.</summary>
+    private static void ParseAll(string text)
+    {
+        var vars = new VariableRegistry();
+        var reg = new Collector(vars);
+        IModule[] modules =
+        [
+            new HttpCoreModule(Path.GetTempPath()), new SslModule(), new AccessLogModule(),
+            new Httpgrl.Modules.Rewrite.RewriteModule(), new Httpgrl.Modules.Rewrite.MapModule(), new Httpgrl.Modules.Headers.HeadersModule(),
+            new Httpgrl.Modules.Limits.LimitReqModule(), new Httpgrl.Modules.Limits.LimitConnModule(), new ProxyModule(),
+            .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(),
+        ];
+        foreach (var m in modules) m.Register(reg);
+        var root = new ConfigParser(reg.Directives, vars).ParseText(text, "/fuzz/<inline>", "/fuzz-nonexistent");
+        vars.ResolvePending();
+        root.MergeAndFreeze();
+        RoutingBuilder.Build(root, NullLog);
+    }
+
+    private sealed class Collector(VariableRegistry vars) : IModuleRegistry
+    {
+        public readonly Dictionary<string, List<Directive>> Directives = new(StringComparer.Ordinal);
+        public void AddDirective(Directive d)
+        {
+            if (!Directives.TryGetValue(d.Name, out var l)) Directives[d.Name] = l = new();
+            l.Add(d);
+        }
+        public void AddVariable(string name, VariableGetter getter) => vars.Add(name, getter);
+        public void AddVariablePrefix(string prefix, PrefixVariableGetter getter) => vars.AddPrefix(prefix, getter);
+    }
+
+    /// <summary>CRLs (DER). Only CryptographicException is a legitimate rejection.</summary>
+    private static Target CrlTarget()
+    {
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var req = new CertificateRequest("CN=fuzz ca", key, HashAlgorithmName.SHA256);
+        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+        req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+        using var ca = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+        var empty = new CertificateRevocationListBuilder().Build(ca, BigInteger.One, DateTimeOffset.UtcNow.AddDays(1), HashAlgorithmName.SHA256);
+        var b = new CertificateRevocationListBuilder();
+        for (int k = 1; k < 6; k++) b.AddEntry(new byte[] { 0x01, (byte)k }, DateTimeOffset.UtcNow, X509RevocationReason.KeyCompromise);
+        var full = b.Build(ca, new BigInteger(7), DateTimeOffset.UtcNow.AddDays(1), HashAlgorithmName.SHA256);
+        return new Target("crl", [empty, full], B("\x30", "\x02", "\x04", "\x05\x00", "\x06", "\x17", "\x18", "\x80", "\x81", "\x82\xff\xff", "\x84\xff\xff\xff\xff", "\xa0", "\x01\x01\xff", "\x00"), data =>
+        {
+            try { Crl.Parse(data, "fuzz"); return true; }
+            catch (CryptographicException) { return false; }
+        }, MaxLen: 4096);
+    }
+}

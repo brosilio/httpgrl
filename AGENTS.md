@@ -90,4 +90,6 @@ actually takes effect.
 
 - Verify with `./scripts/ci.sh`. It runs the build, the tests on the JIT, the same tests as native AOT, the AOT server publish, and a `-t` config check. It must pass before work is called done.
 - Every security behaviour has a test in `tests/Httpgrl.Tests`. Adding a defence means adding the test that attacks it.
+- Every parser of untrusted bytes has a target in `tests/Httpgrl.Tests/Fuzz.cs` with its invariants. A new parser
+  (or a new way to accept input in an existing one) gets a target or a stronger invariant in the same change.
 - Keep README.md current: the directive table, the security model and the module guide.

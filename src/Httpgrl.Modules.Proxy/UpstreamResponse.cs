@@ -56,7 +56,8 @@ internal sealed class UpstreamResponse
         }
     }
 
-    private void Parse(ReadOnlySpan<byte> head, bool requestWasHead)
+    /// <summary>Parse one head, from the status line through the empty line (inclusive). Throws <see cref="UpstreamException"/> only.</summary>
+    internal void Parse(ReadOnlySpan<byte> head, bool requestWasHead)
     {
         int eol = head.IndexOf("\r\n"u8);
         var line = head[..eol];

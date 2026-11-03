@@ -225,6 +225,20 @@ through without buffering (nginx's `proxy_buffering off`), and are flushed whene
 
 ## Security model
 
+**Fuzzing.** Every parser of untrusted or semi-trusted bytes has a mutation-fuzz target in
+`tests/Httpgrl.Tests/Fuzz.cs`: the request head, the URI normalizer, chunked bodies, upstream response heads, the
+config parser (with every module's directives) and CRLs. Each target states which rejections are legitimate and
+which invariants an accepted input must hold (e.g. never both `Content-Length` and `chunked`, no dot segments
+in a path). The test suite runs a fixed-seed pass of each, so CI is also a regression fuzz. For long runs:
+
+```sh
+dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz all 600        # 10 minutes, all targets, random seed
+dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz request 60 42  # one target, fixed seed
+```
+
+A finding prints the seed, iteration and input, which reproduce it exactly. It's dependency-free and not
+coverage-guided, so it's a complement to, not a replacement for, a coverage-guided fuzzer.
+
 **Timeouts and slow clients.** One sweeper thread enforces every deadline. There are no per-operation timers.
 - Header timeout: the whole request head must arrive within `client_header_timeout` of its first byte. Trickling one byte at a time does not extend it.
 - Idle connections: an idle new or keep-alive connection is closed at its deadline.
@@ -349,7 +363,7 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 2. [x] **Revocation for client certificates** (`ssl_crl`): signed, unexpired CRLs for every CA in the chain.
 3. [x] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
 4. [x] **Rate limiting**: `limit_req` and `limit_conn` zones.
-5. [ ] **Hardening**: fuzzing the request, upstream-response and config parsers; long-running soak tests under load; CI on Windows and macOS.
+5. [ ] **Hardening**: ~~fuzzing the parsers~~ (done: request, URI, chunked, upstream, config, CRL); long-running soak tests under load; CI on Windows and macOS.
 6. [ ] **Operations**: a status/metrics endpoint, `$request_id`, gzip/brotli (BCL `System.IO.Compression`), a systemd unit.
 7. [ ] **Proxy**: `proxy_redirect`, `proxy_buffering on`, variables in `proxy_pass`, runtime DNS re-resolution, active health checks.
 8. [ ] **HTTP/2.**
