@@ -15,12 +15,33 @@ internal static class ProxyHandler
 
     public static async ValueTask<HandlerResult> HandleAsync(HttpContext ctx, ProxyConf conf)
     {
-        var t = conf.Target!;
+        ProxyTarget t;
+        string? dynUri = null;
+        if (conf.DynUrl is { } dyn)
+        {
+            var v = dyn.Evaluate(ctx);
+            int slash = v.IndexOf('/');
+            var name = slash < 0 ? v : v[..slash];
+            if (slash >= 0) dynUri = v[slash..];
+            if (!conf.DynTargets!.TryGetValue(name, out t!))
+            {
+                ctx.Log.Warn("proxy_pass variable doesn't name an upstream block", new("value", name), new("uri", ctx.Request.Path));
+                return HandlerResult.WithStatus(502);
+            }
+            ctx.Items[ChosenTargetKey] = t;
+        }
+        else t = conf.Target!;
         var req = ctx.Request;
         if (req.IsChunked && conf.Version == 10) return HandlerResult.WithStatus(411);
         bool upgrade = conf.UpgradeEnabled && conf.Version == 11 && WantsUpgrade(req);
         bool keepAlive = !upgrade && conf.Version == 11 && t.Group.KeepAlive > 0;
-        var head = BuildRequestHead(ctx, conf, t, BuildUri(ctx, conf, t), upgrade, keepAlive);
+        var uri = dynUri is not null ? EscapeRequestUri(dynUri) : BuildUri(ctx, conf, t);
+        if (uri is null)
+        {
+            ctx.Log.Error("proxy_pass URI from variables doesn't start with \"/\"", new LogField("uri", ctx.Request.Path));
+            return HandlerResult.WithStatus(500);
+        }
+        var head = BuildRequestHead(ctx, conf, t, uri, upgrade, keepAlive);
         bool idempotent = IsIdempotent(req.Method);
         t.Dns?.EnsureStarted();
         t.Health?.EnsureStarted(); // before anything that depends on the peer count: an upstream with no addresses yet must still recover
@@ -133,6 +154,38 @@ internal static class ProxyHandler
     /// what was requested (e.g. "..\" on a Windows backend, or double decoding). <c>proxy_pass_raw_uri on</c>
     /// forwards the client's bytes instead.
     /// </summary>
+    private static readonly object ChosenTargetKey = new();
+
+    /// <summary>The target this request is (or would be) proxied to, for $proxy_host / $proxy_port.</summary>
+    internal static ProxyTarget? CurrentTarget(HttpContext ctx)
+    {
+        var c = ctx.Config<ProxyConf>();
+        if (c.Target is { } t) return t;
+        return ctx.Items.TryGetValue(ChosenTargetKey, out var o) ? o as ProxyTarget : null;
+    }
+
+    /// <summary>
+    /// A request URI built from variables, made safe for the request line: control characters, spaces and non-ASCII
+    /// are percent-encoded ($uri is decoded and may contain them); '%' is kept, so already-encoded input stays as is.
+    /// Null if it doesn't start with '/'.
+    /// </summary>
+    internal static string? EscapeRequestUri(string uri)
+    {
+        if (!uri.StartsWith('/')) return null;
+        int hash = uri.IndexOf('#');
+        if (hash >= 0) uri = uri[..hash];
+        bool clean = true;
+        foreach (char c in uri) if (c is <= ' ' or >= (char)0x7f) { clean = false; break; }
+        if (clean) return uri;
+        var sb = new StringBuilder(uri.Length + 16);
+        foreach (byte b in Encoding.UTF8.GetBytes(uri))
+        {
+            if (b is > (byte)' ' and < 0x7f) sb.Append((char)b);
+            else sb.Append('%').Append("0123456789ABCDEF"[b >> 4]).Append("0123456789ABCDEF"[b & 15]);
+        }
+        return sb.ToString();
+    }
+
     internal static string BuildUri(HttpContext ctx, ProxyConf conf, ProxyTarget t)
     {
         var req = ctx.Request;

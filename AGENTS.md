@@ -50,6 +50,7 @@ These are deliberate design decisions made by the project owner, not accidents t
      - `h2c` is never tunnelled.
      - Pooled upstream connections are reused only under the TLS identity they were verified with.
      - Mid-body upstream failure cuts the client connection, never "completes" it.
+     - Variables in `proxy_pass` may only select an `upstream` block by name, never an arbitrary host (SSRF).
      - Keep these defaults even where nginx's differ.
 
 7. **Logging is single-line JSON on stdout.** Write through `ILogger` / `Utf8JsonWriter`. Never write directly with `Console.Write`, and never build JSON by string concatenation. The logger must never block request processing; it drops lines (and counts them) instead.

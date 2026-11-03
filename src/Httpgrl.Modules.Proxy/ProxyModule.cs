@@ -15,6 +15,13 @@ public sealed class ProxyConf : ScopeConfig<ProxyConf>
     public SourceLocation PassSource;
     public string[] LocationArgs = [];
     internal ProxyTarget? Target;
+    /// <summary>
+    /// proxy_pass with variables: everything after the scheme, evaluated per request and split at the first '/'
+    /// (as nginx does). The authority must name an upstream block; a URI part replaces the request URI.
+    /// </summary>
+    internal ComplexValue? DynUrl;
+    internal bool DynTls;
+    internal Dictionary<string, ProxyTarget>? DynTargets;
 
     // Inherited.
     public List<(string Name, ComplexValue Value)>? SetHeaders; // a level that sets any replaces the inherited list
@@ -167,8 +174,8 @@ public sealed class ProxyModule : IModule, IDisposable
             },
         });
 
-        r.AddVariable("proxy_host", c => c.Config<ProxyConf>().Target?.HostHeader);
-        r.AddVariable("proxy_port", c => c.Config<ProxyConf>().Target?.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        r.AddVariable("proxy_host", c => ProxyHandler.CurrentTarget(c)?.HostHeader);
+        r.AddVariable("proxy_port", c => ProxyHandler.CurrentTarget(c)?.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
         r.AddVariable("proxy_add_x_forwarded_for", c =>
         {
             var xff = c.Request.Headers.Get("X-Forwarded-For");
@@ -237,9 +244,18 @@ public sealed class ProxyModule : IModule, IDisposable
     {
         var c = i.Conf<ProxyConf>();
         var url = i.Args[0];
-        if (url.Contains('$')) throw i.Error("variables in proxy_pass are not supported");
         if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
             throw i.Error($"invalid URL prefix in \"{url}\"");
+        if (url.Contains('$'))
+        {
+            // Variables may pick an upstream block by name (and set the whole URI), never an arbitrary host: a
+            // variable fed by the request would otherwise make this an open proxy to anything the server can reach.
+            bool tls = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+            var rest = url[(tls ? 8 : 7)..];
+            if (rest.Length == 0 || rest[0] == '/') throw i.Error("no host in proxy_pass");
+            c.DynTls = tls;
+            c.DynUrl = i.Compile(rest);
+        }
         c.Pass = url;
         c.PassSource = i.Source;
         c.LocationArgs = [.. i.Scope.Args];
@@ -300,6 +316,15 @@ public sealed class ProxyModule : IModule, IDisposable
         foreach (var loc in setup.ScopesOf(ContextKind.Location))
         {
             if (!loc.TryGet<ProxyConf>(out var pc) || pc.Pass is null) continue;
+            if (pc.DynUrl is not null)
+            {
+                if (groups.Count == 0) throw new ConfigException("proxy_pass with variables needs upstream blocks to choose from", pc.PassSource);
+                pc.DynTargets = new Dictionary<string, ProxyTarget>(StringComparer.OrdinalIgnoreCase);
+                foreach (var name in groups.Keys)
+                    pc.DynTargets[name] = BuildTarget(pc, groups, implicitGroups, setup.Log, (pc.DynTls ? "https://" : "http://") + name);
+                pc.RedirectRules = pc.Redirects is null ? [] : RedirectRules(pc, setup); // no "default" mapping for a variable URL
+                continue;
+            }
             pc.Target = BuildTarget(pc, groups, implicitGroups, setup.Log);
             pc.RedirectRules = RedirectRules(pc, setup);
         }
@@ -315,24 +340,38 @@ public sealed class ProxyModule : IModule, IDisposable
             var g = groups[u.Name];
             ProxyTarget? first = null;
             foreach (var loc in setup.ScopesOf(ContextKind.Location))
-                if (loc.TryGet<ProxyConf>(out var pc) && pc.Target is { } t && t.Group == g) { first = t; break; }
+            {
+                if (!loc.TryGet<ProxyConf>(out var pc)) continue;
+                if (pc.Target is { } t && t.Group == g) { first = t; break; }
+                if (pc.DynTargets?.Values.FirstOrDefault(x => x.Group == g) is { } d) { first = d; break; }
+            }
             if (first is null) continue; // nobody proxies to it
             checkers[g] = new HealthChecker(g, u.HealthCheck, first, setup.Log);
         }
         _checkers.AddRange(checkers.Values);
         if (checkers.Count > 0)
-            foreach (var loc in setup.ScopesOf(ContextKind.Location))
-                if (loc.TryGet<ProxyConf>(out var pc) && pc.Target is { } t && checkers.TryGetValue(t.Group, out var hc)) pc.Target = t with { Health = hc };
+            Enrich(setup, t => checkers.TryGetValue(t.Group, out var hc) ? t with { Health = hc } : t);
         if (_resolveIntervalMs > 0 && _groups.Exists(g => g.Resolvable.Length > 0))
         {
             _refresher = new DnsRefresher(_groups.FindAll(g => g.Resolvable.Length > 0), _resolveIntervalMs, _resolve, setup.Log);
-            foreach (var loc in setup.ScopesOf(ContextKind.Location))
-                if (loc.TryGet<ProxyConf>(out var pc) && pc.Target is { } t && t.Group.Resolvable.Length > 0) pc.Target = t with { Dns = _refresher };
+            Enrich(setup, t => t.Group.Resolvable.Length > 0 ? t with { Dns = _refresher } : t);
         }
     }
 
     private readonly List<UpstreamGroup> _groups = new();
     private readonly List<HealthChecker> _checkers = new();
+
+    /// <summary>Apply <paramref name="f"/> to every target of every location (fixed and variable ones).</summary>
+    private static void Enrich(IModuleSetup setup, Func<ProxyTarget, ProxyTarget> f)
+    {
+        foreach (var loc in setup.ScopesOf(ContextKind.Location))
+        {
+            if (!loc.TryGet<ProxyConf>(out var pc)) continue;
+            if (pc.Target is { } t) pc.Target = f(t);
+            if (pc.DynTargets is { } d)
+                foreach (var k in d.Keys.ToArray()) d[k] = f(d[k]);
+        }
+    }
 
     /// <summary>
     /// "default" maps the proxy_pass URL to the location's prefix (nginx): with
@@ -371,9 +410,9 @@ public sealed class ProxyModule : IModule, IDisposable
         foreach (var g in _groups) g.Retire();
     }
 
-    private ProxyTarget BuildTarget(ProxyConf c, Dictionary<string, UpstreamGroup> groups, Dictionary<string, UpstreamGroup> implicitGroups, ILogger log)
+    private ProxyTarget BuildTarget(ProxyConf c, Dictionary<string, UpstreamGroup> groups, Dictionary<string, UpstreamGroup> implicitGroups, ILogger log, string? urlOverride = null)
     {
-        var url = c.Pass!;
+        var url = urlOverride ?? c.Pass!;
         var src = c.PassSource;
         bool tls = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
         var rest = url[(tls ? 8 : 7)..];

@@ -21,6 +21,41 @@ internal static class ProxyTests
 
     public static void Register()
     {
+        T.Add("proxy: variables in proxy_pass choose among upstream blocks only (never an arbitrary host)", async () =>
+        {
+            await using var a = new FakeUpstream(Answers("A"));
+            await using var b = new FakeUpstream(Answers("B"));
+            await using var echo = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf("""
+                location / { proxy_pass http://$backend; }
+                location /open/ { proxy_pass http://$arg_to; }
+                location /uri/ { proxy_pass http://echo/fixed$is_args$args; }
+                location /raw/ { proxy_pass http://$which$uri; }
+                """, $$"""
+                upstream tenant_a { server 127.0.0.1:{{a.Port}}; }
+                upstream main { server 127.0.0.1:{{b.Port}}; }
+                upstream echo { server 127.0.0.1:{{echo.Port}}; }
+                map $http_x_tenant $backend { acme tenant_a; default main; }
+                map $uri $which { default echo; }
+                """));
+            T.Eq("A", Body(await s.Raw("GET / HTTP/1.1\r\nHost: front.test\r\nX-Tenant: acme\r\nConnection: close\r\n\r\n")));
+            T.Eq("B", Body(await s.Raw(Get("/"))));
+            T.Eq("B", Body(await s.Raw(Get("/open/?to=main"))));
+            // A request-controlled variable naming an address gets nowhere: that would be an open proxy.
+            T.Eq(502, Status(await s.Raw(Get($"/open/?to=127.0.0.1:{a.Port}"))));
+            T.Contains("name an upstream block", s.LogText());
+
+            var fixedUri = Body(await s.Raw(Get("/uri/x?y=1")));
+            T.Contains("GET /fixed?y=1 HTTP/1.1", fixedUri);       // a URI part with variables replaces the request URI
+            T.Contains("Host: echo", fixedUri);
+            var rawResp = await s.Raw(Get("/raw/a%20b%0d%0aX:%201"));
+            var raw = Body(rawResp);
+            T.Contains("GET /raw/a%20b%0D%0AX:%201 HTTP/1.1", raw); // a decoded $uri can't break the request line
+            T.True(!raw.Contains("\r\nX: 1", StringComparison.Ordinal));
+
+            T.Contains("needs upstream blocks", T.Throws<ConfigException>(() => TestServer.Start(Conf("location / { proxy_pass http://$host; }"))).Message);
+        });
+
         T.Add("proxy: active health checks take failing peers out of rotation and bring them back", async () =>
         {
             int bHealth = 200, aHealth = 200;
