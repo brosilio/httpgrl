@@ -362,10 +362,11 @@ internal static class Fuzz
         data =>
         {
             var v = Encoding.Latin1.GetString(data);
-            var c = Httpgrl.Modules.Compression.CompressionModule.Negotiate(v, true, true);
+            var c = AcceptEncoding.Choose(v, true, true);
             // Whatever the rest says, an explicit q=0 (exact, unambiguous form) for a coding is never overridden for it.
-            if (c == Httpgrl.Modules.Compression.CompressionModule.Coding.Brotli && v == "br;q=0") throw new Finding("br chosen despite q=0");
-            return c != Httpgrl.Modules.Compression.CompressionModule.Coding.None;
+            if (c == ContentCoding.Brotli && v == "br;q=0") throw new Finding("br chosen despite q=0");
+            if (c != ContentCoding.Identity && !AcceptEncoding.Accepts(v, c)) throw new Finding($"chose {c} but it isn't acceptable");
+            return c != ContentCoding.Identity;
         }, MaxLen: 1024);
 
     /// <summary>CRLs (DER). Only CryptographicException is a legitimate rejection.</summary>

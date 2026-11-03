@@ -209,7 +209,8 @@ gzip_types text/plain text/css application/json application/javascript image/svg
 | `gzip_comp_level 1..9;` / `brotli_comp_level 0..11;` | http, server, location | `1` / `4` | |
 | `gzip_min_length size;` | http, server, location | `256` | Applies when the length is known up front (nginx: 20). |
 | `gzip_vary on\|off;` | http, server, location | **`on`** | Adds `Vary: Accept-Encoding` to every compressible response, compressed or not, and merges with an existing `Vary`. nginx defaults to off, which lets shared caches serve gzip to clients that didn't ask for it. |
-| `gzip_proxied`, `gzip_disable`, `gzip_buffers`, `gzip_http_version`, `gzip_static` | | | Accepted and ignored with a warning, so nginx configs load. Responses compress regardless of `Via`; precompressed files aren't served yet. |
+| `gzip_static on\|off\|always;` / `brotli_static on\|off;` | http, server, location | `off` | Serve a precompressed sibling (`x.br`, then `x.gz`) when the client accepts it (`always`: the `.gz` regardless). It's opened through the core like any file (containment, `disable_symlinks`), keeps the original's `Content-Type`, and is served with a known length; conditional requests and ranges apply to it. Adds `Vary: Accept-Encoding`. Falls back to the original, which on-the-fly compression may still handle. |
+| `gzip_proxied`, `gzip_disable`, `gzip_buffers`, `gzip_http_version` | | | Accepted and ignored with a warning, so nginx configs load. Responses compress regardless of `Via`. |
 
 **BREACH:** compressing a response that reflects attacker-controlled input next to a secret (a CSRF token, say)
 over TLS lets an attacker who can observe response sizes recover the secret. That's why compression is off by
@@ -425,6 +426,7 @@ Then add it to the list in `src/Httpgrl/Program.cs`. There is no reflection and 
 - **Changing the URI:** `ctx.SetUri(path, query, reselectLocation)` rewrites the request URI in place (normalized by the core), optionally choosing the location again. `rewrite` is built on it.
 - **Request end:** `ctx.OnRequestEnd(callback, state)` runs exactly once when the request is over, whether it completed or the connection broke mid-request. Use it to release per-request reservations (`limit_conn` does).
 - **State across reloads:** `setup.Persistent(key, () => new T())` hands back the object the previous configuration stored under `key`, or makes a new one. Rate-limit zones use it so a `SIGHUP` doesn't reset everyone's counters. A failed reload never touches it, and keys the new configuration doesn't ask for are dropped.
+- **Content negotiation:** `AcceptEncoding.Choose(header, gzip, brotli)`, `Accepts` and `AddVary` implement RFC 9110 `Accept-Encoding` handling once, for every module that needs it.
 - **Body encoding:** from a header filter, `ctx.Response.EncodeBody(sink => new GZipStream(sink, ...))` sends the body through an encoder. The core switches to chunked framing, flushes the encoder on `FlushAsync`, writes its trailer at completion, and frees it if the response is cut short.
 - **Header filters:** `setup.AddHeaderFilter(ctx => ...)` runs once per response just before its head is written, for handler, proxied and core-rendered responses alike (`add_header` is one).
 - **Variables:** register fixed ones in `Register` (`r.AddVariable`). Declare config-defined ones while parsing with `inv.AddVariable` (`set` and `map` do this). Uses resolve after parsing, so order in the file doesn't matter. `ctx.SetCaptures(match)` makes a regex match the source of `$1`..`$9`.
@@ -445,5 +447,5 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 8. [ ] **HTTP/2.**
 9. [ ] **Release process**: CI on push, a first `v0.x` tag, signed images.
 
-Also not yet: `gzip_static` (precompressed files), `disable_symlinks if_not_owner`, `map ... hostnames`, OCSP, open-file cache, `sendfile(2)` for plaintext responses
+Also not yet: `disable_symlinks if_not_owner`, `map ... hostnames`, OCSP, open-file cache, `sendfile(2)` for plaintext responses
 (responses currently use buffered `pread` + `send`; over TLS that's unavoidable anyway).

@@ -43,7 +43,7 @@ public sealed class CompressionModule : IModule
         "application/ld+json", "application/manifest+json", "application/wasm", "image/svg+xml",
     ];
 
-    private static readonly string[] Ignored = ["gzip_proxied", "gzip_disable", "gzip_buffers", "gzip_http_version", "gzip_static"];
+    private static readonly string[] Ignored = ["gzip_proxied", "gzip_disable", "gzip_buffers", "gzip_http_version"];
     private readonly List<(string, SourceLocation)> _ignoredSeen = new();
 
     public string Name => "http_compression";
@@ -81,13 +81,9 @@ public sealed class CompressionModule : IModule
     public void Configure(IModuleSetup setup)
     {
         foreach (var (name, src) in _ignoredSeen)
-            setup.Log.Warn(name == "gzip_static"
-                ? "directive ignored: precompressed files aren't served yet; responses are compressed on the fly"
-                : "directive ignored: not needed here", new("directive", name), new("at", src.ToString()));
+            setup.Log.Warn("directive ignored: not needed here", new("directive", name), new("at", src.ToString()));
         setup.AddHeaderFilter(Filter, Order);
     }
-
-    internal enum Coding : byte { None, Gzip, Brotli }
 
     private static void Filter(HttpContext ctx)
     {
@@ -102,16 +98,16 @@ public sealed class CompressionModule : IModule
         if (h.Get("Cache-Control") is { } cc && cc.Contains("no-transform", StringComparison.OrdinalIgnoreCase)) return;
 
         // The representation varies by Accept-Encoding from here on, whether or not this response gets compressed.
-        if (c.Vary != false) AddVary(h);
+        if (c.Vary != false) AcceptEncoding.AddVary(h);
         if (resp.ContentLength >= 0 && resp.ContentLength < (c.MinLength ?? 256)) return;
-        var coding = Negotiate(ctx.Request.Headers.Get("Accept-Encoding"), gzip, br);
-        if (coding == Coding.None) return;
+        var coding = AcceptEncoding.Choose(ctx.Request.Headers.Get("Accept-Encoding"), gzip, br);
+        if (coding == ContentCoding.Identity) return;
 
-        h.Set("Content-Encoding", coding == Coding.Brotli ? "br" : "gzip");
+        h.Set("Content-Encoding", coding == ContentCoding.Brotli ? "br" : "gzip");
         h.Remove("Accept-Ranges");
         if (h.Get("ETag") is { } etag && !etag.StartsWith("W/", StringComparison.Ordinal)) h.Set("ETag", "W/" + etag);
-        int level = coding == Coding.Brotli ? c.BrotliLevel ?? 4 : c.GzipLevel ?? 1;
-        resp.EncodeBody(coding == Coding.Brotli
+        int level = coding == ContentCoding.Brotli ? c.BrotliLevel ?? 4 : c.GzipLevel ?? 1;
+        resp.EncodeBody(coding == ContentCoding.Brotli
             ? sink => new BrotliEncodeStream(sink, level)
             : sink => new GZipStream(sink, new ZLibCompressionOptions { CompressionLevel = level }, leaveOpen: true));
     }
@@ -128,52 +124,6 @@ public sealed class CompressionModule : IModule
         return false;
     }
 
-    private static void AddVary(HeaderCollection h)
-    {
-        var v = h.Get("Vary");
-        if (v is null) { h.Set("Vary", "Accept-Encoding"); return; }
-        foreach (var r in v.AsSpan().Split(','))
-        {
-            var tok = v.AsSpan()[r].Trim();
-            if (tok.Equals("Accept-Encoding", StringComparison.OrdinalIgnoreCase) || tok.SequenceEqual("*")) return;
-        }
-        h.Set("Vary", v + ", Accept-Encoding");
-    }
-
-    /// <summary>
-    /// RFC 9110 12.5.3: codings with q=0 are refused; "*" stands for any coding not listed. Brotli wins a tie (it's
-    /// smaller at comparable cost); otherwise the higher q wins. Garbage yields no coding, never an error.
-    /// </summary>
-    internal static Coding Negotiate(string? acceptEncoding, bool gzipOn, bool brOn)
-    {
-        if (string.IsNullOrEmpty(acceptEncoding)) return Coding.None;
-        double gz = -1, brq = -1, star = -1;
-        var s = acceptEncoding.AsSpan();
-        foreach (var r in s.Split(','))
-        {
-            var item = s[r].Trim();
-            if (item.IsEmpty) continue;
-            double q = 1;
-            int semi = item.IndexOf(';');
-            var name = (semi < 0 ? item : item[..semi]).Trim();
-            if (semi >= 0)
-            {
-                var p = item[(semi + 1)..].Trim();
-                if (p.Length < 2 || (p[0] | 0x20) != 'q' || p[1] != '=' || !double.TryParse(p[2..], System.Globalization.NumberStyles.AllowDecimalPoint, System.Globalization.CultureInfo.InvariantCulture, out q) || q is < 0 or > 1)
-                    continue; // malformed: ignore this item
-            }
-            if (name.Equals("gzip", StringComparison.OrdinalIgnoreCase) || name.Equals("x-gzip", StringComparison.OrdinalIgnoreCase)) gz = Math.Max(gz, q);
-            else if (name.Equals("br", StringComparison.OrdinalIgnoreCase)) brq = Math.Max(brq, q);
-            else if (name.SequenceEqual("*")) star = Math.Max(star, q);
-        }
-        if (gz < 0) gz = star;
-        if (brq < 0) brq = star;
-        if (!gzipOn) gz = 0;
-        if (!brOn) brq = 0;
-        if (brq > 0 && brq >= gz) return Coding.Brotli;
-        if (gz > 0) return Coding.Gzip;
-        return Coding.None;
-    }
 }
 
 /// <summary>

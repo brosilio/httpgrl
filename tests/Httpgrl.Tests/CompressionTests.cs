@@ -119,21 +119,75 @@ internal static class CompressionTests
             release.SetResult();
         });
 
+        T.Add("gzip_static/brotli_static: precompressed siblings by Accept-Encoding; always; fallbacks", async () =>
+        {
+            byte[] Pack(string coding)
+            {
+                var ms = new MemoryStream();
+                using (Stream z = coding == "br" ? new BrotliStream(ms, CompressionLevel.SmallestSize, true) : new GZipStream(ms, CompressionLevel.SmallestSize, true))
+                    z.Write(Encoding.UTF8.GetBytes(Text));
+                return ms.ToArray();
+            }
+            var gzBytes = Pack("gz");
+            var brBytes = Pack("br");
+            await using var s = TestServer.Start("""
+                http { types { application/javascript js; text/plain txt; }
+                  server { listen 127.0.0.1:0; root {DIR}/www;
+                    location / { gzip_static on; brotli_static on; }
+                    location /always/ { alias {DIR}/www/; gzip_static always; }
+                    location /onlygz/ { alias {DIR}/www/; gzip_static on; gzip on; gzip_min_length 0; }
+                  }
+                }
+                """, d =>
+            {
+                Www(d);
+                File.WriteAllText(Path.Combine(d, "www", "app.js"), Text);
+                File.WriteAllBytes(Path.Combine(d, "www", "app.js.gz"), gzBytes);
+                File.WriteAllBytes(Path.Combine(d, "www", "app.js.br"), brBytes);
+            });
+            var br = await s.Raw(Get("/app.js", "gzip, br"));
+            T.Eq("br", Header(br, "Content-Encoding"));
+            T.Eq("application/javascript", Header(br, "Content-Type"));
+            T.Eq(brBytes.Length.ToString(), Header(br, "Content-Length")); // served as a file: length known, no chunking
+            T.Eq(Text, Decode(Encoding.Latin1.GetBytes(Body(br)), "br"));
+            T.Eq("Accept-Encoding", Header(br, "Vary"));
+
+            var gz = await s.Raw(Get("/app.js", "gzip, br;q=0"));
+            T.Eq("gzip", Header(gz, "Content-Encoding"));
+            T.Eq(Text, Decode(Encoding.Latin1.GetBytes(Body(gz)), "gzip"));
+
+            var plain = await s.Raw(Get("/app.js", ""));
+            T.Eq(null, Header(plain, "Content-Encoding"));
+            T.Eq(Text, Body(plain));
+            T.Eq("Accept-Encoding", Header(plain, "Vary"));
+
+            T.Eq("gzip", Header(await s.Raw(Get("/always/app.js", "")), "Content-Encoding")); // always: no Accept-Encoding needed
+            // No precompressed sibling: the original, which on-the-fly gzip may still compress.
+            var dyn = await s.Raw(Get("/onlygz/big.txt", "gzip"));
+            T.Eq("gzip", Header(dyn, "Content-Encoding"));
+            T.Eq("chunked", Header(dyn, "Transfer-Encoding"));
+            T.Eq(Text, Decode(Dechunk(dyn), "gzip"));
+            // A precompressed file isn't compressed again.
+            var once = await s.Raw(Get("/onlygz/app.js", "gzip"));
+            T.Eq(gzBytes.Length.ToString(), Header(once, "Content-Length"));
+            T.Contains("invalid value", T.Throws<ConfigException>(() => TestServer.Start("http { server { listen 127.0.0.1:0; gzip_static sometimes; } }")).Message);
+        });
+
         T.Add("compression: Accept-Encoding negotiation (q-values, *, refusals, garbage)", () =>
         {
-            var G = CompressionModule.Coding.Gzip;
-            var B = CompressionModule.Coding.Brotli;
-            var N = CompressionModule.Coding.None;
-            T.Eq(B, CompressionModule.Negotiate("gzip, br", true, true));
-            T.Eq(G, CompressionModule.Negotiate("gzip, br", true, false));
-            T.Eq(G, CompressionModule.Negotiate("br;q=0, gzip", true, true));
-            T.Eq(G, CompressionModule.Negotiate("br;q=0.5, gzip;q=0.9", true, true));
-            T.Eq(B, CompressionModule.Negotiate("*", true, true));
-            T.Eq(G, CompressionModule.Negotiate("*;q=0.1, br;q=0", true, true));
-            T.Eq(N, CompressionModule.Negotiate("gzip;q=0", true, true));
-            T.Eq(N, CompressionModule.Negotiate("identity", true, true));
-            T.Eq(N, CompressionModule.Negotiate(";;;,,q=,gzip;q=abc, br;q=2", true, true));
-            T.Eq(G, CompressionModule.Negotiate("X-GZIP", true, true));
+            var G = ContentCoding.Gzip;
+            var B = ContentCoding.Brotli;
+            var N = ContentCoding.Identity;
+            T.Eq(B, AcceptEncoding.Choose("gzip, br", true, true));
+            T.Eq(G, AcceptEncoding.Choose("gzip, br", true, false));
+            T.Eq(G, AcceptEncoding.Choose("br;q=0, gzip", true, true));
+            T.Eq(G, AcceptEncoding.Choose("br;q=0.5, gzip;q=0.9", true, true));
+            T.Eq(B, AcceptEncoding.Choose("*", true, true));
+            T.Eq(G, AcceptEncoding.Choose("*;q=0.1, br;q=0", true, true));
+            T.Eq(N, AcceptEncoding.Choose("gzip;q=0", true, true));
+            T.Eq(N, AcceptEncoding.Choose("identity", true, true));
+            T.Eq(N, AcceptEncoding.Choose(";;;,,q=,gzip;q=abc, br;q=2", true, true));
+            T.Eq(G, AcceptEncoding.Choose("X-GZIP", true, true));
             return Task.CompletedTask;
         });
 

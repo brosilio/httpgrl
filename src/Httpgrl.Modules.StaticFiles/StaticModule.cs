@@ -6,12 +6,69 @@ namespace Httpgrl.Modules.StaticFiles;
 /// Serves regular files (cf. ngx_http_static_module): conditional GET (ETag / If-Modified-Since),
 /// single byte ranges, directory-without-slash redirect. Runs last in the content phase.
 /// </summary>
+public sealed class StaticConf : ScopeConfig<StaticConf>
+{
+    internal Precompressed? Gzip;
+    internal bool? Brotli;
+    protected override void Inherit(StaticConf p)
+    {
+        Gzip ??= p.Gzip;
+        Brotli ??= p.Brotli;
+    }
+}
+
+internal enum Precompressed : byte { Off, On, Always }
+
 public sealed class StaticModule : IModule
 {
     public const int Order = 300;
     public string Name => "http_static";
 
-    public void Register(IModuleRegistry registry) { }
+    public void Register(IModuleRegistry r)
+    {
+        r.AddDirective(new()
+        {
+            Name = "gzip_static", Contexts = ContextKind.HttpAny, MinArgs = 1, MaxArgs = 1,
+            Handler = i => i.Conf<StaticConf>().Gzip = i.Args[0] switch
+            {
+                "on" => Precompressed.On,
+                "off" => Precompressed.Off,
+                "always" => Precompressed.Always,
+                var a => throw i.Error($"invalid value \"{a}\"; expected on, off or always"),
+            },
+        });
+        r.AddDirective(new() { Name = "brotli_static", Contexts = ContextKind.HttpAny, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<StaticConf>().Brotli = i.Flag(0) });
+    }
+
+    /// <summary>
+    /// gzip_static / brotli_static: a precompressed sibling (<c>x.br</c>, <c>x.gz</c>) the client accepts, opened through
+    /// the core like any file; null to serve the original. Brotli is preferred when both are acceptable.
+    /// </summary>
+    private static FileResource? OpenPrecompressed(HttpContext ctx, string uri, out string? encoding)
+    {
+        encoding = null;
+        var c = ctx.Config<StaticConf>();
+        var gz = c.Gzip ?? Precompressed.Off;
+        bool br = c.Brotli == true;
+        if (gz == Precompressed.Off && !br) return null;
+        AcceptEncoding.AddVary(ctx.Response.Headers);
+        var ae = ctx.Request.Headers.Get("Accept-Encoding");
+        if (br && AcceptEncoding.Accepts(ae, ContentCoding.Brotli) && AcceptEncoding.Choose(ae, gz != Precompressed.Off, true) == ContentCoding.Brotli
+            && ctx.OpenFile(uri + ".br", out var b) == OpenResult.Ok)
+        {
+            encoding = "br";
+            return b;
+        }
+        if (gz == Precompressed.Always || (gz == Precompressed.On && AcceptEncoding.Accepts(ae, ContentCoding.Gzip)))
+        {
+            if (ctx.OpenFile(uri + ".gz", out var g) == OpenResult.Ok)
+            {
+                encoding = "gzip";
+                return g;
+            }
+        }
+        return null;
+    }
 
     public void Configure(IModuleSetup setup) => setup.AddHandler(Phase.Content, Handle, Order);
 
@@ -30,7 +87,8 @@ public sealed class StaticModule : IModule
             return HandlerResult.WithStatus(405);
         }
 
-        switch (ctx.OpenFile(uri, out var opened))
+        var opened = OpenPrecompressed(ctx, uri, out var encoding);
+        switch (opened is not null ? OpenResult.Ok : ctx.OpenFile(uri, out opened))
         {
             case OpenResult.Ok: break;
             case OpenResult.NotFound: return HandlerResult.WithStatus(404);
@@ -50,7 +108,8 @@ public sealed class StaticModule : IModule
         var etag = "\"" + mtimeUnix.ToString("x", CultureInfo.InvariantCulture) + "-" + length.ToString("x", CultureInfo.InvariantCulture) + "\"";
         var resp = ctx.Response;
         var h = resp.Headers;
-        h.Set("Content-Type", file.ContentType);
+        h.Set("Content-Type", encoding is null ? file.ContentType : ctx.ContentTypeFor(uri));
+        if (encoding is not null) h.Set("Content-Encoding", encoding);
         h.Set("Last-Modified", lastModified.ToString("r", CultureInfo.InvariantCulture));
         h.Set("ETag", etag);
         h.Set("Accept-Ranges", "bytes");
