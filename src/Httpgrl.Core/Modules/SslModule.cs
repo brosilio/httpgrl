@@ -10,6 +10,7 @@ public sealed class SslConf : ScopeConfig<SslConf>
     public string? Certificate, CertificateKey;
     public SourceLocation CertificateSource;
     public SslProtocols? Protocols;
+    public bool? Stapling;
     public VerifyClient? Verify;
     public string? ClientCa;
     public SourceLocation ClientCaSource;
@@ -25,6 +26,7 @@ public sealed class SslConf : ScopeConfig<SslConf>
     {
         if (Certificate is null) { Certificate = p.Certificate; CertificateKey = p.CertificateKey; CertificateSource = p.CertificateSource; }
         Protocols ??= p.Protocols;
+        Stapling ??= p.Stapling;
         Verify ??= p.Verify;
         if (ClientCa is null) { ClientCa = p.ClientCa; ClientCaSource = p.ClientCaSource; }
         VerifyDepth ??= p.VerifyDepth;
@@ -134,7 +136,7 @@ internal sealed class SslModule : IModule
 {
     public string Name => "http_ssl";
 
-    private static readonly string[] Ignored = ["ssl_ciphers", "ssl_prefer_server_ciphers", "ssl_session_cache", "ssl_session_timeout", "ssl_session_tickets", "ssl_dhparam", "ssl_ecdh_curve", "ssl_stapling", "ssl_stapling_verify"];
+    private static readonly string[] Ignored = ["ssl_ciphers", "ssl_prefer_server_ciphers", "ssl_session_cache", "ssl_session_timeout", "ssl_session_tickets", "ssl_dhparam", "ssl_ecdh_curve"];
     private readonly List<(string, SourceLocation)> _ignoredSeen = new();
 
     public void Register(IModuleRegistry r)
@@ -143,6 +145,12 @@ internal sealed class SslModule : IModule
         r.AddDirective(new() { Name = "ssl_certificate", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => { var c = i.Conf<SslConf>(); c.Certificate = i.Args[0]; c.CertificateSource = i.Source; } });
         r.AddDirective(new() { Name = "ssl_certificate_key", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<SslConf>().CertificateKey = i.Args[0] });
         r.AddDirective(new() { Name = "ssl_protocols", Contexts = ctx, MinArgs = 1, MaxArgs = -1, Handler = Protocols });
+        r.AddDirective(new() { Name = "ssl_stapling", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<SslConf>().Stapling = i.Flag(0) });
+        // The platform verifies every OCSP response it staples (signature by the issuer or its delegate, CertID,
+        // validity); "off" can't be honoured, so it's an error rather than a silent no-op.
+        r.AddDirective(new() { Name = "ssl_stapling_verify", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => { if (!i.Flag(0)) throw i.Error("stapled OCSP responses are always verified; \"off\" isn't supported"); } });
+        foreach (var n in new[] { "ssl_stapling_file", "ssl_stapling_responder" })
+            r.AddDirective(new() { Name = n, Contexts = ctx, MaxArgs = -1, Handler = i => throw i.Error($"\"{i.Name}\" is not supported: the OCSP response is fetched from the responder named in the certificate") });
         r.AddDirective(new() { Name = "ssl_verify_client", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<SslConf>().Verify = i.Args[0] switch
         {
             "off" => VerifyClient.Off,
@@ -198,7 +206,7 @@ internal sealed class SslModule : IModule
         foreach (var (name, src) in _ignoredSeen)
             setup.Log.Warn("directive ignored; the platform TLS stack defaults apply", new("directive", name), new("at", src.ToString()));
 
-        var cache = new Dictionary<(string, string, string?), SslStreamCertificateContext>();
+        var cache = new Dictionary<(string, string, string?, bool), SslStreamCertificateContext>();
         var auths = new Dictionary<(VerifyClient, string?, int, string?), ClientAuth>();
         var crlSets = new Dictionary<string, CrlSet>();
         var caBundles = new Dictionary<string, X509Certificate2Collection>();
@@ -247,14 +255,16 @@ internal sealed class SslModule : IModule
 
             // The trust list travels inside the certificate context, so a context is per (cert, key, CA bundle).
             string? trustKey = auth?.Trust is null ? null : ssl.ClientCa;
-            if (!cache.TryGetValue((cert, key, trustKey), out var context))
+            bool stapling = ssl.Stapling == true;
+            if (stapling) CheckStapling(cert, ssl.CertificateSource, setup.Log);
+            if (!cache.TryGetValue((cert, key, trustKey, stapling), out var context))
             {
-                try { context = Load(cert, key, auth?.Trust); }
+                try { context = Load(cert, key, auth?.Trust, stapling); }
                 catch (Exception e) when (e is CryptographicException or IOException or UnauthorizedAccessException or ArgumentException)
                 {
                     throw new ConfigException($"cannot load certificate \"{cert}\" / key \"{key}\": {e.Message}", ssl.CertificateSource);
                 }
-                cache[(cert, key, trustKey)] = context;
+                cache[(cert, key, trustKey, stapling)] = context;
             }
             ssl.Options = new SslServerAuthenticationOptions
             {
@@ -310,7 +320,24 @@ internal sealed class SslModule : IModule
         return new CrlSet(crls);
     }
 
-    internal static SslStreamCertificateContext Load(string certPath, string keyPath, SslCertificateTrust? trust = null)
+    /// <summary>Stapling silently does nothing without a responder URL or the issuer: say so at load.</summary>
+    private static void CheckStapling(string certPath, SourceLocation src, ILogger log)
+    {
+        var all = new X509Certificate2Collection();
+        try { all.ImportFromPemFile(certPath); }
+        catch (Exception e) when (e is CryptographicException or IOException) { return; } // reported by Load
+        if (all.Count == 0) return;
+        var leaf = all[0];
+        bool hasUrl = false;
+        foreach (var ext in leaf.Extensions)
+            if (ext is X509AuthorityInformationAccessExtension aia && aia.EnumerateOcspUris().Any()) hasUrl = true;
+        if (!hasUrl)
+            log.Warn("ssl_stapling: the certificate names no OCSP responder, so nothing will be stapled", new("certificate", certPath), new("at", src.ToString()));
+        else if (!all.Cast<X509Certificate2>().Skip(1).Any(c => c.SubjectName.RawData.AsSpan().SequenceEqual(leaf.IssuerName.RawData)))
+            log.Warn("ssl_stapling: the certificate file doesn't include the issuer, which OCSP needs; append it", new("certificate", certPath), new("at", src.ToString()));
+    }
+
+    internal static SslStreamCertificateContext Load(string certPath, string keyPath, SslCertificateTrust? trust = null, bool stapling = false)
     {
         var leaf = X509Certificate2.CreateFromPemFile(certPath, keyPath);
         if (OperatingSystem.IsWindows())
@@ -325,7 +352,9 @@ internal sealed class SslModule : IModule
         var chain = new X509Certificate2Collection();
         foreach (var c in all)
             if (!c.RawDataMemory.Span.SequenceEqual(leaf.RawDataMemory.Span)) chain.Add(c);
-        return SslStreamCertificateContext.Create(leaf, chain, offline: true, trust);
+        // Online: the platform fetches an OCSP response from the certificate's responder and staples it (refreshing it
+        // before it expires). Offline: nothing leaves the machine.
+        return SslStreamCertificateContext.Create(leaf, chain, offline: !stapling, trust);
     }
 }
 
