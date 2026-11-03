@@ -133,6 +133,34 @@ internal static class ProxyTests
             T.Contains("invalid parameter", Err("bogus=1"));
         });
 
+        T.Add("proxy: localhost is loopback only (RFC 6761), never looked up", async () =>
+        {
+            int lookups = 0;
+            Task<System.Net.IPAddress[]> Resolve(string host, CancellationToken ct)
+            {
+                Interlocked.Increment(ref lookups);
+                // What .NET returned on Debian for "localhost": the machine's 127.0.1.1 alias as well.
+                return Task.FromResult(new[] { System.Net.IPAddress.Parse("127.0.1.1"), System.Net.IPAddress.Loopback });
+            }
+            await using var up = new FakeUpstream(Answers("up"));
+            await using var s = TestServer.Start(Conf($$"""
+                location / { proxy_pass http://localhost:{{up.Port}}/; }
+                location /sub/ { proxy_pass http://app.LocalHost.:{{up.Port}}/; }
+                location /grp/ { proxy_pass http://g/; }
+                """, $"upstream g {{ server localhost:{up.Port}; }} upstream_resolve_interval 100ms;"), dns: Resolve);
+            for (int k = 0; k < 6; k++)
+            {
+                T.Eq("up", Body(await s.Raw(Get("/"))));
+                T.Eq("up", Body(await s.Raw(Get("/sub/"))));
+                T.Eq("up", Body(await s.Raw(Get("/grp/"))));
+            }
+            await Task.Delay(300); // past a re-resolution interval
+            T.Eq(0, lookups);
+            T.True(!s.LogText().Contains("127.0.1.1", StringComparison.Ordinal));
+            var L = Httpgrl.Modules.Proxy.ProxyModule.IsLocalhost;
+            T.True(L("LOCALHOST") && L("a.b.localhost.") && !L("localhost.example") && !L("notlocalhost"));
+        });
+
         T.Add("proxy: upstream hostnames are re-resolved; DNS failures keep the last good addresses", async () =>
         {
             int port = FreePort();

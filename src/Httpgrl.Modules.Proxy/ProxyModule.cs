@@ -578,8 +578,21 @@ public sealed class ProxyModule : IModule, IDisposable
     {
         if (address.StartsWith("unix:", StringComparison.Ordinal)) return null;
         SplitHostPort(address, defPort, src, out var host, out var port, out _);
-        return IPAddress.TryParse(host, out _) ? null : (host, port);
+        return IPAddress.TryParse(host, out _) || IsLocalhost(host) ? null : (host, port);
     }
+
+    /// <summary>
+    /// RFC 6761 6.3: "localhost" and "*.localhost" are always loopback and aren't looked up. The system resolver can
+    /// add more (Debian maps the machine's own name to 127.0.1.1, and .NET then returns it for "localhost" too), which
+    /// made a backend listening on 127.0.0.1 also get tried on addresses it isn't on.
+    /// </summary>
+    internal static bool IsLocalhost(string host)
+    {
+        var h = host.AsSpan().TrimEnd('.');
+        return h.Equals("localhost", StringComparison.OrdinalIgnoreCase) || h.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static readonly IPAddress[] Loopbacks = [IPAddress.Loopback, IPAddress.IPv6Loopback];
 
     /// <summary>Load-time resolution. <paramref name="allowMissing"/> ("resolve"): start without addresses and keep trying.</summary>
     private IEnumerable<EndPoint> Resolve(string address, int defPort, SourceLocation src, bool allowMissing, ILogger log)
@@ -587,6 +600,7 @@ public sealed class ProxyModule : IModule, IDisposable
         if (address.StartsWith("unix:", StringComparison.Ordinal)) return [new UnixDomainSocketEndPoint(address[5..])];
         SplitHostPort(address, defPort, src, out var host, out var port, out _);
         if (IPAddress.TryParse(host, out var ip)) return [new IPEndPoint(ip, port)];
+        if (IsLocalhost(host)) return Array.ConvertAll(Loopbacks, a => (EndPoint)new IPEndPoint(a, port));
         IPAddress[] addrs;
         string? why = null;
         try { addrs = _resolve(host, CancellationToken.None).GetAwaiter().GetResult(); }
