@@ -239,8 +239,11 @@ public sealed class HttpServer : IAsyncDisposable
             _mgr.CountAccepted();
             var conn = new Connection(_mgr.NextId(), s, IpKey.From(remote));
             // Pin a generation; a reload between reading and pinning just means we read again.
+            // A listener a reload dropped keeps its last (now retired) state forever: give up on it rather than spin.
             Listener.State st;
-            while (!(st = listener.Current).Rt.TryAcquire()) { }
+            bool pinned;
+            while (!(pinned = (st = listener.Current).Rt.TryAcquire()) && !listener.Closed && !_stopping) { }
+            if (!pinned) { s.Dispose(); return; }
             conn.Generation = st.Rt;
             conn.Tls = st.Binding.Ssl;
             if (!_mgr.TryAdmit(conn, out var why))

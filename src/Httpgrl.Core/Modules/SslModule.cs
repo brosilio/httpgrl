@@ -141,7 +141,9 @@ public sealed class ClientAuth
 }
 
 /// <summary>TLS termination via the platform stack (SslStream). PEM certificate chains, TLS 1.2/1.3 only.</summary>
-internal sealed class SslModule : IModule, IDisposable
+/// <param name="prefix">Relative certificate/key/CA/CRL/staple paths resolve against this (the main configuration's
+/// directory), like nginx and like every other path in the configuration, whichever file the directive is in.</param>
+internal sealed class SslModule(string prefix) : IModule, IDisposable
 {
     public string Name => "http_ssl";
 
@@ -234,7 +236,7 @@ internal sealed class SslModule : IModule, IDisposable
             if (ssl.RejectHandshake == true) continue; // nothing to present: every handshake that routes here is refused
             if (ssl.Certificate is null || ssl.CertificateKey is null)
                 throw new ConfigException("no \"ssl_certificate\"/\"ssl_certificate_key\" defined for a server with \"listen ... ssl\"", server.Source);
-            var root = Path.GetDirectoryName(server.Source.File) ?? "";
+            var root = prefix;
             var cert = Path.GetFullPath(ssl.Certificate, root);
             var key = Path.GetFullPath(ssl.CertificateKey, root);
 
@@ -270,7 +272,7 @@ internal sealed class SslModule : IModule, IDisposable
             ssl.ClientAuth = auth;
 
             // The trust list travels inside the certificate context, so a context is per (cert, key, CA bundle).
-            string? trustKey = auth?.Trust is null ? null : ssl.ClientCa;
+            string? trustKey = auth?.Trust is null ? null : Path.GetFullPath(ssl.ClientCa!, root); // the file, not its spelling
             bool stapling = ssl.Stapling == true;
             string? stapleFile = ssl.StaplingFile is null ? null : Path.GetFullPath(ssl.StaplingFile, root);
             var ckey = (cert, key, trustKey, stapling ? (stapleFile ?? "") + "|" + ssl.StaplingResponder : null);

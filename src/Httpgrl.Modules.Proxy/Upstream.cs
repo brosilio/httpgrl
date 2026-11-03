@@ -218,7 +218,8 @@ internal sealed class UpstreamConn : IDisposable
     public long IdleSince;
     /// <summary>The TLS options this connection was verified under (null: plaintext). Pool reuse requires a match.</summary>
     public readonly object? Identity;
-    private readonly CancellationTokenSource _cts = new();
+    // Reads and writes time out separately: while a request body uploads, the response head is read at the same time.
+    private readonly CancellationTokenSource _readCts = new(), _writeCts = new();
     private int _disposed;
 
     private UpstreamConn(UpstreamServer server, Socket socket, Stream stream, int bufSize, object? identity)
@@ -271,16 +272,22 @@ internal sealed class UpstreamConn : IDisposable
 
     public async ValueTask<int> ReadAsync(Memory<byte> into, int timeoutMs)
     {
-        if (timeoutMs > 0) _cts.CancelAfter(timeoutMs);
-        try { return await Stream.ReadAsync(into, timeoutMs > 0 ? _cts.Token : default).ConfigureAwait(false); }
-        finally { if (timeoutMs > 0) _cts.TryReset(); }
+        if (timeoutMs > 0) _readCts.CancelAfter(timeoutMs);
+        try { return await Stream.ReadAsync(into, timeoutMs > 0 ? _readCts.Token : default).ConfigureAwait(false); }
+        finally { if (timeoutMs > 0) _readCts.TryReset(); }
     }
 
     public async ValueTask WriteAsync(ReadOnlyMemory<byte> data, int timeoutMs)
     {
-        _cts.CancelAfter(timeoutMs);
-        try { await Stream.WriteAsync(data, _cts.Token).ConfigureAwait(false); }
-        finally { _cts.TryReset(); }
+        _writeCts.CancelAfter(timeoutMs);
+        try { await Stream.WriteAsync(data, _writeCts.Token).ConfigureAwait(false); }
+        finally { _writeCts.TryReset(); }
+    }
+
+    /// <summary>Abandon the write in flight (and any later one): the connection won't be reused.</summary>
+    public void CancelWrites()
+    {
+        try { _writeCts.Cancel(); } catch (ObjectDisposedException) { }
     }
 
     /// <summary>Read more into the buffer (compacting first). 0 on EOF; throws if the buffer is full.</summary>
@@ -303,7 +310,8 @@ internal sealed class UpstreamConn : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         try { Stream.Dispose(); } catch (Exception e) when (e is IOException or ObjectDisposedException or SocketException) { }
-        _cts.Dispose();
+        _readCts.Dispose();
+        _writeCts.Dispose();
     }
 }
 

@@ -207,6 +207,27 @@ internal static class Client
         return i < 0 ? "" : response[(i + 4)..];
     }
 
+    /// <summary>The body with chunked framing removed (strictly: a malformed or unterminated body throws).</summary>
+    public static string Dechunked(string response)
+    {
+        var b = Body(response);
+        if (!string.Equals(Header(response, "Transfer-Encoding"), "chunked", StringComparison.OrdinalIgnoreCase)) return b;
+        var sb = new StringBuilder();
+        int i = 0;
+        while (true)
+        {
+            int eol = b.IndexOf("\r\n", i, StringComparison.Ordinal);
+            if (eol < 0) throw new FormatException("unterminated chunked body");
+            int size = Convert.ToInt32(b[i..eol], 16);
+            i = eol + 2;
+            if (size == 0) return b.AsSpan(i).SequenceEqual("\r\n") ? sb.ToString() : throw new FormatException("bad chunked end");
+            sb.Append(b, i, size);
+            i += size;
+            if (!b.AsSpan(i).StartsWith("\r\n")) throw new FormatException("missing chunk terminator");
+            i += 2;
+        }
+    }
+
     public static string? Header(string response, string name)
     {
         int end = response.IndexOf("\r\n\r\n", StringComparison.Ordinal);

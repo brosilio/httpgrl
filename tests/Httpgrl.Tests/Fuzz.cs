@@ -225,7 +225,7 @@ internal static class Fuzz
     /// <summary>Chunked request bodies: the other half of smuggling safety.</summary>
     private static Target ChunkedTarget() => new("chunked",
         B("5\r\nhello\r\n0\r\n\r\n", "3;ext=1\r\nabc\r\n0\r\nTrailer: x\r\n\r\n", "a\r\n0123456789\r\n1\r\nx\r\n0\r\n\r\nGET / HTTP/1.1\r\n\r\n", "0\r\n\r\n",
-          "1\r\n\r\r\nA\r\n0000000000\r\n0\r\n\r\n"),
+          "1\r\n\r\r\nA\r\n0000000000\r\n0\r\n\r\n", "1\r\nx\r\n0\r\nX: a\r\r\n\r\n", "1;e\r\r\nx\r\n0\r\n\r\n"),
         B("\r\n", "\n", "\r", ";", "0", "f", "F", "ffffffffffffffff", "7fffffff", "-1", " ", "\t", "0x", "+1", "Trailer: v\r\n", "\0", "1\r\na\r\n"),
         data =>
         {
@@ -331,7 +331,7 @@ internal static class Fuzz
         var reg = new Collector(vars);
         IModule[] modules =
         [
-            new HttpCoreModule(Path.GetTempPath()), new SslModule(), new AccessLogModule(),
+            new HttpCoreModule(Path.GetTempPath()), new SslModule(Path.GetTempPath()), new AccessLogModule(),
             new Httpgrl.Modules.Rewrite.RewriteModule(), new Httpgrl.Modules.Rewrite.MapModule(), new Httpgrl.Modules.Headers.HeadersModule(),
             new Httpgrl.Modules.Limits.LimitReqModule(), new Httpgrl.Modules.Limits.LimitConnModule(), new ProxyModule(),
             .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(),

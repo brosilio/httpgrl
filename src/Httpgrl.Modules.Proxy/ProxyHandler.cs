@@ -85,9 +85,9 @@ internal static class ProxyHandler
                 if (req.HasBody)
                 {
                     bodyStarted = true;
-                    await SendBodyAsync(ctx, conn, conf).ConfigureAwait(false);
+                    resp = await SendBodyAndReadAsync(ctx, conn, conf).ConfigureAwait(false);
                 }
-                resp = await UpstreamResponse.ReadAsync(conn, conf.HeaderBufferSize, conf.ReadTimeoutMs, req.IsHead).ConfigureAwait(false);
+                else resp = await UpstreamResponse.ReadAsync(conn, conf.HeaderBufferSize, conf.ReadTimeoutMs, req.IsHead).ConfigureAwait(false);
             }
             catch (ClientBodyException e)
             {
@@ -301,7 +301,63 @@ internal static class ProxyHandler
 
     private static bool SafeValue(string v) => v.IndexOfAny(['\r', '\n', '\0']) < 0;
 
-    private static async ValueTask SendBodyAsync(HttpContext ctx, UpstreamConn conn, ProxyConf conf)
+    /// <summary>
+    /// Upload the request body while already reading the response. An upstream may answer before it has read the whole
+    /// body (401, 413, a redirect) and then stop reading; waiting for the upload to finish first would turn its answer
+    /// into a send timeout or a broken pipe (502/504). On an early answer the upload stops (the rest of the client's
+    /// body is abandoned, so that client connection closes after the response) and the upstream connection isn't
+    /// reused. proxy_read_timeout runs from the end of the upload, as it would have without this.
+    /// </summary>
+    private static async ValueTask<UpstreamResponse> SendBodyAndReadAsync(HttpContext ctx, UpstreamConn conn, ProxyConf conf)
+    {
+        using var stopBody = new CancellationTokenSource();
+        using var stopWrites = stopBody.Token.Register(static c => ((UpstreamConn)c!).CancelWrites(), conn);
+        var send = SendBodyAsync(ctx, conn, conf, stopBody.Token).AsTask();
+        var read = UpstreamResponse.ReadAsync(conn, conf.HeaderBufferSize, 0, ctx.Request.IsHead).AsTask();
+
+        if (await Task.WhenAny(send, read).ConfigureAwait(false) == read)
+        {
+            stopBody.Cancel();
+            if (!read.IsCompletedSuccessfully) conn.Dispose(); // the upstream broke: its failure is what gets reported
+            await Settle(send).ConfigureAwait(false);
+            var early = await read.ConfigureAwait(false); // rethrows a read failure
+            early.KeepAlive = false; // part of the body may still be unsent (or half-written): never reuse this connection
+            return early;
+        }
+
+        // The upload ended first.
+        if (!send.IsCompletedSuccessfully)
+        {
+            var e = send.Exception!.InnerException!;
+            // A client-side failure or our own send timeout: stop here. A closed or reset upstream may have answered
+            // first, so its response is still read (the timeout below bounds that).
+            if (e is ClientBodyException or OperationCanceledException)
+            {
+                conn.Dispose();
+                await Settle(read).ConfigureAwait(false);
+                await send.ConfigureAwait(false); // rethrows
+            }
+        }
+        using var timeout = new CancellationTokenSource(conf.ReadTimeoutMs);
+        var done = await Task.WhenAny(read, Task.Delay(Timeout.Infinite, timeout.Token)).ConfigureAwait(false);
+        if (done != read)
+        {
+            conn.Dispose();
+            await Settle(read).ConfigureAwait(false);
+            throw new OperationCanceledException("upstream response timed out");
+        }
+        var resp = await read.ConfigureAwait(false);
+        if (!send.IsCompletedSuccessfully) resp.KeepAlive = false;
+        return resp;
+    }
+
+    private static async Task Settle(Task t)
+    {
+        try { await t.ConfigureAwait(false); }
+        catch (Exception e) when (e is not OutOfMemoryException) { }
+    }
+
+    private static async ValueTask SendBodyAsync(HttpContext ctx, UpstreamConn conn, ProxyConf conf, CancellationToken stop)
     {
         const int Pre = 18, Post = 2; // room for "<hex>\r\n" before and "\r\n" after each chunk
         bool chunked = ctx.Request.IsChunked;
@@ -313,8 +369,8 @@ internal static class ProxyHandler
             while (true)
             {
                 int n;
-                try { n = await body.ReadAsync(chunked ? buf.AsMemory(Pre, buf.Length - Pre - Post) : buf).ConfigureAwait(false); }
-                catch (Exception e) when (e is not OutOfMemoryException) { throw new ClientBodyException(e); }
+                try { n = await body.ReadAsync(chunked ? buf.AsMemory(Pre, buf.Length - Pre - Post) : buf, stop).ConfigureAwait(false); }
+                catch (Exception e) when (e is not OutOfMemoryException && !stop.IsCancellationRequested) { throw new ClientBodyException(e); }
                 if (n == 0) break;
                 if (!chunked)
                 {
@@ -584,8 +640,10 @@ internal static class ProxyHandler
                 while (true) // trailers are read and dropped
                 {
                     int l = await LineAsync(conn, r, timeoutMs).ConfigureAwait(false);
+                    bool valid = l == 2 || UpstreamResponse.ValidTrailer(conn.Buf.AsSpan(conn.Start, l - 2));
                     conn.Start += l;
                     if (l == 2) return;
+                    if (!valid) throw new UpstreamException("invalid upstream trailer");
                     if ((trailer += l) > 8192) throw new UpstreamException("upstream trailer too large");
                 }
             }
@@ -627,7 +685,11 @@ internal static class ProxyHandler
         }
         if (digits == 0) return -1;
         while (i < line.Length && (line[i] == ' ' || line[i] == '\t')) i++;
-        if (i < line.Length && line[i] != ';') return -1;
+        if (i < line.Length)
+        {
+            if (line[i] != ';') return -1;
+            for (; i < line.Length; i++) if ((line[i] < 0x20 && line[i] != '\t') || line[i] == 0x7F) return -1; // ext: no CTLs (bare CR)
+        }
         return size;
     }
 

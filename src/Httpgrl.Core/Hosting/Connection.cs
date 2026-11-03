@@ -22,8 +22,9 @@ internal sealed class Connection
 
     /// <summary>Phase deadline independent of I/O (TLS handshake, whole request head, keep-alive idle). 0 = none.</summary>
     public long BaseDeadline;
-    /// <summary>Deadline of the in-flight read/write. 0 = none.</summary>
-    public long OpDeadline;
+    /// <summary>Deadlines of the in-flight read and write (independent: upgraded tunnels do both at once). 0 = none.</summary>
+    public long ReadDeadline;
+    public long WriteDeadline;
     public int ReadOpTimeout;
     public int WriteOpTimeout;
 
@@ -31,7 +32,8 @@ internal sealed class Connection
     public int MinRate;
     public long RateBytes;
     public long RateBusyMs;
-    public long OpStartedAt;
+    public long ReadStartedAt;
+    public long WriteStartedAt;
 
     /// <summary>When set (upgraded tunnels), each completed I/O op moves <see cref="BaseDeadline"/> this far out.</summary>
     public int IdleRefreshMs;
@@ -88,25 +90,31 @@ internal sealed class Connection
 
     public void StopRate() => MinRate = 0;
 
-    // Called by the transport around every socket operation.
-    public void BeginOp(int timeoutMs)
+    // Called by the transport around every socket operation. Reads and writes keep separate state, so a read
+    // completing can never clear (or a read's start overwrite) the deadline of a write stalled at the same time.
+    public void BeginRead() => Begin(ref ReadStartedAt, ref ReadDeadline, ReadOpTimeout);
+    public void EndRead(int bytes) => End(ref ReadStartedAt, ref ReadDeadline, bytes);
+    public void BeginWrite() => Begin(ref WriteStartedAt, ref WriteDeadline, WriteOpTimeout);
+    public void EndWrite(int bytes) => End(ref WriteStartedAt, ref WriteDeadline, bytes);
+
+    private static void Begin(ref long startedAt, ref long deadline, int timeoutMs)
     {
         long now = Environment.TickCount64;
-        OpStartedAt = now;
-        if (timeoutMs > 0) OpDeadline = now + timeoutMs;
+        Volatile.Write(ref startedAt, now);
+        Volatile.Write(ref deadline, timeoutMs > 0 ? now + timeoutMs : 0);
     }
 
-    public void EndOp(int bytes)
+    private void End(ref long startedAt, ref long deadline, int bytes)
     {
         long now = Environment.TickCount64;
-        OpDeadline = 0;
+        Volatile.Write(ref deadline, 0);
         if (IdleRefreshMs > 0) BaseDeadline = now + IdleRefreshMs;
         if (MinRate > 0)
         {
-            RateBusyMs += now - OpStartedAt;
-            RateBytes += bytes;
+            Interlocked.Add(ref RateBusyMs, now - startedAt);
+            Interlocked.Add(ref RateBytes, bytes);
         }
-        OpStartedAt = 0;
+        Volatile.Write(ref startedAt, 0);
     }
 
     /// <summary>Hard close: RST, no lingering. Safe to call from any thread, any number of times.</summary>

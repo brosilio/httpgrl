@@ -265,15 +265,21 @@ internal static class Ocsp
 /// <summary>Stapling state that survives a reload (keyed by certificate), so reloading doesn't refetch or drop the staple.</summary>
 internal sealed class StapleState
 {
-    public OcspVerified? Current;
+    public volatile OcspVerified? Current;
     public DateTime NextFetch;
     public int Failures;
+    /// <summary>
+    /// Held for a fetch and the state update after it. During a reload drain the old configuration's stapler and the
+    /// new one share this state; the gate keeps them to one fetch between them (the second sees the new NextFetch).
+    /// </summary>
+    public readonly SemaphoreSlim FetchGate = new(1, 1);
 }
 
 /// <summary>
 /// Drives stapling for one certificate context: fetch on first use, refresh hourly, back off 5 minutes after a failure
 /// (nginx's schedule), keep stapling a valid response through an outage, drop it the moment it expires. Never more
-/// than one fetch in flight; nothing a client does can trigger extra fetches. With ssl_stapling_file the response is
+/// than one fetch in flight, across reloads too (<see cref="StapleState.FetchGate"/>); nothing a client does can
+/// trigger extra fetches. With ssl_stapling_file the response is
 /// fixed and nothing is fetched.
 /// </summary>
 internal sealed class OcspStapler
@@ -329,7 +335,13 @@ internal sealed class OcspStapler
         while (!_stop.IsCancellationRequested)
         {
             var now = DateTime.UtcNow;
-            if (now >= _state.NextFetch) await FetchAsync().ConfigureAwait(false);
+            if (now >= _state.NextFetch)
+            {
+                try { await _state.FetchGate.WaitAsync(_stop.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                try { if (DateTime.UtcNow >= _state.NextFetch) await FetchAsync().ConfigureAwait(false); }
+                finally { _state.FetchGate.Release(); }
+            }
             now = DateTime.UtcNow;
             Apply(now);
             // Wake for the next fetch, or when the current response expires, whichever is first.

@@ -5,24 +5,33 @@ using System.Threading.Channels;
 namespace Httpgrl.Core.Logging;
 
 /// <summary>
-/// One JSON object per line on stdout. Producers format on their own thread and enqueue into a bounded
-/// channel; a dedicated thread does the (possibly blocking) writes. A stalled stdout drops lines instead
-/// of stalling request processing; the drop count is reported once output recovers.
+/// One JSON object per line on stdout. Producers format on their own thread and enqueue; a dedicated thread does the
+/// (possibly blocking) writes. The queue is bounded in bytes, not lines (request-controlled fields make line sizes vary
+/// widely), so a stalled stdout costs at most <see cref="MaxQueuedBytes"/> of memory: past that, lines are dropped
+/// instead of stalling request processing, and the drop count is reported once output recovers. If the output fails
+/// for good, everything is dropped from then on.
 /// </summary>
 public sealed class JsonLogger : ILogger, IDisposable
 {
-    private const int Capacity = 1 << 16;
-    private const int MaxLine = 64 << 10;
+    internal const long MaxQueuedBytes = 8 << 20;
+    /// <summary>Whole-line cap. A record over it is written again with every string field cut to <see cref="ShortField"/>.</summary>
+    internal const int MaxLine = 16 << 10;
+    private const int MaxField = 4 << 10;
+    private const int ShortField = 128;
 
     [ThreadStatic] private static ArrayBufferWriter<byte>? t_buf;
     [ThreadStatic] private static Utf8JsonWriter? t_writer;
 
-    private readonly Channel<byte[]> _queue = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(Capacity)
+    // Unbounded as a channel; bounded by _queuedBytes. (A bounded channel in DropWrite mode reports a dropped write
+    // as a success, so drops couldn't be counted.)
+    private readonly Channel<byte[]> _queue = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions
     {
-        FullMode = BoundedChannelFullMode.DropWrite,
         SingleReader = true,
         SingleWriter = false,
     });
+    private long _queuedBytes;
+    internal long QueuedBytes => Interlocked.Read(ref _queuedBytes);
+    private volatile bool _dead;
     private readonly Stream _out;
     private readonly Thread _thread;
     private long _dropped;
@@ -48,16 +57,31 @@ public sealed class JsonLogger : ILogger, IDisposable
     public void Write(LogLevel level, string message, ReadOnlySpan<LogField> fields)
     {
         if (level < _min) return;
+        if (_dead) { Drop(); return; }
         byte[] line;
-        try { line = Format(level, message, fields); }
+        try
+        {
+            line = Format(level, message, fields, MaxField);
+            if (line.Length > MaxLine) line = Format(level, message, fields, ShortField, truncated: true);
+        }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException)
         {
-            line = Format(LogLevel.Error, "log format error", [new("error", e.Message), new("orig_msg", message)]);
+            line = Format(LogLevel.Error, "log format error", [new("error", e.Message), new("orig_msg", message)], ShortField);
         }
-        if (!_queue.Writer.TryWrite(line)) { Interlocked.Increment(ref _dropped); Interlocked.Increment(ref _droppedTotal); }
+        if (Interlocked.Add(ref _queuedBytes, line.Length) > MaxQueuedBytes || !_queue.Writer.TryWrite(line))
+        {
+            Interlocked.Add(ref _queuedBytes, -line.Length);
+            Drop();
+        }
     }
 
-    private static byte[] Format(LogLevel level, string message, ReadOnlySpan<LogField> fields)
+    private void Drop()
+    {
+        Interlocked.Increment(ref _dropped);
+        Interlocked.Increment(ref _droppedTotal);
+    }
+
+    private static byte[] Format(LogLevel level, string message, ReadOnlySpan<LogField> fields, int maxField, bool truncated = false)
     {
         var buf = t_buf ??= new ArrayBufferWriter<byte>(512);
         buf.ResetWrittenCount();
@@ -75,20 +99,21 @@ public sealed class JsonLogger : ILogger, IDisposable
             LogLevel.Warn => "warn"u8,
             _ => "error"u8,
         });
-        w.WriteString("msg"u8, message);
+        w.WriteString("msg"u8, message.Length > maxField ? message[..maxField] : message);
         foreach (ref readonly var f in fields)
         {
             switch (f.Kind)
             {
                 case LogFieldKind.String:
                     if (f.Str is null) w.WriteNull(f.Key);
-                    else w.WriteString(f.Key, f.Str.Length > MaxLine / 4 ? f.Str[..(MaxLine / 4)] : f.Str);
+                    else w.WriteString(f.Key, f.Str.Length > maxField ? f.Str[..maxField] : f.Str);
                     break;
                 case LogFieldKind.Long: w.WriteNumber(f.Key, f.Long); break;
                 case LogFieldKind.Double: w.WriteNumber(f.Key, double.IsFinite(f.Double) ? f.Double : 0); break;
                 case LogFieldKind.Bool: w.WriteBoolean(f.Key, f.Long != 0); break;
             }
         }
+        if (truncated) w.WriteBoolean("truncated"u8, true);
         w.WriteEndObject();
         w.Flush();
         // The JSON writer escapes all control characters, so the line can never contain a raw newline.
@@ -106,14 +131,23 @@ public sealed class JsonLogger : ILogger, IDisposable
         {
             while (reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
             {
-                while (reader.TryRead(out var line)) _out.Write(line);
+                while (reader.TryRead(out var line))
+                {
+                    Interlocked.Add(ref _queuedBytes, -line.Length);
+                    _out.Write(line);
+                }
                 long dropped = Interlocked.Exchange(ref _dropped, 0);
-                if (dropped > 0) _out.Write(Format(LogLevel.Warn, "log lines dropped", [new("count", dropped)]));
+                if (dropped > 0) _out.Write(Format(LogLevel.Warn, "log lines dropped", [new("count", dropped)], ShortField));
                 _out.Flush();
             }
         }
-        catch (IOException) { /* stdout gone: nothing left to report to */ }
-        catch (ObjectDisposedException) { }
+        catch (Exception e) when (e is IOException or ObjectDisposedException or NotSupportedException)
+        {
+            // stdout is gone for good: nothing left to report to. Stop queueing, and free what's queued.
+            _dead = true;
+            while (reader.TryRead(out _)) { }
+            Interlocked.Exchange(ref _queuedBytes, 0);
+        }
     }
 
     public void Dispose()

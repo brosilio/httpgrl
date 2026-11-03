@@ -51,6 +51,7 @@ internal sealed class BodyStream : Stream
         _total = 0;
         _trailerBytes = 0;
         _started = false;
+        _broken = false;
         SendContinue = null;
     }
 
@@ -74,12 +75,27 @@ internal sealed class BodyStream : Stream
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
     {
         if (buffer.IsEmpty || IsComplete) return 0;
+        if (_broken) throw new HttpBodyException(400, "request body reading was abandoned");
         if (!_started) await StartAsync().ConfigureAwait(false);
         _conn.ReadOpTimeout = ReadTimeoutMs;
-        int n = _mode == Mode.Length ? await ReadLengthAsync(buffer).ConfigureAwait(false) : await ReadChunkedAsync(buffer).ConfigureAwait(false);
+        _ct = ct;
+        int n;
+        try { n = _mode == Mode.Length ? await ReadLengthAsync(buffer).ConfigureAwait(false) : await ReadChunkedAsync(buffer).ConfigureAwait(false); }
+        catch (OperationCanceledException)
+        {
+            // The reader gave up on the body (a proxied upstream answered before it was all sent). Its framing state is
+            // lost, so the connection can't carry another request: DrainAsync refuses and the session closes it.
+            _broken = true;
+            _conn.StopRate();
+            throw;
+        }
+        finally { _ct = default; }
         if (IsComplete) _conn.StopRate();
         return n;
     }
+
+    private CancellationToken _ct;
+    private bool _broken;
 
     private async ValueTask StartAsync()
     {
@@ -103,7 +119,7 @@ internal sealed class BodyStream : Stream
         }
         else
         {
-            n = await _transport.ReadAsync(buffer[..want]).ConfigureAwait(false);
+            n = await _transport.ReadAsync(buffer[..want], _ct).ConfigureAwait(false);
             if (n == 0) throw new HttpBodyException(400, "client closed connection while sending body");
         }
         _remaining -= n;
@@ -154,6 +170,8 @@ internal sealed class BodyStream : Stream
                     int len = await LineAsync().ConfigureAwait(false);
                     _trailerBytes += len;
                     if (_trailerBytes > MaxTrailer) throw new HttpBodyException(431, "trailer too large");
+                    // Dropped, but validated: a bare CR (or any CTL) is where parsers disagree about the line structure.
+                    if (len > 2 && !ValidTrailer(_in.Buf.AsSpan(_in.Start, len - 2))) throw new HttpBodyException(400, "invalid trailer field");
                     _in.Consume(len);
                     if (len == 2) { _chunk = Chunk.Done; return 0; }
                     continue;
@@ -182,7 +200,7 @@ internal sealed class BodyStream : Stream
 
     private async ValueTask<int> FillAsync()
     {
-        int n = await _in.FillAsync(_transport, Math.Max(_in.Buf.Length, MaxChunkLine)).ConfigureAwait(false);
+        int n = await _in.FillAsync(_transport, Math.Max(_in.Buf.Length, MaxChunkLine), _ct).ConfigureAwait(false);
         return n < 0 ? throw new HttpBodyException(400, "chunk line too long") : n;
     }
 
@@ -210,11 +228,21 @@ internal sealed class BodyStream : Stream
         return size;
     }
 
+    /// <summary>A trailer line (without CRLF): token name, ':', value with no control characters but HTAB.</summary>
+    internal static bool ValidTrailer(ReadOnlySpan<byte> line)
+    {
+        int colon = line.IndexOf((byte)':');
+        if (colon <= 0) return false;
+        foreach (byte b in line[..colon]) if (!HttpChars.IsToken(b)) return false;
+        foreach (byte b in line[(colon + 1)..]) if ((b < 0x20 && b != '\t') || b == 0x7F) return false;
+        return true;
+    }
+
     /// <summary>Discard up to <paramref name="limit"/> remaining body bytes. False if the body is larger or broken.</summary>
     public async ValueTask<bool> DrainAsync(long limit)
     {
         if (IsComplete) return true;
-        if (_mode == Mode.Length && _remaining > limit) return false;
+        if (_broken || (_mode == Mode.Length && _remaining > limit)) return false;
         var tmp = System.Buffers.ArrayPool<byte>.Shared.Rent(8192);
         try
         {

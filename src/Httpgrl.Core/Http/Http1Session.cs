@@ -243,6 +243,9 @@ internal sealed class Http1Session
         while (true)
         {
             if (_current() is not { } st) return false;
+            // The address now speaks something else (plaintext -> TLS, PROXY protocol on or off): what this connection
+            // was accepted as no longer applies. Continuing would run the new TLS/mTLS policy without a handshake.
+            if (st.Binding.Ssl != _binding.Ssl || st.Binding.ProxyProtocol != _binding.ProxyProtocol) return false;
             if (!st.Rt.TryAcquire()) continue; // retired again meanwhile: read the newest
             var old = _rt;
             _rt = st.Rt;

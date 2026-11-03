@@ -82,12 +82,26 @@ internal static partial class LocalFiles
     public static OpenResult List(string path, string? noSymlinksFrom, int max, List<DirectoryEntry> into, out bool truncated)
     {
         truncated = false;
+        int dirFd = -1;
         if (noSymlinksFrom is not null)
         {
-            int fd = WalkNoFollow(path, noSymlinksFrom, finalIsDirectory: true, out int errno);
-            if (fd < 0) return errno is 2 or 20 ? OpenResult.NotFound : OpenResult.Forbidden;
-            Close(fd);
+            dirFd = WalkNoFollow(path, noSymlinksFrom, finalIsDirectory: true, out int errno);
+            if (dirFd < 0) return errno is 2 or 20 ? OpenResult.NotFound : OpenResult.Forbidden;
+            // Enumerate the directory we just verified, not the path again: a component swapped for a symlink after the
+            // walk must not redirect the listing. /proc/self/fd/N names the open descriptor itself (and entries under it
+            // resolve relative to that directory). Without procfs there's no safe way to do this with .NET's
+            // enumerator, so refuse rather than list racily.
+            var viaFd = $"/proc/self/fd/{dirFd}";
+            if (!OperatingSystem.IsLinux() || !Directory.Exists(viaFd)) { Close(dirFd); return OpenResult.Forbidden; }
+            path = viaFd;
         }
+        try { return ListPath(path, noSymlinksFrom is not null, max, into, out truncated); }
+        finally { if (dirFd >= 0) Close(dirFd); }
+    }
+
+    private static OpenResult ListPath(string path, bool noSymlinks, int max, List<DirectoryEntry> into, out bool truncated)
+    {
+        truncated = false;
         if (!Directory.Exists(path)) return OpenResult.NotFound;
         try
         {
@@ -99,7 +113,7 @@ internal static partial class LocalFiles
                 {
                     if (fi.LinkTarget is not null)
                     {
-                        if (noSymlinksFrom is not null) continue; // couldn't be opened anyway: don't list it
+                        if (noSymlinks) continue; // couldn't be opened anyway: don't list it
                         if (fi.ResolveLinkTarget(true) is not { Exists: true } target) continue; // broken link
                         into.Add(new DirectoryEntry(fi.Name, target is DirectoryInfo, target is FileInfo tf ? tf.Length : 0, target.LastWriteTimeUtc));
                     }

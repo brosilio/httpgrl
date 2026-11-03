@@ -131,6 +131,19 @@ internal static class ProxyTests
             T.Contains("at least 100ms", Err("interval=10ms"));
             T.Contains("invalid uri", Err("uri=healthz"));
             T.Contains("invalid parameter", Err("bogus=1"));
+            // One verdict per peer serves every location: they must reach the peers the same way.
+            T.Contains("different schemes", T.Throws<ConfigException>(() => TestServer.Start(Conf(
+                "location /a { proxy_pass http://app; } location /b { proxy_pass https://app; }",
+                "upstream app { server 127.0.0.1:1; health_check; }"))).Message);
+            T.Contains("different schemes", T.Throws<ConfigException>(() => TestServer.Start(Conf(
+                "location /a { proxy_pass https://app; } location /b { proxy_pass https://app; proxy_ssl_verify off; }",
+                "upstream app { server 127.0.0.1:1; health_check; }"))).Message);
+            TestServer.Start(Conf( // agreeing references are fine
+                "location /a { proxy_pass http://app; } location /b { proxy_pass http://app/x/; }",
+                "upstream app { server 127.0.0.1:1; health_check; }")).DisposeAsync().AsTask().GetAwaiter().GetResult();
+            // A size that would wrap count * size negative is refused, not loaded.
+            T.Contains("at most 64m", T.Throws<ConfigException>(() => TestServer.Start(Conf(
+                "location / { proxy_pass http://127.0.0.1:1; proxy_buffers 2 9007199254740991k; }"))).Message);
         });
 
         T.Add("proxy: localhost is loopback only (RFC 6761), never looked up", async () =>
@@ -383,6 +396,87 @@ internal static class ProxyTests
             T.True(sw.ElapsedMilliseconds is > 800 and < 3000);
         });
 
+        T.Add("proxy: an upstream that answers before reading the whole body is relayed, not turned into a 502/504", async () =>
+        {
+            // Reads only the head, refuses at once, then neither reads nor closes (the case that used to wait out
+            // proxy_send_timeout and answer 504).
+            await using var up = new FakeUpstream(async (st, rd) =>
+            {
+                var buf = new byte[4096];
+                var seen = new StringBuilder();
+                while (!seen.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+                {
+                    int n = await st.ReadAsync(buf);
+                    if (n == 0) return;
+                    seen.Append(Encoding.Latin1.GetString(buf, 0, n));
+                }
+                await st.WriteAsync("HTTP/1.1 413 Payload Too Large\r\nContent-Length: 4\r\n\r\nnope"u8.ToArray());
+                await Task.Delay(10_000);
+            });
+            await using var s = TestServer.Start(Conf($$"""
+                location / { proxy_pass http://127.0.0.1:{{up.Port}}; proxy_send_timeout 20s; proxy_read_timeout 20s; }
+                """, "client_max_body_size 0;"));
+            using var c = await Connect(s.Port);
+            await c.SendAsync(Encoding.ASCII.GetBytes("POST /upload HTTP/1.1\r\nHost: t\r\nContent-Length: 104857600\r\n\r\n"));
+            var pump = Task.Run(async () =>
+            {
+                var chunk = new byte[64 << 10];
+                try { while (true) await c.SendAsync(chunk); } catch (Exception) { }
+            });
+            var sw = Stopwatch.StartNew();
+            var r = await ReadOne(c, 5000);
+            T.Eq(413, Status(r));
+            T.Eq("nope", Body(r));
+            T.True(sw.ElapsedMilliseconds < 4000, $"{sw.ElapsedMilliseconds}ms");
+            c.Dispose(); // the rest of the body was abandoned: this connection can't carry another request anyway
+            await pump;
+
+            // An ordinary upload still works, and its connection stays reusable.
+            await using var echo = FakeUpstream.Echo();
+            await using var s2 = TestServer.Start(Conf($$"""location / { proxy_pass http://127.0.0.1:{{echo.Port}}; }"""));
+            using var c2 = await Connect(s2.Port);
+            for (int i = 0; i < 2; i++)
+            {
+                await c2.SendAsync(Encoding.ASCII.GetBytes("POST /e HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello"));
+                T.Eq(200, Status(await ReadOne(c2)));
+            }
+        });
+
+        T.Add("proxy: an upgraded tunnel whose client stops reading is cut, even while the client keeps sending", async () =>
+        {
+            // The upstream floods; the client reads nothing but trickles bytes in. Each inbound byte completes a read,
+            // which must not clear the deadline of the outbound write stalled at the same moment.
+            await using var up = new FakeUpstream(async (st, rd) =>
+            {
+                await rd.ReadRequestAsync();
+                await st.WriteAsync("HTTP/1.1 101 Switching Protocols\r\nUpgrade: flood\r\nConnection: Upgrade\r\n\r\n"u8.ToArray());
+                _ = Task.Run(async () => { var sink = new byte[4096]; try { while (await st.ReadAsync(sink) > 0) { } } catch (Exception) { } });
+                var junk = new byte[64 << 10];
+                while (true) await st.WriteAsync(junk);
+            });
+            await using var s = TestServer.Start(Conf($$"""location / { proxy_pass http://127.0.0.1:{{up.Port}}; proxy_read_timeout 1s; }"""));
+            using var c = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { ReceiveBufferSize = 4096 };
+            await c.ConnectAsync(IPAddress.Loopback, s.Port);
+            await c.SendAsync(Encoding.ASCII.GetBytes("GET /ws HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: flood\r\n\r\n"));
+            var one = new byte[1];
+            var head = new StringBuilder();
+            while (!head.ToString().EndsWith("\r\n\r\n", StringComparison.Ordinal))
+            {
+                T.True(await c.ReceiveAsync(one, SocketFlags.None) == 1, "closed during upgrade");
+                head.Append((char)one[0]);
+            }
+            T.Eq(101, Status(head.ToString()));
+            var sw = Stopwatch.StartNew();
+            bool cut = false;
+            while (sw.ElapsedMilliseconds < 8000 && !cut)
+            {
+                try { await c.SendAsync("x"u8.ToArray()); } catch (SocketException) { cut = true; break; }
+                await Task.Delay(200);
+                cut = s.LogText().Contains("upgraded i/o timeout", StringComparison.Ordinal);
+            }
+            T.True(cut, "the stalled write was never timed out");
+        });
+
         T.Add("proxy: malicious or broken upstream responses are refused", async () =>
         {
             static FakeUpstream Says(string raw) => new(async (st, rd) => { await rd.ReadRequestAsync(); await st.WriteAsync(Encoding.Latin1.GetBytes(raw)); });
@@ -395,12 +489,17 @@ internal static class ProxyTests
             await using var badTe = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n");
             await using var short_ = Says("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly-some");
             await using var badChunk = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n");
+            await using var sameCl = Says("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello");
+            await using var st600 = Says("HTTP/1.1 600 Weird\r\nContent-Length: 0\r\n\r\n");
+            await using var badTrailer = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX: a\r\r\n\r\n");
+            await using var badExt = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;a\rb\r\nhello\r\n0\r\n\r\n");
             var locs = new StringBuilder();
-            foreach (var (name, u) in new[] { ("both", both), ("twocl", twoCl), ("fold", fold), ("split", split), ("big", bigHead), ("line", badLine), ("te", badTe), ("short", short_), ("chunk", badChunk) })
+            foreach (var (name, u) in new[] { ("both", both), ("twocl", twoCl), ("fold", fold), ("split", split), ("big", bigHead), ("line", badLine), ("te", badTe), ("short", short_), ("chunk", badChunk),
+                                              ("samecl", sameCl), ("st600", st600), ("trailer", badTrailer), ("ext", badExt) })
                 locs.Append($"location /{name} {{ proxy_pass http://127.0.0.1:{u.Port}; }}\n");
             locs.Append($"location /streamed-short {{ proxy_pass http://127.0.0.1:{short_.Port}; proxy_buffering off; }}\n");
             await using var s = TestServer.Start(Conf(locs.ToString()));
-            foreach (var p in new[] { "/both", "/twocl", "/fold", "/split", "/big", "/line", "/te" })
+            foreach (var p in new[] { "/both", "/twocl", "/fold", "/split", "/big", "/line", "/te", "/samecl", "/st600" })
             {
                 var r = await s.Raw(Get(p));
                 if (Status(r) != 502) throw new Exception($"{p}: expected 502, got {Status(r)}");
@@ -417,6 +516,11 @@ internal static class ProxyTests
             // Either nothing reached the client or a cut-off body: never a terminated chunked message.
             var chunk = await s.Raw(Get("/chunk"));
             T.NotContains("\r\n0\r\n\r\n", Body(chunk));
+            foreach (var p in new[] { "/trailer", "/ext" })
+            {
+                var r = await s.Raw(Get(p));
+                T.True(Status(r) == 502 || !r.Contains("\r\n0\r\n\r\n", StringComparison.Ordinal), $"{p}: {r}");
+            }
         });
 
         T.Add("proxy: 101 without an upgrade request is refused; h2c upgrade is never forwarded", async () =>

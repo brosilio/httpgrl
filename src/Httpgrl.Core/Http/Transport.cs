@@ -19,20 +19,20 @@ internal sealed class TransportStream(Connection conn) : Stream
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
     {
-        conn.BeginOp(conn.ReadOpTimeout);
+        conn.BeginRead();
         int n = 0;
         try { return n = await _s.ReceiveAsync(buffer, SocketFlags.None, ct).ConfigureAwait(false); }
-        finally { conn.EndOp(n); }
+        finally { conn.EndRead(n); }
     }
 
     public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
     {
         while (!buffer.IsEmpty)
         {
-            conn.BeginOp(conn.WriteOpTimeout);
+            conn.BeginWrite();
             int n = 0;
             try { n = await _s.SendAsync(buffer, SocketFlags.None, ct).ConfigureAwait(false); }
-            finally { conn.EndOp(n); }
+            finally { conn.EndWrite(n); }
             if (n <= 0) throw new IOException("connection closed during send");
             buffer = buffer[n..];
         }
@@ -46,17 +46,25 @@ internal sealed class TransportStream(Connection conn) : Stream
 
     public override int Read(byte[] buffer, int offset, int count)
     {
-        conn.BeginOp(conn.ReadOpTimeout);
+        conn.BeginRead();
         int n = 0;
         try { return n = _s.Receive(buffer, offset, count, SocketFlags.None); }
-        finally { conn.EndOp(n); }
+        finally { conn.EndRead(n); }
     }
 
     public override void Write(byte[] buffer, int offset, int count)
     {
-        conn.BeginOp(conn.WriteOpTimeout);
-        try { _s.Send(buffer, offset, count, SocketFlags.None); }
-        finally { conn.EndOp(count); }
+        // Socket.Send may return a partial count: loop, and account only what actually went out.
+        while (count > 0)
+        {
+            conn.BeginWrite();
+            int n = 0;
+            try { n = _s.Send(buffer, offset, count, SocketFlags.None); }
+            finally { conn.EndWrite(n); }
+            if (n <= 0) throw new IOException("connection closed during send");
+            offset += n;
+            count -= n;
+        }
     }
 
     public override Task FlushAsync(CancellationToken ct) => Task.CompletedTask;
@@ -87,7 +95,7 @@ internal sealed class InputBuffer : IDisposable
     }
 
     /// <summary>Read more bytes. Returns 0 on EOF, -1 when <paramref name="limit"/> buffered bytes are already held.</summary>
-    public async ValueTask<int> FillAsync(Stream s, int limit)
+    public async ValueTask<int> FillAsync(Stream s, int limit, CancellationToken ct = default)
     {
         if (End == Buf.Length)
         {
@@ -109,7 +117,7 @@ internal sealed class InputBuffer : IDisposable
             }
         }
         int max = Math.Min(Buf.Length - End, Math.Max(limit - Count, 1));
-        int n = await s.ReadAsync(Buf.AsMemory(End, max)).ConfigureAwait(false);
+        int n = await s.ReadAsync(Buf.AsMemory(End, max), ct).ConfigureAwait(false);
         End += n;
         return n;
     }

@@ -61,47 +61,61 @@ public sealed class AutoIndexModule : IModule
             case OpenResult.Forbidden: return HandlerResult.WithStatus(403);
             default: return HandlerResult.WithStatus(500);
         }
-        var entries = listed.FindAll(static e => !e.Name.StartsWith('.')); // dotfiles stay hidden
+        listed.RemoveAll(static e => e.Name.StartsWith('.')); // dotfiles stay hidden (in place: no second list)
+        listed.Sort(static (a, b) => a.IsDirectory != b.IsDirectory ? (a.IsDirectory ? -1 : 1) : string.CompareOrdinal(a.Name, b.Name));
 
-        entries.Sort(static (a, b) => a.IsDirectory != b.IsDirectory ? (a.IsDirectory ? -1 : 1) : string.CompareOrdinal(a.Name, b.Name));
-
-        byte[] body;
-        string type;
-        if (conf.Json == true) { body = RenderJson(entries); type = "application/json"; }
-        else { body = RenderHtml(uri, entries, conf, truncated); type = "text/html; charset=utf-8"; }
-
+        // Streamed in small pieces (no Content-Length): a big directory costs a flush buffer, not its whole rendering.
         var resp = ctx.Response;
-        resp.Headers.Set("Content-Type", type);
-        resp.ContentLength = body.Length;
-        await resp.WriteAsync(body).ConfigureAwait(false);
+        resp.Headers.Set("Content-Type", conf.Json == true ? "application/json" : "text/html; charset=utf-8");
+        if (conf.Json == true) await RenderJson(resp, listed).ConfigureAwait(false);
+        else await RenderHtml(resp, uri, listed, conf, truncated).ConfigureAwait(false);
         return HandlerResult.Done;
     }
 
-    private static byte[] RenderJson(List<DirectoryEntry> entries)
+    private const int FlushAt = 16 << 10;
+
+    private static async ValueTask RenderJson(HttpResponse resp, List<DirectoryEntry> entries)
     {
-        var buf = new ArrayBufferWriter<byte>(entries.Count * 96 + 16);
-        using (var w = new Utf8JsonWriter(buf))
+        var buf = new ArrayBufferWriter<byte>(FlushAt + 2048);
+        using var w = new Utf8JsonWriter(buf);
+        w.WriteStartArray();
+        foreach (var e in entries)
         {
-            w.WriteStartArray();
-            foreach (var e in entries)
+            w.WriteStartObject();
+            w.WriteString("name"u8, e.Name);
+            w.WriteString("type"u8, e.IsDirectory ? "directory"u8 : "file"u8);
+            w.WriteString("mtime"u8, e.LastModifiedUtc.ToString("r", CultureInfo.InvariantCulture));
+            if (!e.IsDirectory) w.WriteNumber("size"u8, e.Size);
+            w.WriteEndObject();
+            if (w.BytesPending + buf.WrittenCount >= FlushAt)
             {
-                w.WriteStartObject();
-                w.WriteString("name"u8, e.Name);
-                w.WriteString("type"u8, e.IsDirectory ? "directory"u8 : "file"u8);
-                w.WriteString("mtime"u8, e.LastModifiedUtc.ToString("r", CultureInfo.InvariantCulture));
-                if (!e.IsDirectory) w.WriteNumber("size"u8, e.Size);
-                w.WriteEndObject();
+                w.Flush();
+                await resp.WriteAsync(buf.WrittenMemory).ConfigureAwait(false);
+                buf.ResetWrittenCount();
             }
-            w.WriteEndArray();
         }
-        return buf.WrittenSpan.ToArray();
+        w.WriteEndArray();
+        w.Flush();
+        await resp.WriteAsync(buf.WrittenMemory).ConfigureAwait(false);
     }
 
     private const int NameWidth = 50;
 
-    private static byte[] RenderHtml(string uri, List<DirectoryEntry> entries, AutoIndexConf conf, bool truncated)
+    private static async ValueTask RenderHtml(HttpResponse resp, string uri, List<DirectoryEntry> entries, AutoIndexConf conf, bool truncated)
     {
-        var sb = new StringBuilder(entries.Count * 128 + 512);
+        var sb = new StringBuilder(FlushAt + 2048);
+        var bytes = new byte[Encoding.UTF8.GetMaxByteCount(FlushAt + 2048)];
+        var encoder = Encoding.UTF8.GetEncoder(); // stateful: a surrogate pair split across flushes stays intact
+        async ValueTask Flush(bool last)
+        {
+            if (Encoding.UTF8.GetMaxByteCount(sb.Length) > bytes.Length) bytes = new byte[Encoding.UTF8.GetMaxByteCount(sb.Length)];
+            int n = 0;
+            foreach (var chunk in sb.GetChunks()) n += encoder.GetBytes(chunk.Span, bytes.AsSpan(n), flush: false);
+            if (last) n += encoder.GetBytes([], bytes.AsSpan(n), flush: true);
+            sb.Clear();
+            if (n > 0) await resp.WriteAsync(bytes.AsMemory(0, n)).ConfigureAwait(false);
+        }
+
         sb.Append("<html>\r\n<head><title>Index of ");
         UrlEncoding.HtmlEscape(sb, uri);
         sb.Append("</title></head>\r\n<body>\r\n<h1>Index of ");
@@ -127,10 +141,11 @@ public sealed class AutoIndexModule : IModule
             sb.Append(' ');
             var size = e.IsDirectory ? "-" : exact ? e.Size.ToString(CultureInfo.InvariantCulture) : HumanSize(e.Size);
             sb.Append(' ', Math.Max(1, 20 - size.Length)).Append(size).Append("\r\n");
+            if (sb.Length >= FlushAt) await Flush(last: false).ConfigureAwait(false);
         }
         if (truncated) sb.Append("(listing truncated)\r\n");
         sb.Append("</pre><hr></body>\r\n</html>\r\n");
-        return Encoding.UTF8.GetBytes(sb.ToString());
+        await Flush(last: true).ConfigureAwait(false);
     }
 
     private static string HumanSize(long n)

@@ -141,9 +141,9 @@ public sealed class ProxyModule : IModule, IDisposable
             {
                 int n = i.Int(0);
                 long size = i.Size(1);
-                long total = n * size;
-                if (n < 1 || size < 1024 || total > 64L << 20) throw i.Error("expected a count and a size of at least 1k, at most 64m in total");
-                i.Conf<ProxyConf>().Buffers = total;
+                // Bound each factor before multiplying: a huge size would otherwise wrap the product negative.
+                if (n < 1 || size < 1024 || size > 64L << 20 || n * size > 64L << 20) throw i.Error("expected a count and a size of at least 1k, at most 64m in total");
+                i.Conf<ProxyConf>().Buffers = n * size;
             },
         });
         foreach (var n in new[] { "proxy_busy_buffers_size", "proxy_max_temp_file_size", "proxy_temp_file_write_size", "proxy_temp_path",
@@ -358,19 +358,30 @@ public sealed class ProxyModule : IModule, IDisposable
         _groups.AddRange(groups.Values);
         _groups.AddRange(implicitGroups.Values);
 
-        // Health checks probe with the scheme/TLS settings of the (first) location that proxies to the group.
+        // Health checks probe with the scheme/TLS settings that every location proxying to the group shares.
         var checkers = new Dictionary<UpstreamGroup, HealthChecker>();
         foreach (var scope in setup.ScopesOf(Upstream))
         {
             var u = scope.Get<UpstreamConf>();
             if (u.HealthCheck is null) continue;
             var g = groups[u.Name];
+            // One verdict per peer is shared by every location using the group, so the check must speak to the peers the
+            // way all of them do: references that disagree on scheme, TLS name/trust or (without host=) Host are an error,
+            // rather than letting whichever location comes first decide what "healthy" means for the others.
             ProxyTarget? first = null;
             foreach (var loc in setup.ScopesOf(ContextKind.Location))
             {
                 if (!loc.TryGet<ProxyConf>(out var pc)) continue;
-                if (pc.Target is { } t && t.Group == g) { first = t; break; }
-                if (pc.DynTargets?.Values.FirstOrDefault(x => x.Group == g) is { } d) { first = d; break; }
+                var refs = new List<ProxyTarget>();
+                if (pc.Target is { } t && t.Group == g) refs.Add(t);
+                if (pc.DynTargets is { } dyn) foreach (var d in dyn.Values) if (d.Group == g) refs.Add(d);
+                foreach (var r in refs)
+                {
+                    if (first is null) { first = r; continue; }
+                    if (r.Transport != first.Transport || (u.HealthCheck.Host is null && !r.HostHeader.Equals(first.HostHeader, StringComparison.OrdinalIgnoreCase)))
+                        throw new ConfigException($"health_check: locations proxy to upstream \"{u.Name}\" with different schemes, TLS settings or Host; "
+                            + "the check can't stand for all of them (make them agree, or set host= and use one scheme)", pc.PassSource);
+                }
             }
             if (first is null) continue; // nobody proxies to it
             checkers[g] = new HealthChecker(g, u.HealthCheck, first, setup.Log);
@@ -507,7 +518,11 @@ public sealed class ProxyModule : IModule, IDisposable
 
         SslClientAuthenticationOptions? ssl = null;
         if (tls) ssl = BuildSsl(c, c.SslName ?? host);
-        return new ProxyTarget(group!, tls, authority.StartsWith("unix:", StringComparison.Ordinal) ? "localhost" : authority, port, uriPart, prefix, ssl);
+        // What a connection to the group means for this location: scheme and, over TLS, the name and trust it's verified
+        // with. Health checks need every location that shares a checked group to agree on it.
+        string transport = !tls ? "http" : string.Join('|', "https", c.SslName ?? host, c.SslVerify ?? true, c.SslServerName ?? true,
+            c.SslProtocols?.ToString() ?? "default", c.SslTrusted is null ? "system" : string.Join(',', c.SslTrusted.Select(x => x.Thumbprint)));
+        return new ProxyTarget(group!, tls, authority.StartsWith("unix:", StringComparison.Ordinal) ? "localhost" : authority, port, uriPart, prefix, ssl) { Transport = transport };
     }
 
     private static SslClientAuthenticationOptions BuildSsl(ProxyConf c, string name)
@@ -620,6 +635,7 @@ internal sealed record RedirectRule(string? Prefix, Regex? Regex, ComplexValue R
 
 internal sealed record ProxyTarget(UpstreamGroup Group, bool Tls, string HostHeader, int Port, string? UriPart, string? LocationPrefix, SslClientAuthenticationOptions? Ssl)
 {
+    public string Transport { get; init; } = "http";
     public DnsRefresher? Dns { get; init; }
     public HealthChecker? Health { get; init; }
 }

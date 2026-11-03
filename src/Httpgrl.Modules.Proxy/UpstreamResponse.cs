@@ -66,7 +66,7 @@ internal sealed class UpstreamResponse
         if (line.Length < 12 || !IsDigit(line[9]) || !IsDigit(line[10]) || !IsDigit(line[11]) || (line.Length > 12 && line[12] != ' '))
             throw new UpstreamException("invalid upstream status line");
         Status = (line[9] - '0') * 100 + (line[10] - '0') * 10 + (line[11] - '0');
-        if (Status < 100) throw new UpstreamException("invalid upstream status code");
+        if (Status is < 100 or > 599) throw new UpstreamException("invalid upstream status code");
         foreach (byte b in line[12..]) if ((b < 0x20 && b != '\t') || b == 0x7F) throw new UpstreamException("invalid upstream status line");
 
         int pos = eol + 2;
@@ -94,9 +94,9 @@ internal sealed class UpstreamResponse
 
             if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
             {
-                clCount++;
+                // Exactly one, even if repeats agree: the same rule as for requests.
+                if (++clCount > 1) throw new UpstreamException("multiple upstream Content-Length headers");
                 if (!long.TryParse(value, System.Globalization.NumberStyles.None, null, out var cl)) throw new UpstreamException("invalid upstream Content-Length");
-                if (ContentLength >= 0 && ContentLength != cl) throw new UpstreamException("conflicting upstream Content-Length");
                 ContentLength = cl;
                 continue;
             }
@@ -128,4 +128,18 @@ internal sealed class UpstreamResponse
     }
 
     private static bool IsDigit(byte b) => (uint)(b - '0') <= 9;
+
+    /// <summary>
+    /// A trailer line (without its CRLF) is a well-formed header field: token name, colon, value without control
+    /// characters. Trailers are dropped, but a line two parsers would split differently (a bare CR) is how a chunked
+    /// body gets read as ending in different places, so it's rejected rather than skipped.
+    /// </summary>
+    internal static bool ValidTrailer(ReadOnlySpan<byte> line)
+    {
+        int colon = line.IndexOf((byte)':');
+        if (colon <= 0) return false;
+        foreach (byte b in line[..colon]) if (!HttpChars.IsToken(b)) return false;
+        foreach (byte b in line[(colon + 1)..]) if ((b < 0x20 && b != '\t') || b == 0x7F) return false;
+        return true;
+    }
 }

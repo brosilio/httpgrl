@@ -125,6 +125,41 @@ internal static class ReloadTests
             T.Contains("cannot listen", s.LogText());
         });
 
+        T.Add("reload: a plaintext keep-alive can't carry on after its address turns into TLS/mTLS", async () =>
+        {
+            int port = FreePort();
+            await using var s = TestServer.Start($$"""http { server { listen 127.0.0.1:{{port}}; return 200 "plain"; } }""",
+                d => { ProxyTests.MakeCert("x.test", d, "c").Dispose(); ProxyTests.MakeCert("ca.test", d, "ca").Dispose(); });
+            using var c = await Connect(port);
+            await c.SendAsync(Encoding.ASCII.GetBytes("GET / HTTP/1.1\r\nHost: t\r\n\r\n"));
+            T.Eq("plain", Body(await ReadOne(c)));
+
+            T.True(await s.Reload($$"""
+                http { server { listen 127.0.0.1:{{port}} ssl; ssl_certificate {DIR}/c.crt; ssl_certificate_key {DIR}/c.key;
+                       ssl_verify_client on; ssl_client_certificate {DIR}/ca.crt; return 200 "secret"; } }
+                """));
+            // The connection was accepted as plaintext; the address now demands a handshake and a client certificate.
+            // Its next request must not be served under the new configuration without either.
+            await c.SendAsync(Encoding.ASCII.GetBytes("GET / HTTP/1.1\r\nHost: t\r\n\r\n"));
+            string r;
+            try { r = await ReadOne(c, 3000); } catch (Exception e) when (e is IOException or SocketException) { r = ""; }
+            T.NotContains("secret", r);
+            T.Eq("", r);
+        });
+
+        T.Add("ssl: relative certificate paths resolve against the main configuration's directory, in any included file", async () =>
+        {
+            await using var s = TestServer.Start("http { include sites/*.conf; }", d =>
+            {
+                Directory.CreateDirectory(Path.Combine(d, "certs"));
+                Directory.CreateDirectory(Path.Combine(d, "sites"));
+                ProxyTests.MakeCert("rel.test", Path.Combine(d, "certs"), "rel").Dispose();
+                File.WriteAllText(Path.Combine(d, "sites", "rel.conf"),
+                    "server { listen 127.0.0.1:0 ssl; ssl_certificate certs/rel.crt; ssl_certificate_key certs/rel.key; return 200 \"rel\"; }");
+            });
+            T.Contains("CN=rel.test", await ServerCertSubject(s.Port));
+        });
+
         T.Add("reload: rotated certificates are picked up", async () =>
         {
             const string Conf = """http { server { listen 127.0.0.1:0 ssl; ssl_certificate {DIR}/c.crt; ssl_certificate_key {DIR}/c.key; return 200 "tls"; } }""";

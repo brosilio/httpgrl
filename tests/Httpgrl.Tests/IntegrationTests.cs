@@ -127,9 +127,31 @@ internal static class IntegrationTests
             }
             r = await s.Raw(Get("/listjson/"));
             T.Eq("application/json", Header(r, "Content-Type"));
-            using var doc = System.Text.Json.JsonDocument.Parse(Body(r));
+            using var doc = System.Text.Json.JsonDocument.Parse(Dechunked(r));
             T.Eq("sub", doc.RootElement[0].GetProperty("name").GetString());
             T.Eq("directory", doc.RootElement[0].GetProperty("type").GetString());
+        });
+
+        T.Add("autoindex: a big directory is streamed in pieces, and arrives complete", async () =>
+        {
+            const int Files = 3000;
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR}; location /big/ { autoindex on; }
+                       location /bigjson/ { alias {DIR}/big/; autoindex on; autoindex_format json; } } }
+                """, d =>
+            {
+                Directory.CreateDirectory(Path.Combine(d, "big"));
+                for (int i = 0; i < Files; i++) File.WriteAllText(Path.Combine(d, "big", $"{i:D5}-" + new string('n', 100)), "");
+            });
+            var r = await s.Raw(Get("/bigjson/"));
+            T.Eq("chunked", Header(r, "Transfer-Encoding"));
+            using var doc = System.Text.Json.JsonDocument.Parse(Dechunked(r));
+            T.Eq(Files, doc.RootElement.GetArrayLength());
+            T.Eq("00000-" + new string('n', 100), doc.RootElement[0].GetProperty("name").GetString());
+            var html = Dechunked(await s.Raw(Get("/big/")));
+            T.Eq(Files, html.Split("<a href=\"./0", StringSplitOptions.None).Length - 1);
+            T.True(html.EndsWith("</html>\r\n", StringComparison.Ordinal));
+            T.Eq(200, Status(await s.Raw("HEAD /big/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")));
         });
 
         T.Add("security: traversal and alias off-by-slash", async () =>
@@ -425,6 +447,9 @@ internal static class IntegrationTests
             T.Eq(413, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n" + new string('x', 2048) + "\r\n0\r\n\r\n")));
             T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")));
             T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n")));
+            // Trailers are dropped but must be well-formed: a bare CR is where two parsers disagree about where the body ends.
+            T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX: a\r\r\n\r\n")));
+            T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nnocolon\r\n\r\n")));
             using var c = await Connect(s.Port);
             await c.SendAsync(Encoding.ASCII.GetBytes("POST /body HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\n"));
             var buf = new byte[256];
@@ -469,7 +494,7 @@ internal static class IntegrationTests
                 T.Eq(404, Status(await s.Raw(Get("/real.txt/x"))));       // a real non-directory is still "not found"
                 T.Eq(404, Status(await s.Raw(Get("/nope/x"))));
                 T.Eq("real", Body(await s.Raw(Get("/try/x"))));            // the symlinked candidate doesn't exist for try_files
-                var listing = Body(await s.Raw(Get("/idx/")));
+                var listing = Dechunked(await s.Raw(Get("/idx/")));
                 T.Contains("real.txt", listing);
                 T.True(!listing.Contains("link.txt") && !listing.Contains("escape.txt") && !listing.Contains("linkdir"), listing);
             }

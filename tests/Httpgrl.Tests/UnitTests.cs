@@ -237,9 +237,66 @@ internal static class UnitTests
             using var d = System.Text.Json.JsonDocument.Parse(lines[0]);
             T.Eq("line1\r\nline2\u2028\"}", d.RootElement.GetProperty("k").GetString());
         });
+
+        T.Add("logger: a stalled stdout holds a bounded number of bytes, and the drops are counted and reported", () =>
+        {
+            var gate = new ManualResetEventSlim(false);
+            var sink = new GatedStream(gate);
+            using (var log = new JsonLogger(sink, LogLevel.Info))
+            {
+                var big = new string('\u0001', 4000); // escapes to 6 bytes a char: the most a request can inflate a field
+                for (int i = 0; i < 20_000; i++)
+                    log.Info("access", new LogField("uri", big), new("ua", big), new("referer", big), new("host", big));
+                T.True(log.QueuedBytes <= JsonLogger.MaxQueuedBytes, $"queued {log.QueuedBytes}");
+                T.True(log.DroppedTotal > 0, "drops counted");
+                gate.Set();
+                for (int i = 0; i < 200 && log.QueuedBytes > 0; i++) Thread.Sleep(10);
+                log.Info("after");
+            }
+            var text = Encoding.UTF8.GetString(sink.Written.ToArray());
+            T.Contains("log lines dropped", text);
+            foreach (var l in text.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                T.True(l.Length <= JsonLogger.MaxLine + 1, $"line of {l.Length} bytes");
+                using var doc = System.Text.Json.JsonDocument.Parse(l);
+            }
+            T.Contains("\"truncated\":true", text);
+        });
+
+        T.Add("logger: after the output fails for good, lines are dropped instead of queued", () =>
+        {
+            var broken = new GatedStream(null) { Fail = true };
+            using var log = new JsonLogger(broken, LogLevel.Info);
+            log.Info("first");
+            for (int i = 0; i < 200 && log.DroppedTotal == 0; i++) { Thread.Sleep(10); log.Info("more"); }
+            T.True(log.DroppedTotal > 0);
+            T.Eq(0L, log.QueuedBytes);
+        });
     }
 
     private static readonly ILogger Null = new JsonLogger(Stream.Null, LogLevel.Error);
+
+    /// <summary>An output that blocks until the gate opens (a stalled stdout), or fails every write.</summary>
+    private sealed class GatedStream(ManualResetEventSlim? gate) : Stream
+    {
+        public readonly MemoryStream Written = new();
+        public bool Fail;
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            if (Fail) throw new IOException("broken pipe");
+            gate?.Wait();
+            lock (Written) Written.Write(buffer, offset, count);
+        }
+        public override void Flush() { }
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+    }
 
     private static string? N(string raw) => UriNormalizer.NormalizeRaw(Encoding.Latin1.GetBytes(raw));
 
@@ -251,7 +308,7 @@ internal static class UnitTests
         var vars = new VariableRegistry();
         var reg = new DirectiveCollector(vars);
         new Httpgrl.Core.Modules.HttpCoreModule(Path.GetTempPath()).Register(reg);
-        new Httpgrl.Core.Modules.SslModule().Register(reg);
+        new Httpgrl.Core.Modules.SslModule(Path.GetTempPath()).Register(reg);
         foreach (var m in StaticFiles.Modules()) m.Register(reg);
         new Httpgrl.Modules.Rewrite.RewriteModule().Register(reg);
         var root = new ConfigParser(reg.Directives, vars).ParseText(text);

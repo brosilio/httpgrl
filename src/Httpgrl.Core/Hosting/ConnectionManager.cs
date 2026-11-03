@@ -180,19 +180,20 @@ internal sealed class ConnectionManager : IDisposable
                 if (c is null) continue;
                 string? why = null;
                 long b = Volatile.Read(ref c.BaseDeadline);
-                long o = Volatile.Read(ref c.OpDeadline);
+                long rd = Volatile.Read(ref c.ReadDeadline), wd = Volatile.Read(ref c.WriteDeadline);
                 if (stopping && c.Idle) why = "shutdown";
                 // Idle TLS connections close at reload; idle plaintext ones move to the new configuration on their next
                 // request. Anything still on a replaced configuration after reload_drain_timeout is closed.
                 else if (c.Generation is { Retired: true } g && ((c.Idle && c.Tls) || now > g.RetireDeadline))
                     why = c.Idle ? "configuration reloaded" : "reload drain timeout";
                 else if (b != 0 && now > b) why = c.Phase + " timeout";
-                else if (o != 0 && now > o) why = c.Phase + " i/o timeout";
+                else if ((rd != 0 && now > rd) || (wd != 0 && now > wd)) why = c.Phase + " i/o timeout";
                 else if (c.MinRate > 0)
                 {
-                    long busy = c.RateBusyMs;
-                    long started = Volatile.Read(ref c.OpStartedAt);
-                    if (started != 0) busy += now - started;
+                    long busy = Volatile.Read(ref c.RateBusyMs);
+                    long rs = Volatile.Read(ref c.ReadStartedAt), ws = Volatile.Read(ref c.WriteStartedAt);
+                    if (rs != 0) busy += now - rs;
+                    if (ws != 0) busy += now - ws;
                     if (busy > RateGraceMs && c.RateBytes * 1000 < (long)c.MinRate * busy) why = c.Phase + " below minimum rate";
                 }
                 if (why is not null) doomed.Add((c, why));
