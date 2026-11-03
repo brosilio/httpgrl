@@ -16,16 +16,23 @@ internal sealed class AccessLogModule : IModule
         r.AddDirective(new()
         {
             Name = "access_log", Contexts = ContextKind.HttpAny, MinArgs = 1, MaxArgs = -1,
-            Handler = i => i.Conf<AccessLogConf>().Enabled = i.Args[0] switch
+            Handler = i =>
             {
-                "off" => false,
-                "stdout" => true,
-                _ => throw i.Error("only \"stdout\" or \"off\" are supported; records are JSON on stdout"),
+                i.Conf<AccessLogConf>().Enabled = i.Args[0] != "off";
+                // nginx's "access_log /path [format]": records go to stdout as JSON regardless; say so once per directive.
+                if (i.Args[0] is not ("off" or "stdout")) _paths.Add((i.Args[0], i.Source));
             },
         });
     }
 
-    public void Configure(IModuleSetup setup) => setup.AddHandler(Phase.Log, Log, 0);
+    private readonly List<(string Path, SourceLocation Source)> _paths = new();
+
+    public void Configure(IModuleSetup setup)
+    {
+        foreach (var (path, src) in _paths)
+            setup.Log.Warn("access_log: records go to stdout as JSON, not to this file (log_format doesn't apply)", new("path", path), new("at", src.ToString()));
+        setup.AddHandler(Phase.Log, Log, 0);
+    }
 
     private static ValueTask<HandlerResult> Log(HttpContext ctx)
     {

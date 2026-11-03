@@ -86,7 +86,7 @@ public sealed class ServerConf : ScopeConfig<ServerConf>
     protected override void Inherit(ServerConf parent) { }
 }
 
-public sealed record ListenSpec(EndPoint EndPoint, bool IsWildcard, bool Ssl, bool DefaultServer, int Backlog, bool ReusePort, SourceLocation Source)
+public sealed record ListenSpec(EndPoint EndPoint, bool IsWildcard, bool Ssl, bool DefaultServer, int Backlog, bool ReusePort, SourceLocation Source, bool ProxyProtocol = false)
 {
     public string Key => EndPoint switch
     {

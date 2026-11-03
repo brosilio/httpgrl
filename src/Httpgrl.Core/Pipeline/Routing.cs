@@ -196,6 +196,8 @@ internal sealed class ListenBinding(EndPoint endPoint, bool ssl, int backlog, bo
     public readonly bool Ssl = ssl;
     public readonly int Backlog = backlog;
     public readonly bool ReusePort = reusePort;
+    /// <summary>Every connection starts with a PROXY protocol header (mandatory).</summary>
+    public bool ProxyProtocol { get; init; }
     public VirtualHosts Hosts = new();
     /// <summary>When bound to a wildcard address: servers listening on specific local addresses of the same port.</summary>
     public Dictionary<IPAddress, VirtualHosts>? ByAddress;
@@ -240,6 +242,7 @@ internal static class RoutingBuilder
                 }
                 else if (g.Spec.Ssl != l.Ssl) throw new ConfigException($"conflicting \"ssl\" parameter for {l.Key}", l.Source);
                 else if (g.Spec.ReusePort != l.ReusePort) throw new ConfigException($"conflicting \"reuseport\" parameter for {l.Key}", l.Source);
+                else if (g.Spec.ProxyProtocol != l.ProxyProtocol) throw new ConfigException($"conflicting \"proxy_protocol\" parameter for {l.Key}", l.Source);
                 g.Hosts.Add(srv, l.DefaultServer, l.Source, log);
             }
         }
@@ -252,7 +255,7 @@ internal static class RoutingBuilder
         {
             if (spec.EndPoint is IPEndPoint ip && spec.IsWildcard)
             {
-                var b = new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort) { Hosts = hosts };
+                var b = new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort) { Hosts = hosts, ProxyProtocol = spec.ProxyProtocol };
                 wild[(ip.AddressFamily, ip.Port)] = b;
                 bindings.Add(b);
             }
@@ -264,10 +267,11 @@ internal static class RoutingBuilder
             {
                 if (w.Ssl != spec.Ssl) throw new ConfigException($"conflicting \"ssl\" parameter for port {ip.Port}", spec.Source);
                 if (w.ReusePort != spec.ReusePort) throw new ConfigException($"conflicting \"reuseport\" parameter for port {ip.Port}", spec.Source);
+                if (w.ProxyProtocol != spec.ProxyProtocol) throw new ConfigException($"conflicting \"proxy_protocol\" parameter for port {ip.Port}", spec.Source);
                 (w.ByAddress ??= new())[ip.Address] = hosts;
                 continue;
             }
-            bindings.Add(new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort) { Hosts = hosts });
+            bindings.Add(new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort) { Hosts = hosts, ProxyProtocol = spec.ProxyProtocol });
         }
         return bindings;
     }

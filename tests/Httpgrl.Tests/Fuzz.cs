@@ -31,12 +31,12 @@ internal static class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(),
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol" })
         {
             int iterations = name == "config" ? 3_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
@@ -368,6 +368,27 @@ internal static class Fuzz
             if (c != ContentCoding.Identity && !AcceptEncoding.Accepts(v, c)) throw new Finding($"chose {c} but it isn't acceptable");
             return c != ContentCoding.Identity;
         }, MaxLen: 1024);
+
+    /// <summary>PROXY protocol headers: what anyone who can reach a proxy_protocol listener can send.</summary>
+    private static Target ProxyProtocolTarget()
+    {
+        byte[] Sig(byte cmd, byte fam, byte[] body) => [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, cmd, fam, (byte)(body.Length >> 8), (byte)body.Length, .. body];
+        return new Target("proxy-protocol",
+            [.. B("PROXY TCP4 203.0.113.7 198.51.100.1 4242 443\r\nGET / HTTP/1.1\r\n", "PROXY TCP6 2001:db8::1 ::2 1 65535\r\n", "PROXY UNKNOWN\r\n"),
+             Sig(0x21, 0x11, [1, 2, 3, 4, 5, 6, 7, 8, 0, 80, 1, 187]), Sig(0x21, 0x21, new byte[36]), Sig(0x20, 0x00, []), Sig(0x21, 0x31, new byte[216])],
+            B("\r\n", " ", "PROXY ", "TCP4", "TCP6", "UNKNOWN", "0", "65535", "65536", "::", "1.2.3.4", "\x0d\x0a\x0d\x0a\x00\x0d\x0a\x51\x55\x49\x54\x0a", "\x21", "\x20", "\x11", "\x21\x21", "\xff\xff", "\x00\x00"),
+            data =>
+            {
+                int r = Httpgrl.Core.Http.ProxyProtocol.TryParse(data, out var h);
+                if (r > data.Length) throw new Finding($"consumed {r} of {data.Length} bytes");
+                if (r <= 0) return false;
+                if (data[0] == (byte)'P' && (r < 8 || data[r - 2] != '\r' || data[r - 1] != '\n')) throw new Finding("v1 header not ending in CRLF");
+                if (r > Httpgrl.Core.Http.ProxyProtocol.V2Max) throw new Finding("header longer than the cap");
+                if ((h.Source is null) != (h.Destination is null)) throw new Finding("half an address pair");
+                if (h.Source is not null && h.Source.AddressFamily != h.Destination!.AddressFamily) throw new Finding("mixed address families");
+                return true;
+            }, MaxLen: 2048);
+    }
 
     /// <summary>OCSP responses (what a responder, or a man in the middle on its plain-HTTP path, sends us to staple).</summary>
     private static Target OcspTarget()

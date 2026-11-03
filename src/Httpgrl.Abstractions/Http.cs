@@ -181,6 +181,9 @@ public sealed class ConnectionInfo(long id, EndPoint? remote, EndPoint? local, b
     /// <summary>True only when a client certificate was presented and chains to a trusted CA.</summary>
     public bool ClientVerified => ClientVerify == "SUCCESS";
     public int Requests { get; private set; }
+    /// <summary>The client and server addresses from a PROXY protocol header (listeners with <c>proxy_protocol</c>), else null.</summary>
+    public IPEndPoint? ProxySource { get; private set; }
+    public IPEndPoint? ProxyDestination { get; private set; }
 
     public string RemoteAddress => Remote switch { IPEndPoint ip => ip.Address.ToString(), null => "", var e => e.ToString() ?? "" };
 
@@ -216,6 +219,7 @@ public sealed class ConnectionInfo(long id, EndPoint? remote, EndPoint? local, b
         ClientVerify = clientVerify;
     }
     internal void CountRequest() => Requests++;
+    internal void SetProxy(IPEndPoint? source, IPEndPoint? destination) { ProxySource = source; ProxyDestination = destination; }
 }
 
 /// <summary>Ordered, case-insensitive header list. Flat arrays, linear lookup (headers are few).</summary>

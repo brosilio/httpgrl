@@ -14,7 +14,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
 {
     public string Name => "http_core";
 
-    private static readonly string[] Ignored = ["user", "worker_processes", "worker_rlimit_nofile", "pid", "daemon", "master_process", "use", "multi_accept", "sendfile", "tcp_nopush", "tcp_nodelay"];
+    private static readonly string[] Ignored = ["user", "worker_processes", "worker_rlimit_nofile", "pid", "daemon", "master_process", "use", "multi_accept", "sendfile", "tcp_nopush", "tcp_nodelay", "aio", "log_format"];
     private readonly List<(string, SourceLocation)> _ignoredSeen = new();
     private static readonly ContextKind TypesKind = new("types");
 
@@ -98,7 +98,11 @@ internal sealed class HttpCoreModule(string prefix) : IModule
     public void Configure(IModuleSetup setup)
     {
         foreach (var (name, src) in _ignoredSeen)
-            setup.Log.Warn("directive ignored", new("directive", name), new("at", src.ToString()));
+        {
+            if (name.StartsWith("error_log ", StringComparison.Ordinal))
+                setup.Log.Warn("error_log: logs go to stdout as JSON, not to this file (the level still applies)", new("path", name[10..]), new("at", src.ToString()));
+            else setup.Log.Warn("directive ignored", new("directive", name), new("at", src.ToString()));
+        }
         foreach (var server in setup.ScopesOf(ContextKind.Server))
         {
             var sc = server.Get<ServerConf>();
@@ -109,10 +113,11 @@ internal sealed class HttpCoreModule(string prefix) : IModule
 
     private static int Positive(DirectiveInvocation i, int v) => v > 0 ? v : throw i.Error("must be positive");
 
-    private static void ErrorLog(DirectiveInvocation i)
+    private void ErrorLog(DirectiveInvocation i)
     {
-        if (i.Args[0] is not ("stdout" or "stderr"))
-            throw i.Error("only \"stdout\" is supported; logs are single-line JSON on stdout");
+        // A file path (nginx's usual form) is accepted, but logs are single-line JSON on stdout regardless (the
+        // journal or the container runtime collects them).
+        if (i.Args[0] is not ("stdout" or "stderr")) _ignoredSeen.Add(("error_log " + i.Args[0], i.Source));
         if (i.Args.Length > 1)
         {
             i.Conf<MainConf>().LogLevel = i.Args[1] switch
@@ -198,7 +203,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         }
         else ep = ParseInet(i, a, out wildcard);
 
-        bool ssl = false, def = false, reusePort = false;
+        bool ssl = false, def = false, reusePort = false, proxyProtocol = false;
         int backlog = 511;
         for (int k = 1; k < i.Args.Length; k++)
         {
@@ -216,12 +221,13 @@ internal sealed class HttpCoreModule(string prefix) : IModule
                 if (ep is UnixDomainSocketEndPoint) throw i.Error("\"reuseport\" does not apply to unix sockets");
                 reusePort = true;
             }
+            else if (o == "proxy_protocol") proxyProtocol = true;
             else if (o is "deferred" or "http2" or "fastopen" || o.StartsWith("so_keepalive", StringComparison.Ordinal) || o.StartsWith("ipv6only", StringComparison.Ordinal))
                 continue; // accepted for compatibility; no effect
             else throw i.Error($"invalid parameter \"{o}\"");
         }
         var sc = i.Conf<ServerConf>();
-        var spec = new ListenSpec(ep, wildcard, ssl, def, backlog, reusePort, i.Source);
+        var spec = new ListenSpec(ep, wildcard, ssl, def, backlog, reusePort, i.Source, proxyProtocol);
         foreach (var l in sc.Listens) if (l.Key == spec.Key) throw i.Error($"duplicate listen {spec.Key}");
         sc.Listens.Add(spec);
     }
@@ -395,6 +401,10 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         r.AddVariable("remote_addr", c => c.Connection.RemoteAddress);
         r.AddVariable("binary_remote_addr", c => c.Connection.Remote is System.Net.IPEndPoint ip ? System.Text.Encoding.Latin1.GetString(ip.Address.GetAddressBytes()) : "");
         r.AddVariable("remote_net", c => c.Connection.RemoteNet);
+        r.AddVariable("proxy_protocol_addr", c => c.Connection.ProxySource?.Address.ToString());
+        r.AddVariable("proxy_protocol_port", c => c.Connection.ProxySource?.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        r.AddVariable("proxy_protocol_server_addr", c => c.Connection.ProxyDestination?.Address.ToString());
+        r.AddVariable("proxy_protocol_server_port", c => c.Connection.ProxyDestination?.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
         r.AddVariable("remote_port", c => c.Connection.RemotePort.ToString(System.Globalization.CultureInfo.InvariantCulture));
         r.AddVariable("server_addr", c => c.Connection.LocalAddress);
         r.AddVariable("server_port", c => c.Connection.LocalPort.ToString(System.Globalization.CultureInfo.InvariantCulture));

@@ -146,8 +146,10 @@ public sealed class ProxyModule : IModule, IDisposable
                 i.Conf<ProxyConf>().Buffers = total;
             },
         });
-        foreach (var n in new[] { "proxy_busy_buffers_size", "proxy_max_temp_file_size", "proxy_temp_file_write_size", "proxy_temp_path" })
-            r.AddDirective(new() { Name = n, Contexts = http, MaxArgs = -1, Handler = i => _ignoredSeen.Add((i.Name, i.Source)) });
+        foreach (var n in new[] { "proxy_busy_buffers_size", "proxy_max_temp_file_size", "proxy_temp_file_write_size", "proxy_temp_path",
+                                  "proxy_cache", "proxy_cache_bypass", "proxy_no_cache", "proxy_cache_valid", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_lock" })
+            r.AddDirective(new() { Name = n, Contexts = http, MaxArgs = -1, Repeatable = true, Handler = i => _ignoredSeen.Add((i.Name, i.Source)) });
+        r.AddDirective(new() { Name = "proxy_cache_path", Contexts = [ContextKind.Http], MaxArgs = -1, Repeatable = true, Handler = i => _ignoredSeen.Add((i.Name, i.Source)) });
         r.AddDirective(new() { Name = "proxy_redirect", Contexts = http, MinArgs = 1, MaxArgs = 2, Repeatable = true, Handler = Redirect });
         r.AddDirective(new() { Name = "proxy_hide_header", Contexts = http, MinArgs = 1, MaxArgs = 1, Repeatable = true, Handler = i => (i.Conf<ProxyConf>().HideHeaders ??= new()).Add(i.Args[0]) });
         r.AddDirective(new()
@@ -315,7 +317,9 @@ public sealed class ProxyModule : IModule, IDisposable
     public void Configure(IModuleSetup setup)
     {
         foreach (var (name, src) in _ignoredSeen)
-            setup.Log.Warn("directive ignored: proxy_buffering is memory-only here (nothing is written to disk)", new("directive", name), new("at", src.ToString()));
+            setup.Log.Warn(name.StartsWith("proxy_cache", StringComparison.Ordinal) || name == "proxy_no_cache"
+                ? "directive ignored: there's no proxy cache (responses are never cached)"
+                : "directive ignored: proxy_buffering is memory-only here (nothing is written to disk)", new("directive", name), new("at", src.ToString()));
         var groups = new Dictionary<string, UpstreamGroup>(StringComparer.OrdinalIgnoreCase);
         foreach (var scope in setup.ScopesOf(Upstream))
         {

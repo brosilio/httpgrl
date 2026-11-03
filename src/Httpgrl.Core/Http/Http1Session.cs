@@ -45,6 +45,20 @@ internal sealed class Http1Session
         try
         {
             Stream transport = new TransportStream(_conn);
+            if (_binding.ProxyProtocol)
+            {
+                _conn.Phase = "proxy protocol";
+                _conn.BaseDeadline = Environment.TickCount64 + core0.SslHandshakeTimeoutMs;
+                var (rest, hdr) = await ReadProxyHeaderAsync(transport).ConfigureAwait(false);
+                if (rest is null)
+                {
+                    _rt.Log.Info("invalid or missing PROXY protocol header; closing", new("conn", _conn.Id), new("remote", info.RemoteAddress));
+                    return;
+                }
+                info.SetProxy(hdr.Source, hdr.Destination);
+                if (rest.Value.Length > 0) transport = new PrefixedStream(rest.Value, transport);
+                _transport = transport;
+            }
             if (_binding.Ssl)
             {
                 _conn.Phase = "tls handshake";
@@ -196,6 +210,26 @@ internal sealed class Http1Session
             _rt.Release();
             try { await _transport.DisposeAsync().ConfigureAwait(false); } catch (Exception) { /* already torn down */ }
             _conn.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Read the mandatory PROXY header (deadline enforced by the sweeper). Returns what followed it in the same reads
+    /// (the start of the TLS handshake or HTTP request), or null if there's no valid header.
+    /// </summary>
+    private static async ValueTask<(ReadOnlyMemory<byte>? Tail, ProxyHeader Header)> ReadProxyHeaderAsync(Stream s)
+    {
+        var buf = new byte[ProxyProtocol.V2Max];
+        int have = 0;
+        while (true)
+        {
+            int r = ProxyProtocol.TryParse(buf.AsSpan(0, have), out var hdr);
+            if (r < 0) return (null, default);
+            if (r > 0) return (buf.AsMemory(r, have - r), hdr);
+            if (have == buf.Length) return (null, default);
+            int n = await s.ReadAsync(buf.AsMemory(have)).ConfigureAwait(false);
+            if (n <= 0) return (null, default);
+            have += n;
         }
     }
 
