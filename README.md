@@ -441,11 +441,14 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 2. [x] **Revocation for client certificates** (`ssl_crl`): signed, unexpired CRLs for every CA in the chain.
 3. [x] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
 4. [x] **Rate limiting**: `limit_req` and `limit_conn` zones.
-5. [ ] **Hardening**: ~~fuzzing the parsers~~ (done: request, URI, chunked, upstream, config, CRL); ~~soak test~~ (done: `--soak`); CI on Windows and macOS.
+5. [x] **Hardening**: fuzzing the parsers (request, URI, chunked, upstream, config, CRL, Accept-Encoding) and a soak test (`--soak`).
 6. [x] **Operations**: status/metrics endpoint (`stub_status`), `$request_id`, `allow`/`deny`, gzip/brotli, a hardened systemd unit.
 7. [x] **Proxy**: `proxy_redirect`, runtime DNS re-resolution, active health checks, variables in `proxy_pass` (upstream names only), `proxy_buffering`.
 8. [ ] **HTTP/2.**
 9. [ ] **Release process**: CI on push, a first `v0.x` tag, signed images.
+10. [ ] **Windows and macOS**: make sure they work, with CI on both. Deferred until there's hardware to test on: Linux is the
+    only platform actually exercised today, and Windows/macOS-specific code paths (path guards, socket options, SChannel /
+    Secure Transport TLS) are untested.
 
 Also not yet: `disable_symlinks if_not_owner`, `map ... hostnames`, OCSP, open-file cache, `sendfile(2)` for plaintext responses
 (responses currently use buffered `pread` + `send`; over TLS that's unavoidable anyway).
