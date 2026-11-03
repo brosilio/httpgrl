@@ -24,6 +24,7 @@ COPY src/Httpgrl.Modules.Rewrite/Httpgrl.Modules.Rewrite.csproj src/Httpgrl.Modu
 COPY src/Httpgrl.Modules.Headers/Httpgrl.Modules.Headers.csproj src/Httpgrl.Modules.Headers/
 COPY src/Httpgrl.Modules.Limits/Httpgrl.Modules.Limits.csproj src/Httpgrl.Modules.Limits/
 COPY src/Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj src/Httpgrl.Modules.Proxy/
+COPY src/Httpgrl.Modules.Compression/Httpgrl.Modules.Compression.csproj src/Httpgrl.Modules.Compression/
 COPY src/Httpgrl.Modules.Status/Httpgrl.Modules.Status.csproj src/Httpgrl.Modules.Status/
 COPY src/Httpgrl.Modules.Access/Httpgrl.Modules.Access.csproj src/Httpgrl.Modules.Access/
 COPY src/Httpgrl/Httpgrl.csproj src/Httpgrl/

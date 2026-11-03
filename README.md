@@ -33,6 +33,14 @@ everything it references: includes, certificates, CA bundles and CRLs. Upstream 
   drop and reconnect, landing on the new configuration.
 - The old configuration's resources (upstream keep-alive pools) are released when its last connection ends.
 
+## systemd
+
+`dist/httpgrl.service` is a hardened unit; installation steps are in its header. It runs as a dedicated user
+with only `CAP_NET_BIND_SERVICE` (so it can bind 80/443), a read-only filesystem view, no access to /home, and
+a system-call filter. It also uses `MemoryDenyWriteExecute=yes`, which a JIT-compiling .NET app can't use; a
+native AOT binary never needs writable+executable memory. `systemctl reload httpgrl` validates the config with
+`-t`, then sends `SIGHUP`. Logs land in the journal as JSON lines (`journalctl -u httpgrl -o cat | jq .`).
+
 ## Docker
 
 ```sh
@@ -64,6 +72,7 @@ docker compose up --build                              # see compose.yaml
 | `src/Httpgrl.Modules.Limits` | `http_limit_req`, `http_limit_conn`. |
 | `src/Httpgrl.Modules.Access` | `http_access`: `allow`, `deny`. |
 | `src/Httpgrl.Modules.Status` | `http_stub_status`: status and metrics endpoint. |
+| `src/Httpgrl.Modules.Compression` | `http_compression`: gzip and brotli. |
 | `src/Httpgrl.Modules.Proxy` | `http_proxy`: `proxy_pass`, `upstream {}`, WebSocket/Upgrade tunnelling. |
 | `src/Httpgrl` | Host executable. The compiled-in module list is in `Program.cs`. |
 | `tests/Httpgrl.Tests` | A dependency-free test runner. It runs on the JIT, and `ci.sh` also publishes and runs it as native AOT. |
@@ -182,6 +191,27 @@ configuration keep counting against `limit_conn`.
 ```nginx
 location = /metrics { stub_status prometheus; allow 10.0.0.0/8; deny all; }
 ```
+
+### Compression
+
+```nginx
+gzip on;
+brotli on;                 # preferred when the client accepts both
+gzip_types text/plain text/css application/json application/javascript image/svg+xml;
+```
+
+| Directive | Context | Default | Notes |
+|---|---|---|---|
+| `gzip on\|off;` / `brotli on\|off;` | http, server, location | `off` | Compresses 200, 403 and 404 responses (as nginx) of a matching type that aren't already encoded and don't say `Cache-Control: no-transform`. Works for files, handler output and proxied responses, including streamed ones (each flush goes through the compressor, so SSE and long polls still deliver promptly). Compressed responses are chunked, get a weak ETag, and drop `Accept-Ranges`; range requests are served uncompressed. |
+| `gzip_types type ...;` / `brotli_types` | http, server, location | common text types | One list for both (`*` matches everything). `text/html` is always included. **Deviation:** the default covers HTML, plain text, CSS, JS, JSON, XML, SVG, wasm and friends (nginx: only text/html). |
+| `gzip_comp_level 1..9;` / `brotli_comp_level 0..11;` | http, server, location | `1` / `4` | |
+| `gzip_min_length size;` | http, server, location | `256` | Applies when the length is known up front (nginx: 20). |
+| `gzip_vary on\|off;` | http, server, location | **`on`** | Adds `Vary: Accept-Encoding` to every compressible response, compressed or not, and merges with an existing `Vary`. nginx defaults to off, which lets shared caches serve gzip to clients that didn't ask for it. |
+| `gzip_proxied`, `gzip_disable`, `gzip_buffers`, `gzip_http_version`, `gzip_static` | | | Accepted and ignored with a warning, so nginx configs load. Responses compress regardless of `Via`; precompressed files aren't served yet. |
+
+**BREACH:** compressing a response that reflects attacker-controlled input next to a secret (a CSRF token, say)
+over TLS lets an attacker who can observe response sizes recover the secret. That's why compression is off by
+default. Don't enable it for such responses, or mask the secrets per response.
 
 **Choosing a key:** `$remote_net` is the client's IPv4 address, or its IPv6 **/64**. A single IPv6 client typically
 controls a whole /64 and can rotate through 2^64 addresses, so `$binary_remote_addr` (also available) lets it
@@ -382,6 +412,7 @@ Then add it to the list in `src/Httpgrl/Program.cs`. There is no reflection and 
 - **Counters:** `ctx.Stats()` returns a `ServerStats` snapshot (connections by state, requests, responses by class, reloads, dropped log lines, uptime). `stub_status` is built on it.
 - **Request end:** `ctx.OnRequestEnd(callback, state)` runs exactly once when the request is over, whether it completed or the connection broke mid-request. Use it to release per-request reservations (`limit_conn` does).
 - **State across reloads:** `setup.Persistent(key, () => new T())` hands back the object the previous configuration stored under `key`, or makes a new one. Rate-limit zones use it so a `SIGHUP` doesn't reset everyone's counters. A failed reload never touches it, and keys the new configuration doesn't ask for are dropped.
+- **Body encoding:** from a header filter, `ctx.Response.EncodeBody(sink => new GZipStream(sink, ...))` sends the body through an encoder. The core switches to chunked framing, flushes the encoder on `FlushAsync`, writes its trailer at completion, and frees it if the response is cut short.
 - **Header filters:** `setup.AddHeaderFilter(ctx => ...)` runs once per response just before its head is written, for handler, proxied and core-rendered responses alike (`add_header` is one).
 - **Variables:** register fixed ones in `Register` (`r.AddVariable`). Declare config-defined ones while parsing with `inv.AddVariable` (`set` and `map` do this). Uses resolve after parsing, so order in the file doesn't matter. `ctx.SetCaptures(match)` makes a regex match the source of `$1`..`$9`.
 - **Config time:** `DirectiveInvocation` has `Flag/Size/Millis/Int` parsers and `Compile` (for `$variables`). Throw `inv.Error("...")` for errors that report `file:line`.
@@ -396,10 +427,10 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 3. [x] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
 4. [x] **Rate limiting**: `limit_req` and `limit_conn` zones.
 5. [ ] **Hardening**: ~~fuzzing the parsers~~ (done: request, URI, chunked, upstream, config, CRL); ~~soak test~~ (done: `--soak`); CI on Windows and macOS.
-6. [ ] **Operations**: ~~status/metrics endpoint~~, ~~`$request_id`~~, ~~`allow`/`deny`~~ (done); gzip/brotli (BCL `System.IO.Compression`), a systemd unit.
+6. [x] **Operations**: status/metrics endpoint (`stub_status`), `$request_id`, `allow`/`deny`, gzip/brotli, a hardened systemd unit.
 7. [ ] **Proxy**: `proxy_redirect`, `proxy_buffering on`, variables in `proxy_pass`, runtime DNS re-resolution, active health checks.
 8. [ ] **HTTP/2.**
 9. [ ] **Release process**: CI on push, a first `v0.x` tag, signed images.
 
-Also not yet: `rewrite`, `map ... hostnames`, OCSP, open-file cache, `disable_symlinks`, `sendfile(2)` for plaintext responses
+Also not yet: `gzip_static` (precompressed files), `rewrite`, `map ... hostnames`, OCSP, open-file cache, `disable_symlinks`, `sendfile(2)` for plaintext responses
 (responses currently use buffered `pread` + `send`; over TLS that's unavoidable anyway).

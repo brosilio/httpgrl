@@ -14,8 +14,11 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
 
     private byte[]? _buf;
     private int _len;
-    private bool _started, _chunked, _noBody;
+    private bool _started, _chunked, _noBody, _inFilters;
     private long _sent;
+    private Func<Stream, Stream>? _encoderFactory;
+    private Stream? _encoder;
+    private Sink? _sink;
 
     public override bool HasStarted => _started;
     public override long BodyBytesSent => _sent;
@@ -25,14 +28,52 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
         Status = 200;
         Headers.Clear();
         ContentLength = -1;
-        _started = _chunked = _noBody = false;
+        _started = _chunked = _noBody = _inFilters = false;
         _sent = 0;
         _len = 0;
         ReturnBuffer();
     }
 
+    public override void EncodeBody(Func<Stream, Stream> encoder)
+    {
+        if (!_inFilters) throw new InvalidOperationException("EncodeBody is only allowed in a header filter");
+        _encoderFactory = encoder;
+        ContentLength = -1;
+    }
+
+    /// <summary>A response that didn't complete: release the encoder's (native) state without writing anything more.</summary>
+    private void DropEncoder()
+    {
+        _encoderFactory = null;
+        var e = _encoder;
+        _encoder = null;
+        if (e is null) return;
+        _sink!.Dead = true;
+        try { e.Dispose(); } catch (Exception) { /* nothing more can be sent anyway */ }
+    }
+
+    /// <summary>Where an encoder writes: the normal framed body path.</summary>
+    private sealed class Sink(ResponseImpl r) : Stream
+    {
+        public bool Dead;
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) => Dead ? ValueTask.CompletedTask : r.WriteFramedAsync(data);
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) => WriteAsync(buffer.AsMemory(offset, count), ct).AsTask();
+        public override void Write(byte[] buffer, int offset, int count) => WriteAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+        public override Task FlushAsync(CancellationToken ct) => Task.CompletedTask; // ResponseImpl.FlushAsync pushes the buffer
+        public override void Flush() { }
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+    }
+
     public void ReturnBuffer()
     {
+        DropEncoder(); // a response cut short (broken connection) never reached CompleteAsync
         var b = _buf;
         _buf = null;
         if (b is not null) ArrayPool<byte>.Shared.Return(b);
@@ -44,12 +85,25 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
         await FlushBufAsync().ConfigureAwait(false);
     }
 
-    public override ValueTask FlushAsync() => StartAsync();
+    public override async ValueTask FlushAsync()
+    {
+        if (!_started) BuildHead();
+        if (_encoder is not null) await _encoder.FlushAsync().ConfigureAwait(false);
+        await FlushBufAsync().ConfigureAwait(false);
+    }
 
     public override ValueTask WriteAsync(ReadOnlyMemory<byte> data)
     {
         if (!_started) BuildHead();
         if (_noBody || data.IsEmpty) return ValueTask.CompletedTask;
+        if (_encoder is not null) return _encoder.WriteAsync(data);
+        return WriteFramedAsync(data);
+    }
+
+    /// <summary>Body bytes as they go on the wire (after any encoder): length-checked, chunk-framed if chunked.</summary>
+    private ValueTask WriteFramedAsync(ReadOnlyMemory<byte> data)
+    {
+        if (data.IsEmpty) return ValueTask.CompletedTask;
         if (ContentLength >= 0 && _sent + data.Length > ContentLength) throw new InvalidOperationException("response body exceeds Content-Length");
         _sent += data.Length;
         if (!_chunked) return AppendAsync(data);
@@ -74,7 +128,7 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
         if (!_started) BuildHead();
         if (_noBody || count <= 0) return;
         if (ContentLength >= 0 && _sent + count > ContentLength) throw new InvalidOperationException("response body exceeds Content-Length");
-        if (_chunked)
+        if (_chunked || _encoder is not null)
         {
             var tmp = ArrayPool<byte>.Shared.Rent(BufSize / 2);
             try
@@ -113,6 +167,13 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
         {
             if (ContentLength < 0) ContentLength = 0;
             BuildHead();
+        }
+        if (_encoder is not null)
+        {
+            var e = _encoder;
+            _encoder = null;
+            _encoderFactory = null;
+            await e.DisposeAsync().ConfigureAwait(false); // writes the encoder's trailer through the sink
         }
         if (_chunked && !_noBody)
         {
@@ -163,6 +224,7 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
     {
         _started = true;
         if (ctx.StatusOverride > 0 && Status == 200) Status = ctx.StatusOverride;
+        _inFilters = true;
         foreach (var f in ctx.Rt.Pipeline.HeaderFilters)
         {
             try { f(ctx); }
@@ -171,6 +233,7 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
                 ctx.Log.Error("header filter failed", new("conn", ctx.Info.Id), new("error", e.GetType().Name), new("detail", e.Message));
             }
         }
+        _inFilters = false;
         int status = Status;
         if (status is < 100 or > 599) throw new InvalidOperationException($"invalid status {status}");
         bool upgrade = status == 101;
@@ -226,6 +289,14 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
         }
         w.Write("\r\n"u8);
         _len += w.Position;
+
+        if (_encoderFactory is not null && !_noBody && !upgrade)
+        {
+            _sink ??= new Sink(this);
+            _sink.Dead = false;
+            _encoder = _encoderFactory(_sink);
+        }
+        _encoderFactory = null;
     }
 
     private Hosting.Connection conn => ctx.Conn;

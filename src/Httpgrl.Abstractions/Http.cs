@@ -134,6 +134,14 @@ public abstract class HttpResponse
     /// <summary>Send the head if needed and everything buffered so far (streaming: SSE, long polls, proxied bodies).</summary>
     public abstract ValueTask FlushAsync();
     public abstract ValueTask SendFileAsync(FileResource file, long offset, long count);
+
+    /// <summary>
+    /// From a header filter only: send the body through an encoder (compression). <paramref name="encoder"/> gets the
+    /// core's framed body sink and returns a stream that writes the encoded body into it. The core forces chunked
+    /// framing (Content-Length no longer applies), flushes the encoder on <see cref="FlushAsync"/>, and disposes it
+    /// when the response completes (writing its trailer). Not called for responses without a body (HEAD, 204, 304).
+    /// </summary>
+    public abstract void EncodeBody(Func<Stream, Stream> encoder);
 }
 
 /// <summary>

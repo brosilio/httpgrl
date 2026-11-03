@@ -5,6 +5,7 @@
     <Project Path="src/Httpgrl.Modules.Headers/Httpgrl.Modules.Headers.csproj" />
     <Project Path="src/Httpgrl.Modules.Limits/Httpgrl.Modules.Limits.csproj" />
     <Project Path="src/Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj" />
+    <Project Path="src/Httpgrl.Modules.Compression/Httpgrl.Modules.Compression.csproj" />
     <Project Path="src/Httpgrl.Modules.Status/Httpgrl.Modules.Status.csproj" />
     <Project Path="src/Httpgrl.Modules.Access/Httpgrl.Modules.Access.csproj" />
     <Project Path="src/Httpgrl.Modules.Rewrite/Httpgrl.Modules.Rewrite.csproj" />

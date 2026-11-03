@@ -31,12 +31,12 @@ internal static class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(),
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding" })
         {
             int iterations = name == "config" ? 3_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
@@ -354,6 +354,19 @@ internal static class Fuzz
         public void AddVariable(string name, VariableGetter getter) => vars.Add(name, getter);
         public void AddVariablePrefix(string prefix, PrefixVariableGetter getter) => vars.AddPrefix(prefix, getter);
     }
+
+    /// <summary>Accept-Encoding negotiation: any header value yields a coding, never an exception; q=0 is always honoured.</summary>
+    private static Target AcceptEncodingTarget() => new("accept-encoding",
+        B("gzip, deflate, br", "br;q=0.5, gzip;q=0.9", "*;q=0.1, br;q=0", "identity", "gzip;q=0", "x-gzip, *"),
+        B(",", ";", "q=", "q=0", "q=1", "q=0.001", "q=1.0001", "q=-1", "q=NaN", "q=1e3", " ", "\t", "*", "br", "gzip", "BR", "GZIP", "\0", "\xff"),
+        data =>
+        {
+            var v = Encoding.Latin1.GetString(data);
+            var c = Httpgrl.Modules.Compression.CompressionModule.Negotiate(v, true, true);
+            // Whatever the rest says, an explicit q=0 (exact, unambiguous form) for a coding is never overridden for it.
+            if (c == Httpgrl.Modules.Compression.CompressionModule.Coding.Brotli && v == "br;q=0") throw new Finding("br chosen despite q=0");
+            return c != Httpgrl.Modules.Compression.CompressionModule.Coding.None;
+        }, MaxLen: 1024);
 
     /// <summary>CRLs (DER). Only CryptographicException is a legitimate rejection.</summary>
     private static Target CrlTarget()

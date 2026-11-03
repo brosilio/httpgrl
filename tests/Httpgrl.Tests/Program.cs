@@ -11,5 +11,6 @@ ReloadTests.Register();
 ScriptTests.Register();
 LimitTests.Register();
 OpsTests.Register();
+CompressionTests.Register();
 Fuzz.Register();
 return await T.RunAsync(args.Length > 0 ? args[0] : null);

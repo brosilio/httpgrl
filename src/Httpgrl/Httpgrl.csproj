@@ -24,6 +24,7 @@
     <ProjectReference Include="../Httpgrl.Modules.Headers/Httpgrl.Modules.Headers.csproj" />
     <ProjectReference Include="../Httpgrl.Modules.Limits/Httpgrl.Modules.Limits.csproj" />
     <ProjectReference Include="../Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj" />
+    <ProjectReference Include="../Httpgrl.Modules.Compression/Httpgrl.Modules.Compression.csproj" />
     <ProjectReference Include="../Httpgrl.Modules.Status/Httpgrl.Modules.Status.csproj" />
     <ProjectReference Include="../Httpgrl.Modules.Access/Httpgrl.Modules.Access.csproj" />
   </ItemGroup>
