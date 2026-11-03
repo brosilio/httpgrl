@@ -99,11 +99,11 @@ internal sealed class ConnectionManager : IDisposable
         return best;
     }
 
-    /// <summary>After a reload: close idle connections of retired generations now rather than at the next sweep.</summary>
+    /// <summary>After a reload: close idle TLS connections of retired generations now rather than at the next sweep.</summary>
     public void RetireIdle()
     {
         foreach (var c in Snapshot())
-            if (c.Idle && c.Generation is { Retired: true }) c.Abort("configuration reloaded", graceful: true);
+            if (c.Idle && c.Tls && c.Generation is { Retired: true }) c.Abort("configuration reloaded", graceful: true);
     }
 
     /// <summary>Stop admitting; idle connections are closed on the next sweep.</summary>
@@ -142,7 +142,9 @@ internal sealed class ConnectionManager : IDisposable
                 long b = Volatile.Read(ref c.BaseDeadline);
                 long o = Volatile.Read(ref c.OpDeadline);
                 if (stopping && c.Idle) why = "shutdown";
-                else if (c.Generation is { Retired: true } g && (c.Idle || now > g.RetireDeadline))
+                // Idle TLS connections close at reload; idle plaintext ones move to the new configuration on their next
+                // request. Anything still on a replaced configuration after reload_drain_timeout is closed.
+                else if (c.Generation is { Retired: true } g && ((c.Idle && c.Tls) || now > g.RetireDeadline))
                     why = c.Idle ? "configuration reloaded" : "reload drain timeout";
                 else if (b != 0 && now > b) why = c.Phase + " timeout";
                 else if (o != 0 && now > o) why = c.Phase + " i/o timeout";

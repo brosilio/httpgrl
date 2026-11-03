@@ -17,6 +17,8 @@ internal sealed class Connection
     public int Slot = -1;
     /// <summary>The configuration this connection runs under (set before admission).</summary>
     public Pipeline.HttpRuntime? Generation;
+    /// <summary>Accepted on a TLS listener (its handshake ties it to the configuration it was made under).</summary>
+    public bool Tls;
 
     /// <summary>Phase deadline independent of I/O (TLS handshake, whole request head, keep-alive idle). 0 = none.</summary>
     public long BaseDeadline;

@@ -75,7 +75,9 @@ effects on the running one (no logger level changes, no global state), and modul
 module instance, except state deliberately carried over with `IModuleSetup.Persistent` (rate-limit zones).
 That is the only sanctioned way to keep state across a reload: a build may *adopt* the previous object, never
 mutate the running configuration. Resources that must be closed go in `IDisposable.Dispose` on the module, which runs when
-the old configuration's last connection ends. No connection outlives its configuration by more than
+the old configuration's last connection ends. Idle plaintext keep-alives migrate to the new configuration at their next request rather than being closed
+(closing them races clients' requests); TLS connections close, since their handshake belongs to the old
+configuration. No connection outlives its configuration by more than
 `reload_drain_timeout` (enforced by the sweeper), so a reload that rotates certificates or revokes access
 actually takes effect.
 

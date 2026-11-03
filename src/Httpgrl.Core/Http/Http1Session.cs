@@ -16,16 +16,19 @@ internal sealed class Http1Session
     private const int MaxHeaders = 100;
 
     private readonly Connection _conn;
-    private readonly ListenBinding _binding;
-    private readonly HttpRuntime _rt;
+    private ListenBinding _binding;
+    private HttpRuntime _rt;
     private readonly ConnectionManager _mgr;
-    private readonly VirtualHosts _hosts;
+    private VirtualHosts _hosts;
+    /// <summary>This listener's current binding and configuration, or null once it's no longer configured.</summary>
+    private readonly Func<(ListenBinding Binding, HttpRuntime Rt)?> _current;
     private Stream _transport = Stream.Null;
     /// <summary>The server whose TLS settings the handshake used (chosen by SNI).</summary>
     private ServerRt? _tlsServer;
 
-    public Http1Session(Connection conn, ListenBinding binding, HttpRuntime rt, ConnectionManager mgr)
+    public Http1Session(Connection conn, ListenBinding binding, HttpRuntime rt, ConnectionManager mgr, Func<(ListenBinding, HttpRuntime)?> current)
     {
+        _current = current;
         _conn = conn;
         _binding = binding;
         _rt = rt;
@@ -91,6 +94,17 @@ internal sealed class Http1Session
                     if (n <= 0) return;
                     _conn.SetActive();
                 }
+                // A plaintext connection between requests carries no state from its configuration: after a reload it
+                // continues under the new one instead of being closed (closing idle keep-alives races clients that
+                // just sent a request, and they can't safely retry a POST). TLS connections were closed at reload:
+                // their handshake belongs to the old certificates and client-certificate policy.
+                if (_rt.Retired)
+                {
+                    if (_binding.Ssl || !Migrate()) return;
+                    core0 = _hosts.Default.Root.Core;
+                    lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders);
+                    ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport };
+                }
                 if (!first)
                 {
                     // The whole head must arrive within client_header_timeout of its first byte; trickling doesn't extend it.
@@ -132,7 +146,7 @@ internal sealed class Http1Session
                 if (req.ExpectContinue) ctx.BodyReader.SendContinue = SendContinueAsync;
 
                 bool wantsKeepAlive = req.VersionValue == HttpVersion.Http11 ? !req.ConnClose : req.ConnKeepAlive && !req.ConnClose;
-                ctx.SetKeepAlive(reject == 0 && wantsKeepAlive && info.Requests < core0.KeepaliveRequestsMax && !_mgr.Stopping && !_rt.Retired);
+                ctx.SetKeepAlive(reject == 0 && wantsKeepAlive && info.Requests < core0.KeepaliveRequestsMax && !_mgr.Stopping && !(_rt.Retired && _binding.Ssl));
                 _conn.Phase = "processing";
 
                 if (reject != 0) await RequestPipeline.RejectAsync(ctx, reject).ConfigureAwait(false);
@@ -152,7 +166,7 @@ internal sealed class Http1Session
                 await _rt.Pipeline.RunLogAsync(ctx).ConfigureAwait(false);
                 ctx.EndRequest();
 
-                if (!reusable || keepaliveMs <= 0 || _rt.Retired)
+                if (!reusable || keepaliveMs <= 0 || (_rt.Retired && _binding.Ssl))
                 {
                     if (!ctx.Upgraded && clean) await LingeringCloseAsync(transport, input).ConfigureAwait(false);
                     return;
@@ -181,6 +195,23 @@ internal sealed class Http1Session
             _rt.Release();
             try { await _transport.DisposeAsync().ConfigureAwait(false); } catch (Exception) { /* already torn down */ }
             _conn.Dispose();
+        }
+    }
+
+    /// <summary>Move this connection to its listener's current configuration. False if the listener is gone.</summary>
+    private bool Migrate()
+    {
+        while (true)
+        {
+            if (_current() is not { } st) return false;
+            if (!st.Rt.TryAcquire()) continue; // retired again meanwhile: read the newest
+            var old = _rt;
+            _rt = st.Rt;
+            _binding = st.Binding;
+            _hosts = st.Binding.For(_conn.Socket.LocalEndPoint);
+            _conn.Generation = st.Rt;
+            old.Release();
+            return true;
         }
     }
 

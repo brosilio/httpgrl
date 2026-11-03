@@ -21,8 +21,12 @@ everything it references: includes, certificates, CA bundles and CRLs. Upstream 
 - **Listeners** are kept when the same address is still configured (no dropped connections and no window where
   it isn't listening), opened when new, and closed when removed. `backlog`/`reuseport` and `worker_connections`
   changes need a restart; you get a warning.
-- **New connections** use the new configuration. **In-flight requests** finish on the old one and then close.
-  **Idle keep-alives** are closed at once with a normal FIN, so clients reconnect. Anything still running on the
+- **New connections** use the new configuration. **In-flight requests** finish on the old one.
+  **Plaintext keep-alive connections** aren't closed: their next request runs under the new configuration.
+  (Closing idle keep-alives races clients that are just sending a request, and a client can't safely retry a
+  POST. nginx has this race on reload; we don't.) **TLS connections** are closed once idle, with a normal FIN:
+  their handshake was made under the old certificates and client-certificate policy, so they reconnect and
+  handshake again. Anything still running on the
   old configuration after `reload_drain_timeout` (default 60s, taken from the *new* configuration) is closed with a
   FIN: WebSockets and other upgraded tunnels, long polls, slow downloads. So a reload never leaves the old
   configuration (its certificates, upstreams, CRLs) in force indefinitely. WebSocket clients see the connection
@@ -236,6 +240,15 @@ dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz all 600        # 1
 dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz request 60 42  # one target, fixed seed
 ```
 
+**Soak test** (Linux). Runs the real binary as a child process under mixed load: static, proxied and POSTed
+requests, WebSockets, rate-limited paths, slow-loris, garbage, oversized heads, mid-download resets and abandoned
+bodies. It reloads every few seconds, then checks for leaked file descriptors, memory growth, error-level log
+lines, failed requests, and a clean exit on SIGTERM:
+
+```sh
+dotnet run -c Release --project tests/Httpgrl.Tests -- --soak artifacts/linux-x64/httpgrl 300
+```
+
 A finding prints the seed, iteration and input, which reproduce it exactly. It's dependency-free and not
 coverage-guided, so it's a complement to, not a replacement for, a coverage-guided fuzzer.
 
@@ -363,7 +376,7 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 2. [x] **Revocation for client certificates** (`ssl_crl`): signed, unexpired CRLs for every CA in the chain.
 3. [x] **`add_header`, `map`, `set`, `if`**: security headers, and per-location rules such as requiring `$ssl_client_verify`.
 4. [x] **Rate limiting**: `limit_req` and `limit_conn` zones.
-5. [ ] **Hardening**: ~~fuzzing the parsers~~ (done: request, URI, chunked, upstream, config, CRL); long-running soak tests under load; CI on Windows and macOS.
+5. [ ] **Hardening**: ~~fuzzing the parsers~~ (done: request, URI, chunked, upstream, config, CRL); ~~soak test~~ (done: `--soak`); CI on Windows and macOS.
 6. [ ] **Operations**: a status/metrics endpoint, `$request_id`, gzip/brotli (BCL `System.IO.Compression`), a systemd unit.
 7. [ ] **Proxy**: `proxy_redirect`, `proxy_buffering on`, variables in `proxy_pass`, runtime DNS re-resolution, active health checks.
 8. [ ] **HTTP/2.**

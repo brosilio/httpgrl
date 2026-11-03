@@ -1,6 +1,7 @@
 using Httpgrl.Tests;
 
 if (args is ["--fuzz", ..]) return Fuzz.RunCli(args);
+if (args is ["--soak", ..]) return Soak.RunCli(args);
 
 UnitTests.Register();
 IntegrationTests.Register();

@@ -34,7 +34,7 @@ internal static class ReloadTests
             T.Contains("reload failed, keeping the running configuration", log);
         });
 
-        T.Add("reload: idle keep-alive connections close; an in-flight request finishes on the old configuration", async () =>
+        T.Add("reload: plaintext keep-alives move to the new configuration; an in-flight request finishes on the old one", async () =>
         {
             var release = new TaskCompletionSource();
             await using var up = new FakeUpstream(async (st, rd) =>
@@ -54,14 +54,33 @@ internal static class ReloadTests
             for (int i = 0; i < 100 && up.Accepted == 0; i++) await Task.Delay(20);
 
             T.True(await s.Reload(Says("new")));
-            // The idle connection is closed right away...
-            T.Eq("", await ReadToClose(idle, 2000));
-            // ...the busy one gets its old-configuration answer, then the connection closes instead of being kept.
+            await Task.Delay(400); // past a sweep: nothing closes the idle connection
+            // The idle connection isn't closed (that races a client sending its next request); it continues under
+            // the new configuration.
+            await idle.SendAsync(Encoding.ASCII.GetBytes("GET /idle HTTP/1.1\r\nHost: t\r\n\r\n"));
+            T.Eq("new", Body(await ReadOne(idle)));
+            // The busy one gets its old-configuration answer, and its next request the new configuration.
             release.SetResult();
-            var resp = await ReadToClose(busy, 5000);
-            T.Eq(200, Status(resp));
-            T.Eq("old", Body(resp));
-            T.Eq("new", Body(await s.Raw(Get())));
+            T.Eq("old", Body(await ReadOne(busy)));
+            await busy.SendAsync(Encoding.ASCII.GetBytes("GET /slow HTTP/1.1\r\nHost: t\r\n\r\n"));
+            T.Eq("new", Body(await ReadOne(busy)));
+        });
+
+        T.Add("reload: idle TLS keep-alives close (their handshake belongs to the old configuration)", async () =>
+        {
+            const string Conf = """http { server { listen 127.0.0.1:0 ssl; ssl_certificate {DIR}/c.crt; ssl_certificate_key {DIR}/c.key; return 200 "tls"; } }""";
+            await using var s = TestServer.Start(Conf, d => ProxyTests.MakeCert("x.test", d, "c").Dispose());
+            using var c = await Connect(s.Port);
+            await using var ssl = new SslStream(new NetworkStream(c, ownsSocket: false));
+            await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = "x.test", RemoteCertificateValidationCallback = (_, _, _, _) => true });
+            await ssl.WriteAsync("GET / HTTP/1.1\r\nHost: x.test\r\n\r\n"u8.ToArray());
+            var buf = new byte[4096];
+            T.True(await ssl.ReadAsync(buf) > 0);
+            T.True(await s.Reload(Conf));
+            using var cts = new CancellationTokenSource(3000);
+            int n;
+            try { n = await ssl.ReadAsync(buf, cts.Token); } catch (IOException) { n = 0; }
+            T.Eq(0, n);
         });
 
         T.Add("reload: tunnels keep the old configuration only until reload_drain_timeout", async () =>

@@ -27,6 +27,9 @@ public sealed class HttpServer : IAsyncDisposable
     {
         public readonly Socket Socket = socket;
         public volatile State Current = new(binding, rt);
+        /// <summary>Set when a reload drops this address: its connections can't move to a newer configuration.</summary>
+        public volatile bool Closed;
+        public (ListenBinding, HttpRuntime)? Now() => Closed ? null : (Current.Binding, Current.Rt);
         public sealed record State(ListenBinding Binding, HttpRuntime Rt);
     }
 
@@ -102,7 +105,7 @@ public sealed class HttpServer : IAsyncDisposable
                 }
                 foreach (var (key, l) in _listeners)
                     if (!wanted.Contains(key)) closing.Add((l.Socket, l.Current.Binding));
-                foreach (var (_, b) in closing) _listeners.Remove(b.ToString());
+                foreach (var (_, b) in closing) { _listeners[b.ToString()].Closed = true; _listeners.Remove(b.ToString()); }
                 foreach (var (key, sock, b) in opened) _listeners[key] = new Listener(sock, b, next);
                 _rt = next;
             }
@@ -237,6 +240,7 @@ public sealed class HttpServer : IAsyncDisposable
             Listener.State st;
             while (!(st = listener.Current).Rt.TryAcquire()) { }
             conn.Generation = st.Rt;
+            conn.Tls = st.Binding.Ssl;
             if (!_mgr.TryAdmit(conn, out var why))
             {
                 st.Rt.Release();
@@ -245,7 +249,7 @@ public sealed class HttpServer : IAsyncDisposable
                 continue;
             }
             if (s.AddressFamily != AddressFamily.Unix) s.NoDelay = true;
-            var session = new Http1Session(conn, st.Binding, st.Rt, _mgr);
+            var session = new Http1Session(conn, st.Binding, st.Rt, _mgr, listener.Now);
             ThreadPool.UnsafeQueueUserWorkItem(static x => _ = x.RunAsync(), session, preferLocal: false);
         }
     }
