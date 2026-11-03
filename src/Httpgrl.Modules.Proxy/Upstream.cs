@@ -20,6 +20,8 @@ internal sealed class UpstreamServer(EndPoint endPoint, string name, int weight,
     internal long FailedAt;
     internal int CurrentWeight;
     internal readonly List<UpstreamConn> Idle = new();
+    /// <summary>DNS no longer returns this address: finish what's in flight, pool nothing more.</summary>
+    internal volatile bool Removed;
 
     internal bool Available(long now) => !Down && (MaxFails == 0 || Fails < MaxFails || now - FailedAt > FailTimeoutMs);
 }
@@ -28,16 +30,21 @@ internal sealed class UpstreamServer(EndPoint endPoint, string name, int weight,
 /// A set of peers: smooth weighted round-robin (nginx's algorithm), passive health checks
 /// (max_fails within fail_timeout), backups, and a per-peer pool of idle keep-alive connections.
 /// </summary>
+/// <summary>A configured peer that names a host: re-resolved periodically into zero or more <see cref="UpstreamServer"/>s.</summary>
+internal sealed record ResolvableSpec(string Address, string Host, int Port, int Weight, int MaxFails, int FailTimeoutMs, bool Backup, bool Down);
+
 internal sealed class UpstreamGroup
 {
-    private readonly UpstreamServer[] _primary;
-    private readonly UpstreamServer[] _backup;
+    private UpstreamServer[] _primary;
+    private UpstreamServer[] _backup;
     private readonly object _lock = new();
     public readonly string Name;
     public readonly int KeepAlive, KeepAliveTimeoutMs, KeepAliveRequests;
-    public int Count => _primary.Length + _backup.Length;
+    /// <summary>Peers given by hostname (re-resolved); IP literals and unix sockets are fixed.</summary>
+    public readonly ResolvableSpec[] Resolvable;
+    public int Count { get { lock (_lock) return _primary.Length + _backup.Length; } }
 
-    public UpstreamGroup(string name, List<UpstreamServer> servers, int keepAlive, int keepAliveTimeoutMs, int keepAliveRequests)
+    public UpstreamGroup(string name, List<UpstreamServer> servers, int keepAlive, int keepAliveTimeoutMs, int keepAliveRequests, ResolvableSpec[]? resolvable = null)
     {
         Name = name;
         _primary = servers.FindAll(s => !s.Backup).ToArray();
@@ -45,6 +52,48 @@ internal sealed class UpstreamGroup
         KeepAlive = keepAlive;
         KeepAliveTimeoutMs = keepAliveTimeoutMs;
         KeepAliveRequests = keepAliveRequests;
+        Resolvable = resolvable ?? [];
+    }
+
+    /// <summary>
+    /// Replace the peers of one resolvable spec with <paramref name="addresses"/>. Peers whose address is unchanged
+    /// are kept (with their failure counts and idle connections); removed ones close their idle connections.
+    /// Returns whether anything changed.
+    /// </summary>
+    public bool Update(ResolvableSpec spec, IPAddress[] addresses)
+    {
+        var dropped = new List<UpstreamConn>();
+        lock (_lock)
+        {
+            var all = new List<UpstreamServer>(_primary.Length + _backup.Length);
+            all.AddRange(_primary);
+            all.AddRange(_backup);
+            var mine = all.FindAll(s => s.Name == spec.Address);
+            var wanted = new HashSet<IPAddress>(addresses);
+            if (mine.Count == wanted.Count && mine.TrueForAll(s => s.EndPoint is IPEndPoint ip && wanted.Contains(ip.Address))) return false;
+            var next = all.FindAll(s => s.Name != spec.Address);
+            foreach (var a in addresses)
+            {
+                var keep = mine.Find(s => s.EndPoint is IPEndPoint ip && ip.Address.Equals(a));
+                next.Add(keep ?? new UpstreamServer(new IPEndPoint(a, spec.Port), spec.Address, spec.Weight, spec.MaxFails, spec.FailTimeoutMs, spec.Backup, spec.Down));
+            }
+            foreach (var s in mine)
+            {
+                if (next.Contains(s)) continue;
+                s.Removed = true;
+                dropped.AddRange(s.Idle);
+                s.Idle.Clear();
+            }
+            _primary = next.FindAll(s => !s.Backup).ToArray();
+            _backup = next.FindAll(s => s.Backup).ToArray();
+        }
+        foreach (var c in dropped) c.Dispose();
+        return true;
+    }
+
+    public string Describe()
+    {
+        lock (_lock) return string.Join(", ", _primary.Concat(_backup).Select(s => s.Display));
     }
 
     public UpstreamServer? Pick(List<UpstreamServer> tried)
@@ -132,13 +181,13 @@ internal sealed class UpstreamGroup
 
     public void ReturnIdle(UpstreamConn c)
     {
-        if (_retired || KeepAlive <= 0 || c.Requests >= KeepAliveRequests || !c.IsReusable()) { c.Dispose(); return; }
+        if (_retired || c.Server.Removed || KeepAlive <= 0 || c.Requests >= KeepAliveRequests || !c.IsReusable()) { c.Dispose(); return; }
         c.IdleSince = Environment.TickCount64;
         UpstreamConn? evicted = null;
         lock (_lock)
         {
             var idle = c.Server.Idle;
-            if (_retired) evicted = c;
+            if (_retired || c.Server.Removed) evicted = c;
             else
             {
                 idle.Add(c);
@@ -252,3 +301,64 @@ internal sealed class UpstreamConn : IDisposable
 
 /// <summary>The upstream misbehaved (protocol violation, premature close, oversized header): answer 502.</summary>
 internal sealed class UpstreamException(string message) : Exception(message);
+
+/// <summary>
+/// Re-resolves the hostnames of upstream peers every interval (system resolver: /etc/hosts, nsswitch, DNS). A failed
+/// or empty answer keeps the previous addresses. Started on first use, so a configuration that never goes live
+/// starts nothing; stopped when the configuration is retired.
+/// </summary>
+internal sealed class DnsRefresher(List<UpstreamGroup> groups, int intervalMs, Func<string, CancellationToken, Task<IPAddress[]>> resolve, ILogger log)
+{
+    private const int LookupTimeoutMs = 10_000;
+    private int _started;
+    private readonly CancellationTokenSource _stop = new();
+
+    public void EnsureStarted()
+    {
+        if (Volatile.Read(ref _started) != 0 || Interlocked.Exchange(ref _started, 1) != 0) return;
+        _ = Task.Run(LoopAsync);
+    }
+
+    private async Task LoopAsync()
+    {
+        while (true)
+        {
+            try { await Task.Delay(intervalMs, _stop.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            await RefreshAsync().ConfigureAwait(false);
+        }
+    }
+
+    public async Task RefreshAsync()
+    {
+        foreach (var g in groups)
+        {
+            foreach (var spec in g.Resolvable)
+            {
+                if (_stop.IsCancellationRequested) return;
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+                cts.CancelAfter(LookupTimeoutMs);
+                try
+                {
+                    var addrs = await resolve(spec.Host, cts.Token).ConfigureAwait(false);
+                    if (addrs.Length == 0)
+                    {
+                        log.Warn("upstream host resolved to nothing; keeping previous addresses", new("upstream", g.Name), new("host", spec.Host));
+                        continue;
+                    }
+                    if (g.Update(spec, addrs)) log.Info("upstream addresses changed", new("upstream", g.Name), new("host", spec.Host), new("peers", g.Describe()));
+                }
+                catch (OperationCanceledException) when (_stop.IsCancellationRequested) { return; }
+                catch (Exception e) when (e is System.Net.Sockets.SocketException or OperationCanceledException or ArgumentException)
+                {
+                    log.Warn("upstream DNS refresh failed; keeping previous addresses", new("upstream", g.Name), new("host", spec.Host), new("error", e.Message));
+                }
+            }
+        }
+    }
+
+    public void Stop()
+    {
+        try { _stop.Cancel(); } catch (ObjectDisposedException) { }
+    }
+}

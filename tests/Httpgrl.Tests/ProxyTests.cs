@@ -21,6 +21,61 @@ internal static class ProxyTests
 
     public static void Register()
     {
+        T.Add("proxy: upstream hostnames are re-resolved; DNS failures keep the last good addresses", async () =>
+        {
+            int port = FreePort();
+            await using var a = new FakeUpstream(Answers("A"), new System.Net.IPEndPoint(System.Net.IPAddress.Parse("127.0.0.1"), port));
+            await using var b = new FakeUpstream(Answers("B"), new System.Net.IPEndPoint(System.Net.IPAddress.Parse("127.0.0.2"), port));
+            var dns = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
+            dns["app.test"] = "127.0.0.1";
+            dns["late.test"] = "";
+            Task<System.Net.IPAddress[]> Resolve(string host, CancellationToken ct) => dns.TryGetValue(host, out var v)
+                ? v == "fail" ? throw new SocketException((int)SocketError.HostNotFound) : Task.FromResult(v.Length == 0 ? [] : new[] { System.Net.IPAddress.Parse(v) })
+                : throw new SocketException((int)SocketError.HostNotFound);
+            await using var s = TestServer.Start(Conf($$"""
+                location /direct/ { proxy_pass http://app.test:{{port}}/; }
+                location /grouped/ { proxy_pass http://grp/; }
+                location /late/ { proxy_pass http://lategrp/; }
+                """, $$"""
+                upstream_resolve_interval 150ms;
+                upstream grp { server app.test:{{port}}; }
+                upstream lategrp { server late.test:{{port}} resolve; }
+                """), dns: Resolve);
+            T.Eq("A", Body(await s.Raw(Get("/direct/"))));
+            T.Eq("A", Body(await s.Raw(Get("/grouped/"))));
+            T.Eq(502, Status(await s.Raw(Get("/late/"))));        // started without addresses ("resolve")
+
+            dns["app.test"] = "127.0.0.2";
+            dns["late.test"] = "127.0.0.1";
+            await Eventually(async () => Body(await s.Raw(Get("/direct/"))) == "B");
+            await Eventually(async () => Body(await s.Raw(Get("/grouped/"))) == "B");
+            await Eventually(async () => Body(await s.Raw(Get("/late/"))) == "A");
+
+            dns["app.test"] = "fail";
+            await Task.Delay(500);
+            T.Eq("B", Body(await s.Raw(Get("/direct/"))));       // a failed lookup changes nothing
+            dns["app.test"] = "";
+            await Task.Delay(500);
+            T.Eq("B", Body(await s.Raw(Get("/grouped/"))));      // neither does an empty answer
+            var log = s.LogText();
+            T.Contains("upstream addresses changed", log);
+            T.Contains("keeping previous addresses", log);
+
+            // An upstream that starts with no addresses must recover on its own: nothing else starts the refresher here.
+            var dns2 = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
+            Task<System.Net.IPAddress[]> Resolve2(string host, CancellationToken ct) =>
+                Task.FromResult(dns2.TryGetValue(host, out var v) ? new[] { System.Net.IPAddress.Parse(v) } : []);
+            await using (var s2 = TestServer.Start(Conf("location / { proxy_pass http://only/; }", $"upstream_resolve_interval 150ms; upstream only {{ server late.test:{port} resolve; }}"), dns: Resolve2))
+            {
+                T.Eq(502, Status(await s2.Raw(Get("/"))));
+                dns2["late.test"] = "127.0.0.2";
+                await Eventually(async () => Body(await s2.Raw(Get("/"))) == "B");
+            }
+
+            // Without "resolve", an unknown host is still a config error.
+            T.Contains("host not found", T.Throws<ConfigException>(() => TestServer.Start(Conf("location / { proxy_pass http://nope.test/; }"), dns: Resolve)).Message);
+        });
+
         T.Add("proxy_redirect: default maps the upstream URL back to the location; custom, regex and off; Refresh too", async () =>
         {
             int p = 0;
@@ -373,6 +428,27 @@ internal static class ProxyTests
             ms.Write(buf, 0, r.Count);
         } while (!r.EndOfMessage);
         return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    /// <summary>Keep-alive upstream that answers every request with <paramref name="body"/>.</summary>
+    private static Func<Stream, RequestReader, Task> Answers(string body) => async (st, rd) =>
+    {
+        while (true)
+        {
+            var (head, _) = await rd.ReadRequestAsync();
+            if (head.Length == 0) return;
+            await st.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {body.Length}\r\n\r\n{body}"));
+        }
+    };
+
+    private static async Task Eventually(Func<Task<bool>> cond)
+    {
+        for (int k = 0; k < 60; k++)
+        {
+            if (await cond()) return;
+            await Task.Delay(50);
+        }
+        throw new Exception("condition not met within 3 s");
     }
 
     private static int FreePort()

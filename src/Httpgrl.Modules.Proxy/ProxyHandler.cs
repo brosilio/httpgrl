@@ -22,6 +22,7 @@ internal static class ProxyHandler
         bool keepAlive = !upgrade && conf.Version == 11 && t.Group.KeepAlive > 0;
         var head = BuildRequestHead(ctx, conf, t, BuildUri(ctx, conf, t), upgrade, keepAlive);
         bool idempotent = IsIdempotent(req.Method);
+        t.Dns?.EnsureStarted(); // before anything that depends on the peer count: an upstream with no addresses yet must still recover
         int maxTries = conf.NextUpstreamTries is int n and > 0 ? n : t.Group.Count;
         var tried = new List<UpstreamServer>(2);
         var abort = ctx.Aborted;

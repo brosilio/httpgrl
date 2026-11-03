@@ -65,7 +65,7 @@ public sealed class UpstreamConf : ScopeConfig<UpstreamConf>
     protected override void Inherit(UpstreamConf parent) { }
 }
 
-public sealed record UpstreamServerSpec(string Address, int Weight, int MaxFails, int FailTimeoutMs, bool Backup, bool Down, SourceLocation Source);
+public sealed record UpstreamServerSpec(string Address, int Weight, int MaxFails, int FailTimeoutMs, bool Backup, bool Down, SourceLocation Source, bool Resolve = false);
 
 /// <summary>
 /// Reverse proxy (cf. ngx_http_proxy_module + ngx_http_upstream). HTTP/1.x to upstreams over TCP, TLS or
@@ -73,6 +73,16 @@ public sealed record UpstreamServerSpec(string Address, int Weight, int MaxFails
 /// </summary>
 public sealed class ProxyModule : IModule, IDisposable
 {
+    private readonly Func<string, CancellationToken, Task<IPAddress[]>> _resolve;
+    private int _resolveIntervalMs = 30_000;
+    private DnsRefresher? _refresher;
+
+    public ProxyModule() : this(null) { }
+
+    /// <summary>Tests substitute the resolver; production uses the system's.</summary>
+    internal ProxyModule(Func<string, CancellationToken, Task<IPAddress[]>>? resolver) =>
+        _resolve = resolver ?? ((host, ct) => Dns.GetHostAddressesAsync(host, ct));
+
     public static readonly ContextKind Upstream = new("upstream");
     public string Name => "http_proxy";
 
@@ -102,6 +112,11 @@ public sealed class ProxyModule : IModule, IDisposable
                     return; // managed by the module (keep-alive / upgrade); accepted for nginx-config compatibility
                 (c.SetHeaders ??= new()).Add((name, i.Compile(i.Args[1])));
             },
+        });
+        r.AddDirective(new()
+        {
+            Name = "upstream_resolve_interval", Contexts = [ContextKind.Http], MinArgs = 1, MaxArgs = 1,
+            Handler = i => _resolveIntervalMs = i.Args[0] == "off" ? 0 : i.Millis(0) is var ms && ms >= 100 ? ms : throw i.Error("must be at least 100ms, or off"),
         });
         r.AddDirective(new() { Name = "proxy_redirect", Contexts = http, MinArgs = 1, MaxArgs = 2, Repeatable = true, Handler = Redirect });
         r.AddDirective(new() { Name = "proxy_hide_header", Contexts = http, MinArgs = 1, MaxArgs = 1, Repeatable = true, Handler = i => (i.Conf<ProxyConf>().HideHeaders ??= new()).Add(i.Args[0]) });
@@ -166,7 +181,7 @@ public sealed class ProxyModule : IModule, IDisposable
     private static void UpstreamServer(DirectiveInvocation i)
     {
         int weight = 1, maxFails = 1, failTimeout = 10_000;
-        bool backup = false, down = false;
+        bool backup = false, down = false, resolve = false;
         for (int k = 1; k < i.Args.Length; k++)
         {
             var a = i.Args[k];
@@ -175,9 +190,10 @@ public sealed class ProxyModule : IModule, IDisposable
             if (a.StartsWith("fail_timeout=", StringComparison.Ordinal) && ConfigValue.TryParseMillis(a.AsSpan(13), out failTimeout)) continue;
             if (a == "backup") { backup = true; continue; }
             if (a == "down") { down = true; continue; }
+            if (a == "resolve") { resolve = true; continue; }
             throw i.Error($"invalid parameter \"{a}\"");
         }
-        i.Conf<UpstreamConf>().Servers.Add(new UpstreamServerSpec(i.Args[0], weight, maxFails, failTimeout, backup, down, i.Source));
+        i.Conf<UpstreamConf>().Servers.Add(new UpstreamServerSpec(i.Args[0], weight, maxFails, failTimeout, backup, down, i.Source, resolve));
     }
 
     private static void Pass(DirectiveInvocation i)
@@ -231,21 +247,33 @@ public sealed class ProxyModule : IModule, IDisposable
             if (u.Servers.Count == 0) throw new ConfigException($"no servers in upstream \"{u.Name}\"", scope.Source);
             if (groups.ContainsKey(u.Name)) throw new ConfigException($"duplicate upstream \"{u.Name}\"", scope.Source);
             var servers = new List<UpstreamServer>();
+            var resolvable = new List<ResolvableSpec>();
             foreach (var s in u.Servers)
-                foreach (var ep in Resolve(s.Address, 80, s.Source))
+            {
+                if (Hostname(s.Address, 80, s.Source) is { } hp)
+                    resolvable.Add(new ResolvableSpec(s.Address, hp.Host, hp.Port, s.Weight, s.MaxFails, s.FailTimeoutMs, s.Backup, s.Down));
+                foreach (var ep in Resolve(s.Address, 80, s.Source, allowMissing: s.Resolve, setup.Log))
                     servers.Add(new UpstreamServer(ep, s.Address, s.Weight, s.MaxFails, s.FailTimeoutMs, s.Backup, s.Down));
-            groups[u.Name] = new UpstreamGroup(u.Name, servers, u.KeepAlive ?? 32, u.KeepAliveTimeout ?? 60_000, u.KeepAliveRequests ?? 1000);
+            }
+            if (servers.Count == 0 && resolvable.Count == 0) throw new ConfigException($"no servers in upstream \"{u.Name}\"", scope.Source);
+            groups[u.Name] = new UpstreamGroup(u.Name, servers, u.KeepAlive ?? 32, u.KeepAliveTimeout ?? 60_000, u.KeepAliveRequests ?? 1000, [.. resolvable]);
         }
 
         var implicitGroups = new Dictionary<string, UpstreamGroup>(StringComparer.OrdinalIgnoreCase);
         foreach (var loc in setup.ScopesOf(ContextKind.Location))
         {
             if (!loc.TryGet<ProxyConf>(out var pc) || pc.Pass is null) continue;
-            pc.Target = BuildTarget(pc, groups, implicitGroups);
+            pc.Target = BuildTarget(pc, groups, implicitGroups, setup.Log);
             pc.RedirectRules = RedirectRules(pc, setup);
         }
         _groups.AddRange(groups.Values);
         _groups.AddRange(implicitGroups.Values);
+        if (_resolveIntervalMs > 0 && _groups.Exists(g => g.Resolvable.Length > 0))
+        {
+            _refresher = new DnsRefresher(_groups.FindAll(g => g.Resolvable.Length > 0), _resolveIntervalMs, _resolve, setup.Log);
+            foreach (var loc in setup.ScopesOf(ContextKind.Location))
+                if (loc.TryGet<ProxyConf>(out var pc) && pc.Target is { } t && t.Group.Resolvable.Length > 0) pc.Target = t with { Dns = _refresher };
+        }
     }
 
     private readonly List<UpstreamGroup> _groups = new();
@@ -282,10 +310,11 @@ public sealed class ProxyModule : IModule, IDisposable
     /// <summary>The configuration was replaced (reload) and its last connection is gone: close pooled upstream connections.</summary>
     public void Dispose()
     {
+        _refresher?.Stop();
         foreach (var g in _groups) g.Retire();
     }
 
-    private static ProxyTarget BuildTarget(ProxyConf c, Dictionary<string, UpstreamGroup> groups, Dictionary<string, UpstreamGroup> implicitGroups)
+    private ProxyTarget BuildTarget(ProxyConf c, Dictionary<string, UpstreamGroup> groups, Dictionary<string, UpstreamGroup> implicitGroups, ILogger log)
     {
         var url = c.Pass!;
         var src = c.PassSource;
@@ -345,8 +374,9 @@ public sealed class ProxyModule : IModule, IDisposable
                 if (!implicitGroups.TryGetValue(key, out group))
                 {
                     var servers = new List<UpstreamServer>();
-                    foreach (var ep in Resolve(authority, defPort, src)) servers.Add(new UpstreamServer(ep, authority, 1, 1, 10_000, false, false));
-                    implicitGroups[key] = group = new UpstreamGroup(authority, servers, 32, 60_000, 1000);
+                    foreach (var ep in Resolve(authority, defPort, src, allowMissing: false, log)) servers.Add(new UpstreamServer(ep, authority, 1, 1, 10_000, false, false));
+                    ResolvableSpec[] res = Hostname(authority, defPort, src) is { } hp ? [new ResolvableSpec(authority, hp.Host, hp.Port, 1, 1, 10_000, false, false)] : [];
+                    implicitGroups[key] = group = new UpstreamGroup(authority, servers, 32, 60_000, 1000, res);
                 }
             }
         }
@@ -419,15 +449,30 @@ public sealed class ProxyModule : IModule, IDisposable
     }
 
     /// <summary>Resolved once at load (like nginx without a resolver); every address becomes a peer.</summary>
-    private static IEnumerable<EndPoint> Resolve(string address, int defPort, SourceLocation src)
+    /// <summary>Host and port when <paramref name="address"/> names a host (not an IP literal or unix socket).</summary>
+    private static (string Host, int Port)? Hostname(string address, int defPort, SourceLocation src)
+    {
+        if (address.StartsWith("unix:", StringComparison.Ordinal)) return null;
+        SplitHostPort(address, defPort, src, out var host, out var port, out _);
+        return IPAddress.TryParse(host, out _) ? null : (host, port);
+    }
+
+    /// <summary>Load-time resolution. <paramref name="allowMissing"/> ("resolve"): start without addresses and keep trying.</summary>
+    private IEnumerable<EndPoint> Resolve(string address, int defPort, SourceLocation src, bool allowMissing, ILogger log)
     {
         if (address.StartsWith("unix:", StringComparison.Ordinal)) return [new UnixDomainSocketEndPoint(address[5..])];
         SplitHostPort(address, defPort, src, out var host, out var port, out _);
         if (IPAddress.TryParse(host, out var ip)) return [new IPEndPoint(ip, port)];
         IPAddress[] addrs;
-        try { addrs = Dns.GetHostAddresses(host); }
-        catch (SocketException e) { throw new ConfigException($"host not found in upstream \"{address}\": {e.Message}", src); }
-        if (addrs.Length == 0) throw new ConfigException($"host not found in upstream \"{address}\"", src);
+        string? why = null;
+        try { addrs = _resolve(host, CancellationToken.None).GetAwaiter().GetResult(); }
+        catch (SocketException e) { addrs = []; why = e.Message; }
+        if (addrs.Length == 0)
+        {
+            if (!allowMissing) throw new ConfigException($"host not found in upstream \"{address}\"{(why is null ? "" : ": " + why)}", src);
+            log.Warn("upstream host not found; starting without it and retrying", new("host", host), new("at", src.ToString()));
+            return [];
+        }
         return Array.ConvertAll(addrs, a => (EndPoint)new IPEndPoint(a, port));
     }
 }
@@ -435,4 +480,7 @@ public sealed class ProxyModule : IModule, IDisposable
 internal sealed record RedirectSpec(bool Off, bool Default, string? Prefix, Regex? Regex, ComplexValue? Replacement);
 internal sealed record RedirectRule(string? Prefix, Regex? Regex, ComplexValue Replacement);
 
-internal sealed record ProxyTarget(UpstreamGroup Group, bool Tls, string HostHeader, int Port, string? UriPart, string? LocationPrefix, SslClientAuthenticationOptions? Ssl);
+internal sealed record ProxyTarget(UpstreamGroup Group, bool Tls, string HostHeader, int Port, string? UriPart, string? LocationPrefix, SslClientAuthenticationOptions? Ssl)
+{
+    public DnsRefresher? Dns { get; init; }
+}

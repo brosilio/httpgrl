@@ -91,7 +91,9 @@ internal sealed class TestServer : IAsyncDisposable
         _logStream = ms;
     }
 
-    public static TestServer Start(string config, Action<string>? populate = null, IEnumerable<IModule>? extra = null)
+    /// <param name="dns">Replaces the system resolver for the proxy module (hostname -> addresses).</param>
+    public static TestServer Start(string config, Action<string>? populate = null, IEnumerable<IModule>? extra = null,
+        Func<string, CancellationToken, Task<IPAddress[]>>? dns = null)
     {
         var dir = Path.Combine(Path.GetTempPath(), "httpgrl-test-" + Guid.NewGuid().ToString("N")[..12]);
         Directory.CreateDirectory(dir);
@@ -100,19 +102,20 @@ internal sealed class TestServer : IAsyncDisposable
         var log = new JsonLogger(Stream.Synchronized(ms), LogLevel.Debug);
         var text = config.Replace("{DIR}", dir, StringComparison.Ordinal);
         var mods = extra?.ToArray() ?? [];
-        var server = ServerBuilder.LoadText(text, dir, () => Modules(mods), log);
+        var server = ServerBuilder.LoadText(text, dir, () => Modules(mods, dns), log);
         server.Start();
-        return new TestServer(dir, server, log, ms) { _extra = mods };
+        return new TestServer(dir, server, log, ms) { _extra = mods, _dns = dns };
     }
 
     private IModule[] _extra = [];
+    private Func<string, CancellationToken, Task<IPAddress[]>>? _dns;
 
-    private static IModule[] Modules(IModule[] extra) =>
-        [new Httpgrl.Modules.Rewrite.RewriteModule(), new Httpgrl.Modules.Rewrite.MapModule(), new Httpgrl.Modules.Headers.HeadersModule(), new Httpgrl.Modules.Limits.LimitReqModule(), new Httpgrl.Modules.Limits.LimitConnModule(), new Httpgrl.Modules.Access.AccessModule(), new Httpgrl.Modules.Status.StatusModule(), new Httpgrl.Modules.Compression.CompressionModule(), new Httpgrl.Modules.Proxy.ProxyModule(), .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(), .. extra];
+    private static IModule[] Modules(IModule[] extra, Func<string, CancellationToken, Task<IPAddress[]>>? dns) =>
+        [new Httpgrl.Modules.Rewrite.RewriteModule(), new Httpgrl.Modules.Rewrite.MapModule(), new Httpgrl.Modules.Headers.HeadersModule(), new Httpgrl.Modules.Limits.LimitReqModule(), new Httpgrl.Modules.Limits.LimitConnModule(), new Httpgrl.Modules.Access.AccessModule(), new Httpgrl.Modules.Status.StatusModule(), new Httpgrl.Modules.Compression.CompressionModule(), new Httpgrl.Modules.Proxy.ProxyModule(dns), .. Httpgrl.Modules.StaticFiles.StaticFiles.Modules(), .. extra];
 
     /// <summary>Swap in a new configuration ({DIR} expands as in Start). Fresh first-party modules; test modules are reused.</summary>
     public Task<bool> Reload(string config) =>
-        Server.ReloadAsync(prev => ServerBuilder.BuildText(config.Replace("{DIR}", Dir, StringComparison.Ordinal), Dir, Modules(_extra), _log, prev));
+        Server.ReloadAsync(prev => ServerBuilder.BuildText(config.Replace("{DIR}", Dir, StringComparison.Ordinal), Dir, Modules(_extra, _dns), _log, prev));
 
     public string LogText()
     {
