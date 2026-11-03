@@ -16,6 +16,9 @@ internal sealed class OcspPki : IAsyncDisposable
     public readonly string LeafKeyPem;
     public int Requests => Volatile.Read(ref _requests);
     public TimeSpan Validity = TimeSpan.FromDays(3);
+    /// <summary>Sign with a responder certificate the CA issued (with or without the OCSP-signing EKU), included in the response.</summary>
+    public bool Delegated, DelegatedWithoutEku;
+    public string Url => $"http://127.0.0.1:{_responder.Port}/";
     private bool _badSignature;
     public bool BadSignature { get => Volatile.Read(ref _badSignature); set => Volatile.Write(ref _badSignature, value); }
     private bool _revoked, _fail;
@@ -84,18 +87,53 @@ internal sealed class OcspPki : IAsyncDisposable
         if (tbs.PeekTag().HasSameClassAndValue(new Asn1Tag(TagClass.ContextSpecific, 0, true))) tbs.ReadEncodedValue(); // version
         if (tbs.PeekTag().HasSameClassAndValue(new Asn1Tag(TagClass.ContextSpecific, 1, true))) tbs.ReadEncodedValue(); // requestorName
         var certId = tbs.ReadSequence().ReadSequence().ReadEncodedValue();
+        return BuildResponse(certId.Span);
+    }
 
+    /// <summary>A signed OCSP response for <see cref="Leaf"/> (SHA-1 CertID, as most clients and servers request).</summary>
+    public byte[] MakeResponse()
+    {
+        var w = new AsnWriter(AsnEncodingRules.DER);
+        using (w.PushSequence())
+        {
+            using (w.PushSequence()) { w.WriteObjectIdentifier("1.3.14.3.2.26"); w.WriteNull(); }
+            w.WriteOctetString(SHA1.HashData(Ca.SubjectName.RawData));
+            w.WriteOctetString(SHA1.HashData(Ca.PublicKey.EncodedKeyValue.RawData));
+            w.WriteInteger(Leaf.SerialNumberBytes.Span);
+        }
+        return BuildResponse(w.Encode());
+    }
+
+    private X509Certificate2? _delegate;
+
+    private X509Certificate2 Delegate()
+    {
+        if (_delegate is not null) return _delegate;
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var r = new CertificateRequest("CN=ocsp responder", key, HashAlgorithmName.SHA256);
+        r.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
+        if (!DelegatedWithoutEku) r.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new Oid("1.3.6.1.5.5.7.3.9") }, false));
+        var serial = RandomNumberGenerator.GetBytes(8);
+        serial[0] &= 0x7f;
+        using var cert = r.Create(Ca, DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(10), serial);
+        return _delegate = cert.CopyWithPrivateKey(key);
+    }
+
+    private byte[] BuildResponse(ReadOnlySpan<byte> certId)
+    {
         var now = DateTime.UtcNow;
+        bool delegated = Delegated || DelegatedWithoutEku;
+        var signerCert = delegated ? Delegate() : Ca;
         var w = new AsnWriter(AsnEncodingRules.DER);
         using (w.PushSequence()) // ResponseData
         {
             using (w.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 2, true))) // responderID byKey
-                w.WriteOctetString(SHA1.HashData(Ca.PublicKey.EncodedKeyValue.RawData));
+                w.WriteOctetString(SHA1.HashData(signerCert.PublicKey.EncodedKeyValue.RawData));
             w.WriteGeneralizedTime(now, omitFractionalSeconds: true);
             using (w.PushSequence()) // responses
             using (w.PushSequence()) // SingleResponse
             {
-                w.WriteEncodedValue(certId.Span);
+                w.WriteEncodedValue(certId);
                 if (Revoked)
                 {
                     using (w.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 1, true))) // revoked
@@ -108,7 +146,7 @@ internal sealed class OcspPki : IAsyncDisposable
             }
         }
         var tbsData = w.Encode();
-        using var caKey = BadSignature ? ECDsa.Create(ECCurve.NamedCurves.nistP256) : Ca.GetECDsaPrivateKey()!;
+        using var caKey = BadSignature ? ECDsa.Create(ECCurve.NamedCurves.nistP256) : signerCert.GetECDsaPrivateKey()!;
         var sig = caKey.SignData(tbsData, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence);
 
         var basic = new AsnWriter(AsnEncodingRules.DER);
@@ -117,6 +155,12 @@ internal sealed class OcspPki : IAsyncDisposable
             basic.WriteEncodedValue(tbsData);
             using (basic.PushSequence()) basic.WriteObjectIdentifier("1.2.840.10045.4.3.2"); // ecdsa-with-SHA256
             basic.WriteBitString(sig);
+            if (delegated)
+            {
+                using (basic.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0, true)))
+                using (basic.PushSequence())
+                    basic.WriteEncodedValue(signerCert.RawData);
+            }
         }
         var resp = new AsnWriter(AsnEncodingRules.DER);
         using (resp.PushSequence())

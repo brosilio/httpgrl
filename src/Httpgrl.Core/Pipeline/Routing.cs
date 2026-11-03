@@ -111,6 +111,7 @@ internal sealed class ServerRt
     public readonly string PrimaryName;
     public readonly SslServerAuthenticationOptions? Tls;
     public readonly ClientAuth? ClientAuth;
+    public readonly OcspStapler? Stapler;
 
     public ServerRt(IConfigScope scope)
     {
@@ -120,6 +121,7 @@ internal sealed class ServerRt
         PrimaryName = Array.Find(Names, n => !n.StartsWith('~') && !n.Contains('*')) ?? "";
         Tls = scope.Get<SslConf>().Options;
         ClientAuth = scope.Get<SslConf>().ClientAuth;
+        Stapler = scope.Get<SslConf>().Stapler;
     }
 
     public LocationRt Find(string path, out Match? match)

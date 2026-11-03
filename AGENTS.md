@@ -68,6 +68,18 @@ These are deliberate design decisions made by the project owner, not accidents t
   the `if` context: that recreates nginx's "if is evil". Conditional behaviour goes through `map` variables.
 - `add_header` merges across levels, and replaces same-named response headers. Both prevent silently losing security headers.
 
+## Depending on .NET internals (one place only)
+
+`src/Httpgrl.Core/Modules/StaplingAccess.cs` reaches into `SslStreamCertificateContext` with `UnsafeAccessor` so
+OCSP stapling is driven by us (the platform's fetcher has no backoff). It's the only such dependency, and it's
+deliberate:
+- It's AOT-safe (no reflection), and a native AOT binary embeds its runtime, so it can't break under a built
+  binary; it can only break when the SDK/runtime is upgraded.
+- On any runtime upgrade, read `SslStreamCertificateContext.Linux.cs` and `Interop.OpenSsl.cs` (dotnet/runtime, at
+  the matching tag) against the comment in `StaplingAccess.Create`, and make sure the `ssl_stapling` tests pass
+  under AOT. `StaplingAccess.SelfTest` turns a missing member into a config error, never a silent no-op.
+- Don't add more of these without the owner's agreement.
+
 ## Reload
 
 `SIGHUP` builds a complete new configuration (fresh module instances) and swaps it in only if *everything*

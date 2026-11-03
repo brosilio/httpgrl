@@ -31,12 +31,12 @@ internal static class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(),
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp" })
         {
             int iterations = name == "config" ? 3_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
@@ -368,6 +368,26 @@ internal static class Fuzz
             if (c != ContentCoding.Identity && !AcceptEncoding.Accepts(v, c)) throw new Finding($"chose {c} but it isn't acceptable");
             return c != ContentCoding.Identity;
         }, MaxLen: 1024);
+
+    /// <summary>OCSP responses (what a responder, or a man in the middle on its plain-HTTP path, sends us to staple).</summary>
+    private static Target OcspTarget()
+    {
+        var pki = new OcspPki("fuzz.test");
+        var seeds = new List<byte[]> { pki.MakeResponse() };
+        pki.Revoked = true; seeds.Add(pki.MakeResponse());
+        pki.Revoked = false; pki.Delegated = true; seeds.Add(pki.MakeResponse());
+        var leaf = pki.Leaf;
+        var issuer = pki.Ca;
+        return new Target("ocsp", seeds.ToArray(), B("\x30", "\x0a\x01\x00", "\x0a\x01\x06", "\xa0", "\xa1", "\xa2", "\x80\x00", "\x81", "\x82\x00", "\x04", "\x06", "\x18", "\x02", "\x01\x01\xff", "\x84\xff\xff\xff\xff"), data =>
+        {
+            var now = DateTime.UtcNow;
+            var v = Httpgrl.Core.Modules.Ocsp.Verify(data, leaf, issuer, now, out _);
+            if (v is null) return false;
+            if (v.Status == Httpgrl.Core.Modules.OcspCertStatus.Unknown) throw new Finding("accepted status unknown");
+            if (v.Expires <= now) throw new Finding("accepted an expired response");
+            return true;
+        }, MaxLen: 8192);
+    }
 
     /// <summary>CRLs (DER). Only CryptographicException is a legitimate rejection.</summary>
     private static Target CrlTarget()

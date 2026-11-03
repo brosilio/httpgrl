@@ -251,6 +251,7 @@ internal sealed class Http1Session
         if (srv.Tls is null) srv = self._hosts.Default.Tls is not null ? self._hosts.Default : self._hosts.Servers.Find(s => s.Tls is not null)
             ?? throw new AuthenticationException("no certificate");
         self._tlsServer = srv;
+        srv.Stapler?.OnHandshake();
         return ValueTask.FromResult(srv.Tls!);
     }
 
