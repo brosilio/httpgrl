@@ -11,6 +11,8 @@ public sealed class SslConf : ScopeConfig<SslConf>
     public SourceLocation CertificateSource;
     public SslProtocols? Protocols;
     public bool? Stapling;
+    /// <summary>ssl_reject_handshake: refuse any TLS handshake that routes to this server (no certificate needed).</summary>
+    public bool? RejectHandshake;
     public string? StaplingFile, StaplingResponder;
     public SourceLocation StaplingSource;
     /// <summary>Built in Configure when stapling is on and possible.</summary>
@@ -31,6 +33,7 @@ public sealed class SslConf : ScopeConfig<SslConf>
         if (Certificate is null) { Certificate = p.Certificate; CertificateKey = p.CertificateKey; CertificateSource = p.CertificateSource; }
         Protocols ??= p.Protocols;
         Stapling ??= p.Stapling;
+        RejectHandshake ??= p.RejectHandshake;
         StaplingFile ??= p.StaplingFile;
         StaplingResponder ??= p.StaplingResponder;
         Verify ??= p.Verify;
@@ -151,6 +154,7 @@ internal sealed class SslModule : IModule, IDisposable
         r.AddDirective(new() { Name = "ssl_certificate", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => { var c = i.Conf<SslConf>(); c.Certificate = i.Args[0]; c.CertificateSource = i.Source; } });
         r.AddDirective(new() { Name = "ssl_certificate_key", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<SslConf>().CertificateKey = i.Args[0] });
         r.AddDirective(new() { Name = "ssl_protocols", Contexts = ctx, MinArgs = 1, MaxArgs = -1, Handler = Protocols });
+        r.AddDirective(new() { Name = "ssl_reject_handshake", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<SslConf>().RejectHandshake = i.Flag(0) });
         r.AddDirective(new() { Name = "ssl_stapling", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => { var c = i.Conf<SslConf>(); c.Stapling = i.Flag(0); c.StaplingSource = i.Source; } });
         r.AddDirective(new() { Name = "ssl_stapling_file", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<SslConf>().StaplingFile = i.Args[0] });
         r.AddDirective(new()
@@ -227,6 +231,7 @@ internal sealed class SslModule : IModule, IDisposable
             var ssl = server.Get<SslConf>();
             bool needs = sc.Listens.Exists(l => l.Ssl);
             if (!needs) continue;
+            if (ssl.RejectHandshake == true) continue; // nothing to present: every handshake that routes here is refused
             if (ssl.Certificate is null || ssl.CertificateKey is null)
                 throw new ConfigException("no \"ssl_certificate\"/\"ssl_certificate_key\" defined for a server with \"listen ... ssl\"", server.Source);
             var root = Path.GetDirectoryName(server.Source.File) ?? "";

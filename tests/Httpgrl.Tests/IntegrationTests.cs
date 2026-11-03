@@ -485,6 +485,49 @@ internal static class IntegrationTests
             T.Contains("if_not_owner", T.Throws<ConfigException>(() => TestServer.Start("http { server { listen 127.0.0.1:0; disable_symlinks if_not_owner; } }")).Message);
         });
 
+        T.Add("ssl_reject_handshake: no SNI or an unknown name gets no certificate; Host aimed at the default is refused", async () =>
+        {
+            const string Conf = """
+                http {
+                  server { listen 127.0.0.1:0 ssl default_server; ssl_reject_handshake on; error_page 421 =444; }
+                  server { listen 127.0.0.1:0 ssl; server_name real.test; ssl_certificate {DIR}/r.crt; ssl_certificate_key {DIR}/r.key; return 200 "real"; }
+                }
+                """;
+            await using var s = TestServer.Start(Conf, d => WriteCert(d, "r", "real.test"));
+            async Task<(bool Handshake, string? Subject, string Response)> Try(string sni, string host)
+            {
+                using var c = await Connect(s.Port);
+                await using var ssl = new SslStream(new NetworkStream(c, ownsSocket: false));
+                X509Certificate? seen = null;
+                try
+                {
+                    await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = sni, RemoteCertificateValidationCallback = (_, cert, _, _) => { seen = cert; return true; } });
+                }
+                catch (Exception e) when (e is System.Security.Authentication.AuthenticationException or IOException) { return (false, seen?.Subject, ""); }
+                await ssl.WriteAsync(Encoding.ASCII.GetBytes($"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"));
+                try { return (true, seen?.Subject, await new StreamReader(ssl, Encoding.ASCII).ReadToEndAsync()); }
+                catch (IOException) { return (true, seen?.Subject, ""); }
+            }
+            var ok = await Try("real.test", "real.test");
+            T.True(ok.Handshake);
+            T.Eq("real", Body(ok.Response));
+            var noSni = await Try("", "127.0.0.1");              // what a client connecting by IP sends: no SNI at all
+            T.True(!noSni.Handshake);
+            T.Eq(null, noSni.Subject);                           // no certificate, so no names, leak out
+            T.True(!(await Try("other.test", "other.test")).Handshake);
+            var aimed = await Try("real.test", "127.0.0.1");     // a real handshake, then Host aimed at the IP
+            T.True(aimed.Handshake);
+            T.Eq("", aimed.Response);                            // 421, dropped by error_page 421 =444
+
+            // Without error_page: a plain 421 rather than whatever the default server's root would hold.
+            await using var s2 = TestServer.Start(Conf.Replace(" error_page 421 =444;", ""), d => WriteCert(d, "r", "real.test"));
+            using var c2 = await Connect(s2.Port);
+            await using var ssl2 = new SslStream(new NetworkStream(c2, ownsSocket: false));
+            await ssl2.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = "real.test", RemoteCertificateValidationCallback = (_, _, _, _) => true });
+            await ssl2.WriteAsync("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"u8.ToArray());
+            T.Eq(421, Status(await new StreamReader(ssl2, Encoding.ASCII).ReadToEndAsync()));
+        });
+
         T.Add("tls: handshake, SNI certificate selection, HTTP over TLS", async () =>
         {
             await using var s = TestServer.Start("""
@@ -534,12 +577,14 @@ internal static class IntegrationTests
         });
     }
 
-    private static void WriteCert(string dir, string name)
+    private static void WriteCert(string dir, string name) => WriteCert(dir, name, name + ".test");
+
+    private static void WriteCert(string dir, string name, string dnsName)
     {
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        var req = new CertificateRequest("CN=" + name + ".test", key, HashAlgorithmName.SHA256);
+        var req = new CertificateRequest("CN=" + dnsName, key, HashAlgorithmName.SHA256);
         var san = new SubjectAlternativeNameBuilder();
-        san.AddDnsName(name + ".test");
+        san.AddDnsName(dnsName);
         req.CertificateExtensions.Add(san.Build());
         using var cert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
         File.WriteAllText(Path.Combine(dir, name + ".crt"), cert.ExportCertificatePem());

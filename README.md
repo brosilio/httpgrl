@@ -116,6 +116,7 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `ssl_handshake_timeout` | http, server | `10s` | |
 | `ssl_certificate` / `ssl_certificate_key` | http, server | | PEM. The chain is read from the cert file. Selected by SNI. |
 | `ssl_protocols` | http, server | `TLSv1.2 TLSv1.3` | Older protocols are a config error. |
+| `ssl_reject_handshake on\|off;` | http, server | `off` | Refuse every TLS handshake that routes to this server, before any certificate is sent. Typically on the `default_server`: then clients without SNI (anyone connecting by IP) and with names no other server claims get nothing, so a scan of the address learns no domains. Such a server needs no certificate. Requests that still reach it, after a handshake for a real name followed by `Host: <ip>`, get **421**; add `error_page 421 =444;` to drop them silently. |
 | `ssl_verify_client off\|on\|optional\|optional_no_ca;` | http, server | `off` | Client certificates (mTLS). `on`: required. `optional`: a certificate is not required, but one that's presented must verify. `optional_no_ca`: also accepts an unknown issuer (the verdict is in `$ssl_client_verify`); expired or wrong-purpose certificates still fail. A failed check fails the TLS handshake (nginx answers 400 instead). TLS session resumption is disabled on these servers, so every connection gets the full check. |
 | `ssl_client_certificate file;` | http, server | | PEM CA bundle that client certificates must chain to. It's the *only* trust anchor: system roots are never used. Its CA names are sent to clients (not on Windows). Required for `on`/`optional`. |
 | `ssl_verify_depth n;` | http, server | `1` | Maximum chain length above the client certificate: `1` means issued directly by a CA in the bundle. Raise it for intermediates (the client must send them). |
@@ -219,6 +220,13 @@ gzip_types text/plain text/css application/json application/javascript image/svg
 **BREACH:** compressing a response that reflects attacker-controlled input next to a secret (a CSRF token, say)
 over TLS lets an attacker who can observe response sizes recover the secret. That's why compression is off by
 default. Don't enable it for such responses, or mask the secrets per response.
+
+Dropping traffic aimed at the server's address rather than a name, over HTTP and HTTPS:
+
+```nginx
+server { listen 80 default_server;  return 444; }                                       # Host: <ip>, or unknown names
+server { listen 443 ssl default_server; ssl_reject_handshake on; error_page 421 =444; }  # no SNI / unknown SNI / Host: <ip>
+```
 
 **Choosing a key:** `$remote_net` is the client's IPv4 address, or its IPv6 **/64**. A single IPv6 client typically
 controls a whole /64 and can rotate through 2^64 addresses, so `$binary_remote_addr` (also available) lets it

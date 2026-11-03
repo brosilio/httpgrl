@@ -155,6 +155,10 @@ internal sealed class Http1Session
                 // carry it past a client-certificate policy it wasn't checked against (cf. nginx's 421).
                 if (reject == 0 && _tlsServer is not null && !ReferenceEquals(ctx.ServerRt.ClientAuth, _tlsServer.ClientAuth))
                     reject = 421;
+                // A server that refuses every handshake presents nothing over TLS, so it serves nothing over TLS either:
+                // a Host naming it (e.g. the IP, after a handshake for a real name) is misdirected. error_page 421 =444 drops it.
+                if (reject == 0 && _tlsServer is not null && ctx.ServerRt.RejectHandshake)
+                    reject = 421;
                 ctx.SelectLocation(ctx.ServerRt.Root, null);
                 ctx.BodyReader.Reset(transport, reject == 0 ? req.ContentLengthValue : -1, reject == 0 && req.ChunkedValue);
                 if (req.ExpectContinue) ctx.BodyReader.SendContinue = SendContinueAsync;
@@ -282,6 +286,9 @@ internal sealed class Http1Session
     {
         var self = (Http1Session)state!;
         var srv = self._hosts.Resolve(TlsHost(hello.ServerName));
+        // ssl_reject_handshake: SNI (or its absence) routes to a server that presents nothing. Refuse before any
+        // certificate is sent, so a scan of the IP learns no names (no fallback to another server's certificate).
+        if (srv.RejectHandshake) throw new AuthenticationException("handshake rejected (ssl_reject_handshake)");
         if (srv.Tls is null) srv = self._hosts.Default.Tls is not null ? self._hosts.Default : self._hosts.Servers.Find(s => s.Tls is not null)
             ?? throw new AuthenticationException("no certificate");
         self._tlsServer = srv;

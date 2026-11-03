@@ -112,6 +112,7 @@ internal sealed class ServerRt
     public readonly SslServerAuthenticationOptions? Tls;
     public readonly ClientAuth? ClientAuth;
     public readonly OcspStapler? Stapler;
+    public readonly bool RejectHandshake;
 
     public ServerRt(IConfigScope scope)
     {
@@ -122,6 +123,7 @@ internal sealed class ServerRt
         Tls = scope.Get<SslConf>().Options;
         ClientAuth = scope.Get<SslConf>().ClientAuth;
         Stapler = scope.Get<SslConf>().Stapler;
+        RejectHandshake = scope.Get<SslConf>().RejectHandshake == true;
     }
 
     public LocationRt Find(string path, out Match? match)
