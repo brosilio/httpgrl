@@ -66,12 +66,14 @@ internal sealed class ConnectionManager : IDisposable
             else writing++;
         }
         long accepted = Interlocked.Read(ref _accepted);
+        var gc = GC.GetGCMemoryInfo();
         return new ServerStats(Active, accepted, accepted - Interlocked.Read(ref _refused), Interlocked.Read(ref _requests),
             reading, writing, waiting,
             Interlocked.Read(ref _byClass[1]), Interlocked.Read(ref _byClass[2]), Interlocked.Read(ref _byClass[3]),
             Interlocked.Read(ref _byClass[4]), Interlocked.Read(ref _byClass[5]),
             Interlocked.Read(ref _reloads), DroppedLogLines?.Invoke() ?? 0,
-            TimeSpan.FromMilliseconds(Environment.TickCount64 - _startedAt), Http.ServerInfo.Version);
+            TimeSpan.FromMilliseconds(Environment.TickCount64 - _startedAt), Http.ServerInfo.Version,
+            Environment.WorkingSet, gc.HeapSizeBytes, gc.TotalCommittedBytes, GC.CollectionCount(2));
     }
     public int PerClientMax { get => _perIpMax; set => _perIpMax = value; }
     public bool Stopping => _stopping;

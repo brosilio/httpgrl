@@ -27,15 +27,17 @@ internal static class Soak
         if (!OperatingSystem.IsLinux()) { Console.WriteLine("soak: Linux only (reads /proc)"); return 2; }
         var binary = Path.GetFullPath(args.Length > 1 ? args[1] : "artifacts/linux-x64/httpgrl");
         int seconds = args.Length > 2 ? int.Parse(args[2]) : 60;
-        return RunAsync(binary, seconds).GetAwaiter().GetResult();
+        bool reload = !args.Contains("--no-reload");
+        return RunAsync(binary, seconds, reload).GetAwaiter().GetResult();
     }
 
-    private static async Task<int> RunAsync(string binary, int seconds)
+    private static async Task<int> RunAsync(string binary, int seconds, bool reload)
     {
         var dir = Path.Combine(Path.GetTempPath(), "httpgrl-soak-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(Path.Combine(dir, "www"));
         File.WriteAllText(Path.Combine(dir, "www", "small.txt"), "hello");
         File.WriteAllBytes(Path.Combine(dir, "www", "big.bin"), new byte[1 << 20]);
+        File.WriteAllText(Path.Combine(dir, "www", "text.txt"), string.Concat(Enumerable.Range(0, 20_000).Select(i => $"row {i} {i * 7919 % 10007}\n")));
         File.WriteAllText(Path.Combine(dir, "www", "limited"), "limited");
 
         await using var up = FakeUpstream.Echo();
@@ -47,6 +49,7 @@ internal static class Soak
             events { worker_connections 4096; connections_per_client 4096; }
             http {
               access_log off;
+              gzip on; brotli on; gzip_types *;
               limit_req_zone $remote_net zone=lim:1m rate=50r/s;
               limit_conn_zone $remote_net zone=conn:1m;
               upstream up { server 127.0.0.1:{{up.Port}}; keepalive 32; }
@@ -59,6 +62,7 @@ internal static class Soak
                 location /proxy/ { proxy_pass http://up/; }
                 location /ws { proxy_pass http://127.0.0.1:{{wsUp.Port}}; proxy_read_timeout 10s; }
                 location = /limited { limit_req zone=lim burst=20 nodelay; }
+                location = /status.json { stub_status json; allow 127.0.0.1; deny all; }
                 location /set { set $v "$arg_x"; if ($v ~ "^(\d+)$") { return 200 "n=$1"; } return 200 "s=$v"; }
               }
             }
@@ -83,7 +87,7 @@ internal static class Soak
         int pid = server.Id;
         Console.WriteLine($"soak: pid {pid}, port {port}, {seconds}s");
 
-        using var http = new HttpClient(new SocketsHttpHandler { MaxConnectionsPerServer = 64, PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30) })
+        using var http = new HttpClient(new SocketsHttpHandler { AutomaticDecompression = System.Net.DecompressionMethods.All, MaxConnectionsPerServer = 64, PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30) })
         { BaseAddress = new Uri($"http://127.0.0.1:{port}/"), Timeout = TimeSpan.FromSeconds(15) };
         for (int k = 0; k < 50 && !await Up(http); k++) await Task.Delay(100);
 
@@ -100,14 +104,15 @@ internal static class Soak
         Console.WriteLine($"soak: baseline rss {rss0 / 1024} MB, fds {fd0}, threads {th0}");
         long peakRss = rss0;
         var sw = Stopwatch.StartNew();
-        int reloads = 0;
+        int ticks = 0, reloads = 0;
         while (sw.Elapsed.TotalSeconds < seconds)
         {
             await Task.Delay(2000);
-            if (++reloads % 2 == 0) Process.Start("kill", ["-HUP", pid.ToString()])!.WaitForExit();
+            if (++ticks % 2 == 0 && reload) { Process.Start("kill", ["-HUP", pid.ToString()])!.WaitForExit(); reloads++; }
             var (rss, fd, th) = Sample(pid);
             peakRss = Math.Max(peakRss, rss);
-            Console.WriteLine($"soak: t={sw.Elapsed.TotalSeconds:F0}s rss {rss / 1024} MB fds {fd} threads {th} ok {stats.Ok} limited {stats.Limited} ws {stats.Ws} abuse {stats.Abuse} failed {stats.Failed}");
+            var mem = await Memory(http);
+            Console.WriteLine($"soak: t={sw.Elapsed.TotalSeconds:F0}s rss {rss / 1024} MB {mem} fds {fd} threads {th} ok {stats.Ok} limited {stats.Limited} ws {stats.Ws} abuse {stats.Abuse} failed {stats.Failed}");
         }
         stop.Cancel();
         try { await Task.WhenAll(workers); } catch (OperationCanceledException) { }
@@ -131,7 +136,7 @@ internal static class Soak
         long total = stats.Ok + stats.Limited + stats.Failed;
         if (stats.Failed > total / 1000 + 10) problems.Add($"{stats.Failed} of {total} requests failed");
 
-        Console.WriteLine($"soak: done. {total} requests ({stats.Ok} ok, {stats.Limited} rate-limited, {stats.Failed} failed), {stats.Ws} websocket sessions, {stats.Abuse} abusive connections, {reloads / 2} reloads");
+        Console.WriteLine($"soak: done. {total} requests ({stats.Ok} ok, {stats.Limited} rate-limited, {stats.Failed} failed), {stats.Ws} websocket sessions, {stats.Abuse} abusive connections, {reloads} reloads");
         Console.WriteLine($"soak: rss {rss0 / 1024} -> peak {peakRss / 1024} -> {rssEnd / 1024} MB; fds {fd0} -> {fdEnd}; threads {th0} -> {thEnd}");
         foreach (var (what, n) in stats.Errors.OrderByDescending(e => e.Value).Take(8)) Console.WriteLine($"  failure: {what} x{n}");
         lock (log) if (log.Length > 0) Console.WriteLine(log.ToString());
@@ -144,7 +149,7 @@ internal static class Soak
     private static async Task Traffic(HttpClient http, Stats s, int id, CancellationToken stop)
     {
         var r = new Random(id);
-        string[] paths = ["small.txt", "small.txt", "small.txt", "big.bin", "proxy/x?id=" + id, "proxy/y", "limited", "set?x=42", "set?x=abc", "missing"];
+        string[] paths = ["small.txt", "small.txt", "text.txt", "big.bin", "proxy/x?id=" + id, "proxy/y", "limited", "set?x=42", "set?x=abc", "missing"];
         while (!stop.IsCancellationRequested)
         {
             var path = paths[r.Next(paths.Length)];
@@ -215,7 +220,7 @@ internal static class Soak
                         await c.SendAsync(Encoding.ASCII.GetBytes("GET / HTTP/1.1\r\nHost: t\r\nX: " + new string('a', 100_000) + "\r\n\r\n"), SocketFlags.None, stop);
                         break;
                     case 3: // reset mid-download
-                        await c.SendAsync("GET /big.bin HTTP/1.1\r\nHost: t\r\n\r\n"u8.ToArray(), SocketFlags.None, stop);
+                        await c.SendAsync((r.Next(2) == 0 ? "GET /big.bin HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n"u8 : "GET /text.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: br\r\n\r\n"u8).ToArray(), SocketFlags.None, stop);
                         await c.ReceiveAsync(new byte[1024], SocketFlags.None, stop);
                         c.LingerState = new LingerOption(true, 0);
                         break;
@@ -229,6 +234,18 @@ internal static class Soak
             catch (OperationCanceledException) when (stop.IsCancellationRequested) { return; }
             catch (SocketException) { Interlocked.Increment(ref s.Abuse); } // the server hanging up on abuse is the point
         }
+    }
+
+    /// <summary>Managed heap vs GC-committed memory from the server's own status endpoint (to tell managed from native growth).</summary>
+    private static async Task<string> Memory(HttpClient http)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(await http.GetStringAsync("status.json"));
+            var m = doc.RootElement.GetProperty("memory");
+            return $"(heap {m.GetProperty("managed_heap_bytes").GetInt64() >> 20} MB, gc-committed {m.GetProperty("gc_committed_bytes").GetInt64() >> 20} MB, gen2 {m.GetProperty("gen2_collections").GetInt64()})";
+        }
+        catch (Exception e) when (e is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException) { return "(heap ?)"; }
     }
 
     private static async Task<bool> Up(HttpClient http, int? port = null)

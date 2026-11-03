@@ -100,6 +100,10 @@ public sealed class StatusModule : IModule
         Metric("httpgrl_log_lines_dropped_total", "counter", "Log lines dropped because stdout couldn't keep up.", (null, s.DroppedLogLines));
         Metric("httpgrl_uptime_seconds", "gauge", "Seconds since the server started.", (null, Math.Round(s.Uptime.TotalSeconds, 3)));
         Metric("httpgrl_build_info", "gauge", "Build information.", ($"version=\"{s.Version}\"", 1));
+        Metric("httpgrl_memory_resident_bytes", "gauge", "Process working set (RSS).", (null, s.WorkingSetBytes));
+        Metric("httpgrl_memory_managed_heap_bytes", "gauge", "Managed heap size after the last GC.", (null, s.ManagedHeapBytes));
+        Metric("httpgrl_memory_gc_committed_bytes", "gauge", "Memory committed by the GC.", (null, s.GcCommittedBytes));
+        Metric("httpgrl_gc_gen2_collections_total", "counter", "Full (gen 2) garbage collections.", (null, s.Gen2Collections));
         return Encoding.UTF8.GetBytes(b.ToString());
     }
 
@@ -129,6 +133,12 @@ public sealed class StatusModule : IModule
             w.WriteEndObject();
             w.WriteNumber("reloads", s.Reloads);
             w.WriteNumber("log_lines_dropped", s.DroppedLogLines);
+            w.WriteStartObject("memory");
+            w.WriteNumber("resident_bytes", s.WorkingSetBytes);
+            w.WriteNumber("managed_heap_bytes", s.ManagedHeapBytes);
+            w.WriteNumber("gc_committed_bytes", s.GcCommittedBytes);
+            w.WriteNumber("gen2_collections", s.Gen2Collections);
+            w.WriteEndObject();
             w.WriteEndObject();
         }
         return ms.ToArray();

@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -23,6 +24,9 @@ public sealed class ProxyConf : ScopeConfig<ProxyConf>
     public string? SslName;
     public X509Certificate2Collection? SslTrusted;
     public SslProtocols? SslProtocols;
+    /// <summary>proxy_redirect specs as written (null: "default"; empty: "off"). A level with any replaces the inherited list.</summary>
+    internal List<RedirectSpec>? Redirects;
+    internal RedirectRule[] RedirectRules = [];
 
     public int Version => HttpVersion ?? 11;
     public int ConnectTimeoutMs => ConnectTimeout ?? 10_000;
@@ -49,6 +53,7 @@ public sealed class ProxyConf : ScopeConfig<ProxyConf>
         SslName ??= p.SslName;
         SslTrusted ??= p.SslTrusted;
         SslProtocols ??= p.SslProtocols;
+        Redirects ??= p.Redirects;
     }
 }
 
@@ -98,6 +103,7 @@ public sealed class ProxyModule : IModule, IDisposable
                 (c.SetHeaders ??= new()).Add((name, i.Compile(i.Args[1])));
             },
         });
+        r.AddDirective(new() { Name = "proxy_redirect", Contexts = http, MinArgs = 1, MaxArgs = 2, Repeatable = true, Handler = Redirect });
         r.AddDirective(new() { Name = "proxy_hide_header", Contexts = http, MinArgs = 1, MaxArgs = 1, Repeatable = true, Handler = i => (i.Conf<ProxyConf>().HideHeaders ??= new()).Add(i.Args[0]) });
         r.AddDirective(new()
         {
@@ -190,6 +196,32 @@ public sealed class ProxyModule : IModule, IDisposable
         h.Handler = ctx => ProxyHandler.HandleAsync(ctx, c);
     }
 
+    private static void Redirect(DirectiveInvocation i)
+    {
+        var c = i.Conf<ProxyConf>();
+        var list = c.Redirects ??= new();
+        if (i.Args is ["off"] or ["default"])
+        {
+            bool off = i.Args[0] == "off";
+            if (off ? list.Count > 0 : list.Exists(s => s.Off)) throw i.Error("\"off\" can't be combined with other proxy_redirect rules");
+            list.Add(new RedirectSpec(off, !off, null, null, null));
+            return;
+        }
+        if (i.Args.Length != 2) throw i.Error("expected \"proxy_redirect redirect replacement;\", \"default\" or \"off\"");
+        if (list.Exists(s => s.Off)) throw i.Error("\"off\" can't be combined with other proxy_redirect rules");
+        var pattern = i.Args[0];
+        Regex? re = null;
+        if (pattern.StartsWith('~'))
+        {
+            bool ci = pattern.StartsWith("~*", StringComparison.Ordinal);
+            var p = pattern[(ci ? 2 : 1)..];
+            var opts = RegexOptions.CultureInvariant | (ci ? RegexOptions.IgnoreCase : RegexOptions.None);
+            try { re = new Regex(p, opts | RegexOptions.NonBacktracking); }
+            catch (NotSupportedException) { re = new Regex(p, opts, TimeSpan.FromMilliseconds(50)); }
+        }
+        list.Add(new RedirectSpec(false, false, re is null ? pattern : null, re, i.Compile(i.Args[1])));
+    }
+
     public void Configure(IModuleSetup setup)
     {
         var groups = new Dictionary<string, UpstreamGroup>(StringComparer.OrdinalIgnoreCase);
@@ -210,12 +242,42 @@ public sealed class ProxyModule : IModule, IDisposable
         {
             if (!loc.TryGet<ProxyConf>(out var pc) || pc.Pass is null) continue;
             pc.Target = BuildTarget(pc, groups, implicitGroups);
+            pc.RedirectRules = RedirectRules(pc, setup);
         }
         _groups.AddRange(groups.Values);
         _groups.AddRange(implicitGroups.Values);
     }
 
     private readonly List<UpstreamGroup> _groups = new();
+
+    /// <summary>
+    /// "default" maps the proxy_pass URL to the location's prefix (nginx): with
+    /// <c>location /one/ { proxy_pass http://app:8080/two/; }</c>, <c>http://app:8080/two/x</c> becomes <c>/one/x</c>.
+    /// It only applies to prefix and exact locations; a regex or named location has no prefix to map to.
+    /// </summary>
+    private static RedirectRule[] RedirectRules(ProxyConf c, IModuleSetup setup)
+    {
+        var specs = c.Redirects ?? [new RedirectSpec(false, true, null, null, null)];
+        var rules = new List<RedirectRule>();
+        foreach (var s in specs)
+        {
+            if (s.Off) return [];
+            if (!s.Default) { rules.Add(new RedirectRule(s.Prefix, s.Regex, s.Replacement!)); continue; }
+            var args = c.LocationArgs;
+            string? prefix = args switch
+            {
+                [var p] when !p.StartsWith('@') => p,
+                ["^~" or "=", var p] => p,
+                _ => null,
+            };
+            if (prefix is null) continue;
+            var t = c.Target!;
+            var from = c.Pass!;
+            if (t.UriPart is null) { from += "/"; prefix = "/"; }
+            rules.Add(new RedirectRule(from, null, new ComplexValue(prefix, [new ComplexValue.Part(prefix, null)])));
+        }
+        return rules.ToArray();
+    }
 
     /// <summary>The configuration was replaced (reload) and its last connection is gone: close pooled upstream connections.</summary>
     public void Dispose()
@@ -369,5 +431,8 @@ public sealed class ProxyModule : IModule, IDisposable
         return Array.ConvertAll(addrs, a => (EndPoint)new IPEndPoint(a, port));
     }
 }
+
+internal sealed record RedirectSpec(bool Off, bool Default, string? Prefix, Regex? Regex, ComplexValue? Replacement);
+internal sealed record RedirectRule(string? Prefix, Regex? Regex, ComplexValue Replacement);
 
 internal sealed record ProxyTarget(UpstreamGroup Group, bool Tls, string HostHeader, int Port, string? UriPart, string? LocationPrefix, SslClientAuthenticationOptions? Ssl);

@@ -152,7 +152,8 @@ public readonly record struct ServerStats(
     long Active, long Accepted, long Handled, long Requests,
     int Reading, int Writing, int Waiting,
     long Responses1xx, long Responses2xx, long Responses3xx, long Responses4xx, long Responses5xx,
-    long Reloads, long DroppedLogLines, TimeSpan Uptime, string Version);
+    long Reloads, long DroppedLogLines, TimeSpan Uptime, string Version,
+    long WorkingSetBytes, long ManagedHeapBytes, long GcCommittedBytes, long Gen2Collections);
 
 public sealed class ConnectionInfo(long id, EndPoint? remote, EndPoint? local, bool isTls)
 {

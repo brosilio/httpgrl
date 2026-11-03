@@ -21,6 +21,36 @@ internal static class ProxyTests
 
     public static void Register()
     {
+        T.Add("proxy_redirect: default maps the upstream URL back to the location; custom, regex and off; Refresh too", async () =>
+        {
+            int p = 0;
+            await using var up = new FakeUpstream(async (st, rd) =>
+            {
+                var (head, _) = await rd.ReadRequestAsync();
+                var path = head.Split(' ')[1];
+                // The app redirects to itself, as apps behind a proxy do.
+                await st.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{p}{path}next\r\nRefresh: 3; url=http://127.0.0.1:{p}{path}r\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+            });
+            p = up.Port;
+            await using var s = TestServer.Start(Conf($$"""
+                location /one/ { proxy_pass http://127.0.0.1:{{p}}/two/; }
+                location /plain/ { proxy_pass http://127.0.0.1:{{p}}; }
+                location /custom/ { proxy_pass http://127.0.0.1:{{p}}/; proxy_redirect http://127.0.0.1:{{p}}/ https://$host/custom/; }
+                location /re/ { proxy_pass http://127.0.0.1:{{p}}/; proxy_redirect ~^http://[^/]+/(.*)$ /moved/$1; }
+                location /off/ { proxy_pass http://127.0.0.1:{{p}}/; proxy_redirect off; }
+                location ~ ^/rx/ { proxy_pass http://127.0.0.1:{{p}}; }
+                """));
+            var one = await s.Raw(Get("/one/a"));
+            T.Eq("/one/anext", Header(one, "Location"));
+            T.Eq("3; url=/one/ar", Header(one, "Refresh"));
+            T.Eq("/plain/anext", Header(await s.Raw(Get("/plain/a")), "Location"));
+            T.Eq("https://front.test/custom/anext", Header(await s.Raw(Get("/custom/a")), "Location"));
+            T.Eq("/moved/anext", Header(await s.Raw(Get("/re/a")), "Location"));
+            T.Eq($"http://127.0.0.1:{p}/anext", Header(await s.Raw(Get("/off/a")), "Location"));
+            T.Eq($"http://127.0.0.1:{p}/rx/anext", Header(await s.Raw(Get("/rx/a")), "Location")); // regex location: no default mapping
+            T.Contains("can't be combined", T.Throws<ConfigException>(() => TestServer.Start(Conf($"location / {{ proxy_pass http://127.0.0.1:{p}; proxy_redirect off; proxy_redirect /a /b; }}"))).Message);
+        });
+
         T.Add("proxy: basic pass-through to a real upstream (httpgrl static)", async () =>
         {
             await using var origin = TestServer.Start("http { server { listen 127.0.0.1:0; root {DIR}; } }",

@@ -295,7 +295,7 @@ internal static class ProxyHandler
                 return HandlerResult.WithStatus(502);
             }
             r.Status = 101;
-            CopyHeaders(up, r.Headers, hidden);
+            CopyHeaders(ctx, conf, up, r.Headers, hidden);
             r.Headers.Set("Connection", "upgrade");
             r.Headers.Set("Upgrade", up.Upgrade ?? ctx.Request.Headers.Get("Upgrade")!);
             var client = await ctx.UpgradeAsync(conf.ReadTimeoutMs).ConfigureAwait(false);
@@ -311,7 +311,7 @@ internal static class ProxyHandler
         }
 
         r.Status = up.Status;
-        CopyHeaders(up, r.Headers, hidden);
+        CopyHeaders(ctx, conf, up, r.Headers, hidden);
         if (up.ContentLength >= 0 && up.Framing is BodyFraming.Length or BodyFraming.None) r.ContentLength = up.ContentLength;
 
         try
@@ -343,14 +343,45 @@ internal static class ProxyHandler
         return HandlerResult.Done;
     }
 
-    private static void CopyHeaders(UpstreamResponse up, HeaderCollection into, List<string>? hidden)
+    private static void CopyHeaders(HttpContext ctx, ProxyConf conf, UpstreamResponse up, HeaderCollection into, List<string>? hidden)
     {
+        var rules = conf.RedirectRules;
         foreach (var (name, value) in up.Headers)
         {
             if (IsHopByHop(name) || up.IsConnectionListed(name)) continue;
             if (hidden is not null && hidden.Exists(x => x.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
-            into.Add(name, value);
+            var v = value;
+            if (rules.Length > 0)
+            {
+                if (name.Equals("Location", StringComparison.OrdinalIgnoreCase)) v = RewriteRedirect(ctx, rules, value);
+                else if (name.Equals("Refresh", StringComparison.OrdinalIgnoreCase))
+                {
+                    // "5; url=http://...": only the URL part is a redirect.
+                    int u = value.IndexOf("url=", StringComparison.OrdinalIgnoreCase);
+                    if (u >= 0) v = value[..(u + 4)] + RewriteRedirect(ctx, rules, value[(u + 4)..]);
+                }
+            }
+            try { into.Add(name, v); }
+            catch (ArgumentException) { ctx.Log.Warn("proxy_redirect produced an invalid header value; dropped", new LogField("header", name)); }
         }
+    }
+
+    /// <summary>proxy_redirect: the first rule that matches wins. A prefix rule replaces the prefix; a regex rule the whole value.</summary>
+    internal static string RewriteRedirect(HttpContext ctx, RedirectRule[] rules, string value)
+    {
+        foreach (var rule in rules)
+        {
+            if (rule.Prefix is { } p)
+            {
+                if (value.StartsWith(p, StringComparison.OrdinalIgnoreCase)) return rule.Replacement.Evaluate(ctx) + value[p.Length..];
+                continue;
+            }
+            var m = rule.Regex!.Match(value);
+            if (!m.Success) continue;
+            ctx.SetCaptures(m);
+            return rule.Replacement.Evaluate(ctx);
+        }
+        return value;
     }
 
     /// <summary>Read more from upstream, flushing what the client already has first (we're about to block).</summary>

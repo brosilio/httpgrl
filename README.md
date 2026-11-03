@@ -186,7 +186,7 @@ configuration keep counting against `limit_conn`.
 | Directive | Context | Default | Notes |
 |---|---|---|---|
 | `allow address\|CIDR\|unix:\|all;` / `deny ...;` | http, server, location | | Checked in order; the first match decides; no match allows. Denied: 403 (`error_page 403 =444` drops instead). As in nginx, a level with its own rules replaces the inherited list. **Deviation:** a network with host bits set (`192.168.1.1/24`) is a config error rather than silently masked. Runs after `limit_req`/`limit_conn` (nginx's order). |
-| `stub_status [nginx\|prometheus\|json];` | location | `nginx` | Server-wide counters. `nginx` is byte-compatible with nginx's output, so existing exporters work. `prometheus` is the text exposition format, with responses by status class, reloads and dropped log lines added. Counters cover the process lifetime (they survive reloads); "requests" counts completed requests. Restrict it with `allow`/`deny`. |
+| `stub_status [nginx\|prometheus\|json];` | location | `nginx` | Server-wide counters. `nginx` is byte-compatible with nginx's output, so existing exporters work. `prometheus` is the text exposition format, with responses by status class, reloads, dropped log lines and memory (resident, managed heap, GC-committed, full GCs) added. Counters cover the process lifetime (they survive reloads); "requests" counts completed requests. Restrict it with `allow`/`deny`. |
 
 ```nginx
 location = /metrics { stub_status prometheus; allow 10.0.0.0/8; deny all; }
@@ -261,6 +261,7 @@ server {
 | `upstream name { server addr [weight=n] [max_fails=n] [fail_timeout=t] [backup] [down]; keepalive n; keepalive_timeout t; keepalive_requests n; }` | http | `keepalive 32`, `60s`, `1000` | Smooth weighted round-robin. Passive health checks: a peer is skipped after `max_fails` failures within `fail_timeout`. Implicit upstreams (a plain host in `proxy_pass`) get the same defaults. |
 | `proxy_set_header name value;` | http, server, location | | An empty value removes the header. Setting any header at a level replaces the inherited list (nginx). `Host` defaults to the upstream's authority (`$proxy_host`). `Connection`/`Upgrade` are accepted but ignored, because the module manages them. |
 | `proxy_hide_header name;` | | | Drop a response header coming from the upstream. |
+| `proxy_redirect default\|off;` / `proxy_redirect redirect replacement;` | http, server, location | `default` | Rewrites `Location` and the URL in `Refresh` from the upstream. `default` maps the `proxy_pass` URL to the location: with `location /one/ { proxy_pass http://app:8080/two/; }`, `http://app:8080/two/x` becomes `/one/x`. That needs a prefix or exact location, so regex and named locations get no default mapping. Prefix rules match case-insensitively and replace the prefix; `~regex` / `~*regex` rules replace the whole value and can use `$1`..`$9`; replacements may contain variables. The first matching rule wins. A level with rules replaces the inherited list; `off` turns rewriting off. |
 | `proxy_http_version 1.0\|1.1;` | | **`1.1`** | nginx defaults to 1.0. 1.1 is required for keep-alive and Upgrade. |
 | `proxy_connect_timeout` / `proxy_send_timeout` / `proxy_read_timeout` | | `10s` / `60s` / `60s` | Connect timeout includes the TLS handshake. Send/read are per operation. For upgraded tunnels, `proxy_read_timeout` is the idle timeout counted across *both* directions. |
 | `proxy_buffer_size size;` | | `8k` | Maximum size of the upstream response head. Bigger is a 502. |
@@ -291,10 +292,11 @@ dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz request 60 42  # o
 **Soak test** (Linux). Runs the real binary as a child process under mixed load: static, proxied and POSTed
 requests, WebSockets, rate-limited paths, slow-loris, garbage, oversized heads, mid-download resets and abandoned
 bodies. It reloads every few seconds, then checks for leaked file descriptors, memory growth, error-level log
-lines, failed requests, and a clean exit on SIGTERM:
+lines, failed requests, and a clean exit on SIGTERM. It samples the server's own memory metrics, to tell managed
+heap growth (garbage awaiting a full GC, which is normal) from native growth (which would be a leak):
 
 ```sh
-dotnet run -c Release --project tests/Httpgrl.Tests -- --soak artifacts/linux-x64/httpgrl 300
+dotnet run -c Release --project tests/Httpgrl.Tests -- --soak artifacts/linux-x64/httpgrl 300   # add --no-reload to isolate reloads
 ```
 
 A finding prints the seed, iteration and input, which reproduce it exactly. It's dependency-free and not
@@ -428,7 +430,7 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 4. [x] **Rate limiting**: `limit_req` and `limit_conn` zones.
 5. [ ] **Hardening**: ~~fuzzing the parsers~~ (done: request, URI, chunked, upstream, config, CRL); ~~soak test~~ (done: `--soak`); CI on Windows and macOS.
 6. [x] **Operations**: status/metrics endpoint (`stub_status`), `$request_id`, `allow`/`deny`, gzip/brotli, a hardened systemd unit.
-7. [ ] **Proxy**: `proxy_redirect`, `proxy_buffering on`, variables in `proxy_pass`, runtime DNS re-resolution, active health checks.
+7. [ ] **Proxy**: ~~`proxy_redirect`~~ (done), `proxy_buffering on`, variables in `proxy_pass`, runtime DNS re-resolution, active health checks.
 8. [ ] **HTTP/2.**
 9. [ ] **Release process**: CI on push, a first `v0.x` tag, signed images.
 
