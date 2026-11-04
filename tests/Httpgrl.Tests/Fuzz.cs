@@ -31,12 +31,12 @@ internal static class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(),
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map" })
         {
             int iterations = name == "config" ? 3_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
@@ -159,7 +159,7 @@ internal static class Fuzz
         B("\r\n", "\n", "\r", " ", "\t", ":", ": ", "Content-Length: ", "Content-Length: 0\r\n", "Transfer-Encoding: chunked\r\n",
           "Transfer-Encoding: ", "chunked", "identity", "Host: ", "Host: x\r\n", "%", "%00", "%2e", "%2E%2e", "%2f", "%c0%af", "%ff", "/../",
           "/./", "//", "?", "#", "HTTP/1.1", "HTTP/1.0", "HTTP/2.0", "HTTP/1.10", "\0", "\x7f", "\xff", "99999999999999999999", "-1", "+5",
-          "0x10", ",", "Connection: close\r\n", "Expect: 100-continue\r\n", "Upgrade: h2c\r\n", "*", "@", "[::1]", ":8080", "a.test.", "GET ", "CONNECT "),
+          "0x10", ",", "Connection: close\r\n", "Expect: 100-continue\r\n", "Upgrade: h2c\r\n", "X_A: 1\r\n", "_", "*", "@", "[::1]", ":8080", "a.test.", "GET ", "CONNECT "),
         data =>
         {
             using var inb = new InputBuffer(Math.Max(16, data.Length));
@@ -193,8 +193,12 @@ internal static class Fuzz
                 if (c is '\r' or '\n' or '\0' or ' ' or '#') throw new Finding($"bad query \"{req.QueryValue}\"");
             var h = req.Headers;
             for (int k = 0; k < h.Count; k++)
+            {
                 foreach (char c in h.ValueAt(k))
                     if (c is '\r' or '\n' or '\0') throw new Finding("control character in a header value");
+                if (h.NameAt(k).Contains('_')) throw new Finding($"underscored header \"{h.NameAt(k)}\" kept");
+            }
+            if (req.VersionValue == HttpVersion.Http11 && h.Get("Host") is null) throw new Finding("HTTP/1.1 without a Host field accepted");
             return true;
         });
 
@@ -388,6 +392,52 @@ internal static class Fuzz
                 if (h.Source is not null && h.Source.AddressFamily != h.Destination!.AddressFamily) throw new Finding("mixed address families");
                 return true;
             }, MaxLen: 2048);
+    }
+
+    /// <summary>
+    /// Request path (and request-influenced variable text) through root/alias to a filesystem path. Whatever the input,
+    /// the result is null or inside the directory the configuration intends, checked independently of the mapper.
+    /// Input: raw request path, then optionally '\x01' and the text a variable in the root/alias evaluates to.
+    /// </summary>
+    private static Target PathMapTarget()
+    {
+        static void Inside(string? result, string dir, string what)
+        {
+            if (result is null) return;
+            var rel = Path.GetRelativePath(dir, result);
+            if (rel == ".." || rel.StartsWith("../", StringComparison.Ordinal) || Path.IsPathRooted(rel))
+                throw new Finding($"{what}: \"{result}\" is outside \"{dir}\"");
+            foreach (var seg in result.Split('/')) if (seg is "." or "..") throw new Finding($"{what}: dot segment in \"{result}\"");
+        }
+        return new Target("path-map",
+            B("/index.html", "/dl/a/b", "/dl../etc/passwd", "/x..", "/a/%2e%2e/b", "/dl/\x01/srv/www", "/p\x01/srv/www/../etc", "/q\x01..", "/%2e%2e%2f..%2fetc"),
+            B("/", "..", ".", "%2e", "%2f", "%2e%2e", "dl", "dl/", "x", "\x01", "/srv", "/etc", "\0", "\\", "~", "%00", "//"),
+            data =>
+            {
+                int sep = Array.IndexOf(data, (byte)1);
+                var raw = sep < 0 ? data : data[..sep];
+                var var_ = sep < 0 ? "" : Encoding.Latin1.GetString(data, sep + 1, data.Length - sep - 1);
+                if (raw.Length == 0 || raw[0] != (byte)'/') return false;
+                var uri = UriNormalizer.NormalizeRaw(raw);
+                if (uri is null) return false;
+                const string www = "/srv/www", files = "/srv/files", sites = "/srv/sites";
+                Inside(HttpContextImpl.Map(uri, www, false, -1, www), www, "root");
+                Inside(HttpContextImpl.Map(uri, files + "/", true, 4, files + "/"), files, "alias /dl/");
+                Inside(HttpContextImpl.Map(uri, files, true, 3, files), files, "alias /dl (off-by-slash shape)");
+                // location ~ ^/x(.*)$ { alias /srv/files/$1; }: the capture is a substring of the normalized path.
+                if (uri.StartsWith("/x", StringComparison.Ordinal))
+                    Inside(HttpContextImpl.Map(uri, files + "/" + uri[2..], true, -1, files), files, "regex alias");
+                // root $var; (no constant part): never escape the value, and a value with dot segments maps nothing.
+                var r = HttpContextImpl.Map(uri, var_, false, -1, null);
+                if (r is not null)
+                {
+                    if (!Path.IsPathFullyQualified(var_)) throw new Finding($"relative root \"{var_}\" accepted");
+                    Inside(r, Path.GetFullPath(var_), "root $var");
+                }
+                // root /srv/sites/$var;
+                Inside(HttpContextImpl.Map(uri, sites + "/" + var_, false, -1, sites), sites, "root /srv/sites/$var");
+                return true;
+            }, MaxLen: 512);
     }
 
     /// <summary>The remote's answer to a tunnel agent's Upgrade (what the agent reads before serving anything).</summary>

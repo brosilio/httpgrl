@@ -2,11 +2,13 @@ using System.Text;
 
 namespace Httpgrl.Core.Http;
 
-internal readonly struct HeadLimits(int lineMax, int totalMax, int maxHeaders)
+internal readonly struct HeadLimits(int lineMax, int totalMax, int maxHeaders, bool underscores = false)
 {
     public readonly int LineMax = lineMax;
     public readonly int TotalMax = totalMax;
     public readonly int MaxHeaders = maxHeaders;
+    /// <summary>underscores_in_headers: keep header names containing '_' (otherwise they're ignored, as in nginx).</summary>
+    public readonly bool Underscores = underscores;
 }
 
 /// <summary>
@@ -88,6 +90,9 @@ internal static class RequestParser
             while (e > s && (value[e - 1] == ' ' || value[e - 1] == '\t')) e--;
             value = value[s..e];
             foreach (byte b in value) if ((b < 0x20 && b != '\t') || b == 0x7F) return 400;
+            // CGI-style backends (FastCGI, WSGI, Rack) fold '-' and '_' into one variable name, so "X_Client_Verify" would
+            // arrive as the X-Client-Verify a proxy sets or strips. Ignored entirely, as nginx does by default.
+            if (!lim.Underscores && name.IndexOf((byte)'_') >= 0) continue;
             headers.AddUnchecked(InternHeaderName(name), value.IsEmpty ? "" : Encoding.Latin1.GetString(value));
         }
 
@@ -138,12 +143,16 @@ internal static class RequestParser
         }
 
         // ---- Host ----
+        // RFC 9112 3.2: an HTTP/1.1 request without a Host field, or with an invalid one, is a 400, even in absolute form
+        // (where the target's authority is what counts and the field's value is otherwise ignored).
         int hostCount = headers.CountOf("Host");
         if (hostCount > 1) return 400;
-        string? host = uriHost ?? headers.Get("Host");
+        var hostField = headers.Get("Host");
+        if (hostField is null && req.VersionValue == HttpVersion.Http11) return 400;
+        if (hostField is not null && uriHost is not null && NormalizeHost(hostField) is null) return 400;
+        string? host = uriHost ?? hostField;
         if (host is null)
         {
-            if (req.VersionValue == HttpVersion.Http11) return 400;
             req.HostValue = "";
         }
         else

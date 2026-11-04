@@ -159,30 +159,48 @@ internal sealed class HttpContextImpl : HttpContext
     /// </summary>
     internal string? MapPath(string uriPath)
     {
-        if (!FsGuard.IsSafe(uriPath)) return null;
         var loc = Loc;
         var core = loc.Core;
-        string joined;
-        string? baseDir;
         if (core.Alias is { } alias)
+            return Map(uriPath, alias.Evaluate(this), isAlias: true, loc.AliasPrefixLength, core.AliasBase);
+        if (core.Root is { } root)
+            return Map(uriPath, root.Evaluate(this), isAlias: false, -1, core.RootBase);
+        return Map(uriPath, Rt.DefaultRoot, isAlias: false, -1, Rt.DefaultRoot);
+    }
+
+    /// <summary>
+    /// The mapping itself, pure (fuzzed). <paramref name="value"/> is the evaluated root/alias; <paramref name="baseDir"/>
+    /// its constant leading directory, which the result must stay inside. A value that begins with a variable has no
+    /// constant part: then the value itself must be an absolute path without dot segments, and is the boundary. Without
+    /// that, "root $doc;" with a $doc built from the request would let "../" through to the filesystem.
+    /// </summary>
+    internal static string? Map(string uriPath, string value, bool isAlias, int aliasPrefixLength, string? baseDir)
+    {
+        if (!FsGuard.IsSafe(uriPath)) return null;
+        if (baseDir is null)
         {
-            var a = alias.Evaluate(this);
-            if (loc.AliasPrefixLength < 0) joined = a;
-            else joined = a + uriPath.AsSpan(Math.Min(loc.AliasPrefixLength, uriPath.Length)).ToString();
-            baseDir = core.AliasBase;
+            if (!System.IO.Path.IsPathFullyQualified(value) || HasDotSegmentOrControl(value)) return null;
+            baseDir = value;
         }
-        else
-        {
-            var r = core.Root is { } root ? root.Evaluate(this) : Rt.DefaultRoot;
-            joined = string.Concat(r.AsSpan().TrimEnd('/'), uriPath);
-            baseDir = core.Root is null ? Rt.DefaultRoot : core.RootBase;
-        }
+        string joined;
+        if (isAlias) joined = aliasPrefixLength < 0 ? value : value + uriPath.AsSpan(Math.Min(aliasPrefixLength, uriPath.Length)).ToString();
+        else joined = string.Concat(value.AsSpan().TrimEnd('/'), uriPath);
         string full;
         try { full = System.IO.Path.GetFullPath(joined); }
         catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { return null; }
         if (uriPath.EndsWith('/') && !System.IO.Path.EndsInDirectorySeparator(full)) full += System.IO.Path.DirectorySeparatorChar;
-        if (baseDir is not null && !FsGuard.IsContained(full, baseDir)) return null;
-        return full;
+        return FsGuard.IsContained(full, baseDir) ? full : null;
+    }
+
+    private static bool HasDotSegmentOrControl(string path)
+    {
+        foreach (char c in path) if (c < 0x20 || c == 0x7f) return true;
+        foreach (var r in path.AsSpan().SplitAny('/', System.IO.Path.DirectorySeparatorChar))
+        {
+            var seg = path.AsSpan()[r];
+            if (seg is "." or "..") return true;
+        }
+        return false;
     }
 
     public string? DocumentRoot()

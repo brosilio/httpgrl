@@ -104,7 +104,7 @@ internal sealed class Http1Session
             _transport = transport;
 
             ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport, Mgr = _mgr };
-            var lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders);
+            var lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders, core0.UnderscoresInHeaders == true);
             int keepaliveMs = core0.KeepaliveTimeoutMs;
             bool first = true;
 
@@ -139,7 +139,7 @@ internal sealed class Http1Session
                 {
                     if (_binding.Ssl || !Migrate()) return;
                     core0 = _hosts.Default.Root.Core;
-                    lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders);
+                    lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders, core0.UnderscoresInHeaders == true);
                     ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport, Mgr = _mgr };
                 }
                 if (!first || _link is not null)

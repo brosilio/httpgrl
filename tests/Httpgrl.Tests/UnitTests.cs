@@ -68,6 +68,26 @@ internal static class UnitTests
             T.Eq(400, P("GET / HTTP/1.1\r\nHost: a\nX: b\r\n\r\n"));             // bare LF
             T.Eq(400, P("GET / HTTP/1.1\r\nHost: a\r\nX: a\rb\r\n\r\n"));         // bare CR
             T.Eq(400, P("GET / HTTP/1.1\r\nHost: a\r\nX: a\0b\r\n\r\n"));        // NUL
+            // RFC 9112 3.2: absolute form still needs a valid Host field on HTTP/1.1 (the target's authority wins).
+            T.Eq(400, P("GET http://a.test/ HTTP/1.1\r\n\r\n"));
+            T.Eq(400, P("GET http://a.test/ HTTP/1.1\r\nHost: a/b\r\n\r\n"));
+            T.Eq(400, P("GET http://a.test/ HTTP/1.1\r\nHost:\r\n\r\n"));
+            T.Eq(0, P("GET http://a.test/ HTTP/1.0\r\n\r\n"));
+        });
+        T.Add("parser: header names with underscores are ignored unless underscores_in_headers", () =>
+        {
+            // CGI-style backends map X_Client_Verify and X-Client-Verify to the same variable: never let one stand in for the other.
+            var r = new RequestImpl();
+            T.Eq(0, P("GET / HTTP/1.1\r\nHost: a\r\nX_Client_Verify: SUCCESS\r\nX-Ok: 1\r\n\r\n", r));
+            T.Eq(null, r.Headers.Get("X_Client_Verify"));
+            T.Eq("1", r.Headers.Get("X-Ok"));
+            // An underscored framing header is ignored too, so it can't disagree with the real one.
+            r = new RequestImpl();
+            T.Eq(0, P("POST / HTTP/1.1\r\nHost: a\r\nContent_Length: 99\r\nContent-Length: 1\r\n\r\n", r));
+            T.Eq(1L, r.ContentLengthValue);
+            r = new RequestImpl();
+            T.Eq(0, RequestParser.Parse(Encoding.Latin1.GetBytes("GET / HTTP/1.1\r\nHost: a\r\nX_Y: z\r\n\r\n"), r, new HeadLimits(8192, 32768, 100, underscores: true)));
+            T.Eq("z", r.Headers.Get("X_Y"));
         });
         T.Add("parser: protocol and target validation", () =>
         {

@@ -21,6 +21,21 @@ internal static class ProxyTests
 
     public static void Register()
     {
+        T.Add("proxy: underscored header names never reach the upstream (CGI header-folding spoof)", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            var loc = $"location / {{ proxy_pass http://127.0.0.1:{up.Port}; proxy_set_header X-Client-Verify NONE; }}";
+            await using (var s = TestServer.Start(Conf(loc)))
+            {
+                var body = Body(await s.Raw(Get("/", "X_Client_Verify: SUCCESS\r\nX-Client_Verify: SUCCESS\r\n")));
+                T.Contains("X-Client-Verify: NONE", body);
+                T.NotContains("SUCCESS", body);
+            }
+            // Opted in (http or server level), they pass through as sent.
+            await using (var s = TestServer.Start(Conf(loc, "underscores_in_headers on;")))
+                T.Contains("X_Custom: 1", Body(await s.Raw(Get("/", "X_Custom: 1\r\n"))));
+        });
+
         T.Add("proxy: a malformed answer on a pooled connection is reported, not quietly retried as a stale connection", async () =>
         {
             // The first request on the connection is answered properly; the second gets ambiguous framing. Retrying that

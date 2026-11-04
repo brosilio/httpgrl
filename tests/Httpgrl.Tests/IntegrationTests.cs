@@ -170,6 +170,35 @@ internal static class IntegrationTests
             T.NotContains("TOP SECRET", r);
         });
 
+        T.Add("security: a root or alias that begins with a variable can't be climbed out of", async () =>
+        {
+            // No constant leading directory to check against: the value itself is the boundary, and a value with dot
+            // segments (or a relative one) maps nothing. $arg_d stands in for any variable the request can influence.
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0;
+                  location /r/ { root $arg_d; }
+                  location ~ ^/a/(.*)$ { alias $arg_d/$1; }
+                } }
+                """, d =>
+            {
+                Directory.CreateDirectory(Path.Combine(d, "www", "r"));
+                File.WriteAllText(Path.Combine(d, "www", "r", "ok.txt"), "fine");
+                File.WriteAllText(Path.Combine(d, "secret.txt"), "TOP SECRET");
+                Directory.CreateDirectory(Path.Combine(d, "r"));
+                File.WriteAllText(Path.Combine(d, "r", "secret.txt"), "TOP SECRET");
+            });
+            var www = Path.Combine(s.Dir, "www");
+            T.Eq("fine", Body(await s.Raw(Get($"/r/ok.txt?d={www}"))));
+            foreach (var d in new[] { $"{www}/..", $"{www}/../www/..", "..", "www", $"{www}/./.." })
+            {
+                var r = await s.Raw(Get($"/r/secret.txt?d={d}"));
+                T.NotContains("TOP SECRET", r);
+                r = await s.Raw(Get($"/a/secret.txt?d={d}"));
+                T.NotContains("TOP SECRET", r);
+            }
+            T.Eq("fine", Body(await s.Raw(Get($"/a/ok.txt?d={www}/r"))));
+        });
+
         T.Add("security: FIFO in the web root neither hangs nor serves", async () =>
         {
             if (OperatingSystem.IsWindows()) return;

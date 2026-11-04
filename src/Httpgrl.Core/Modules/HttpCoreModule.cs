@@ -90,6 +90,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         r.AddDirective(new() { Name = "client_max_body_size", Contexts = http, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().ClientMaxBodySize = i.Size(0) });
         r.AddDirective(new() { Name = "large_client_header_buffers", Contexts = [ContextKind.Http, ContextKind.Server], MinArgs = 2, MaxArgs = 2, Handler = LargeHeaders });
         r.AddDirective(new() { Name = "disable_symlinks", Contexts = http, MinArgs = 1, MaxArgs = 2, Handler = DisableSymlinks });
+        r.AddDirective(new() { Name = "underscores_in_headers", Contexts = [ContextKind.Http, ContextKind.Server], MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().UnderscoresInHeaders = i.Flag(0) });
         r.AddDirective(new() { Name = "server_tokens", Contexts = http, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().ServerTokens = i.Flag(0) });
 
         RegisterVariables(r);
