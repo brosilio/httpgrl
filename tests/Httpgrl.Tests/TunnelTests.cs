@@ -400,7 +400,10 @@ internal static class TunnelTests
         {
             await using var a = await FakeAgent.Connect(port, cert);
             await a.Ssl.WriteAsync(Encoding.ASCII.GetBytes(request));
-            return await ReadHead(a.Ssl);
+            var head = await ReadHead(a.Ssl);
+            // TLS 1.3 checks the client certificate after the client considers the handshake done: the refusal shows up
+            // as an alert (an exception) or, depending on timing, as the connection closing with no response at all.
+            return head.Length == 0 ? "<<REJECTED>>" : head;
         }
         catch (Exception e) when (e is IOException or System.Security.Authentication.AuthenticationException) { return "<<REJECTED>>"; }
     }
