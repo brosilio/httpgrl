@@ -29,18 +29,27 @@ internal struct SentFrame
     public long Id, A, B;
 }
 
+internal enum CongestionControl : byte
+{
+    NewReno,
+    /// <summary>RFC 9438: better on long, fast paths; Reno-friendly where Reno would do better.</summary>
+    Cubic,
+}
+
 internal sealed class SentPacket
 {
     public long Pn;
     public long TimeSent;
     public int Size;
     public bool AckEliciting, InFlight;
+    /// <summary>Sent while the congestion window was what limited us (only then may an ACK of it grow the window).</summary>
+    public bool WindowLimited;
     public readonly List<SentFrame> Frames = new(4);
 
     public void Reset()
     {
         Frames.Clear();
-        AckEliciting = InFlight = false;
+        AckEliciting = InFlight = WindowLimited = false;
     }
 }
 
@@ -86,11 +95,22 @@ internal sealed class Recovery
     /// <summary>Counters for logs and tests.</summary>
     public long LostPackets, CongestionEvents, PersistentCongestions;
 
-    public Recovery(int maxDatagramSize = 1200)
+    public readonly CongestionControl Algorithm;
+
+    // CUBIC (RFC 9438), in bytes: the window before the last reduction, the time to regain it, the epoch's start,
+    // and the Reno-friendly estimate.
+    public const double CubicC = 0.4, CubicBeta = 0.7;
+    private double _wMax, _wLastMax, _k, _wEst;
+    private long _epochStart = -1;
+
+    public Recovery(int maxDatagramSize = 1200, CongestionControl algorithm = CongestionControl.Cubic)
     {
         MaxDatagramSize = maxDatagramSize;
-        Cwnd = Math.Min(10L * maxDatagramSize, Math.Max(14720, 2L * maxDatagramSize));
+        Algorithm = algorithm;
+        Cwnd = InitialWindow;
     }
+
+    public long InitialWindow => Math.Min(10L * MaxDatagramSize, Math.Max(14720, 2L * MaxDatagramSize));
 
     public bool CanSend(int bytes) => BytesInFlight + bytes <= Cwnd;
 
@@ -107,6 +127,9 @@ internal sealed class Recovery
                 s.AckElicitingInFlight++;
             }
             BytesInFlight += p.Size;
+            // Half the window in use counts as window-limited: an application that never fills it (interactive
+            // traffic) mustn't inflate it without bound.
+            p.WindowLimited = BytesInFlight * 2 >= Cwnd;
         }
     }
 
@@ -157,7 +180,7 @@ internal sealed class Recovery
         }
 
         DetectLost(space, now, lost);
-        for (int i = start; i < acked.Count; i++) OnAcked(s, acked[i]);
+        for (int i = start; i < acked.Count; i++) OnAcked(s, acked[i], now);
         // Reset the backoff: the peer is responding (a client still validating the server's address keeps it).
         PtoCount = 0;
         return true;
@@ -180,15 +203,37 @@ internal sealed class Recovery
         SmoothedRtt = (7 * SmoothedRtt + adjusted) / 8;
     }
 
-    private void OnAcked(Space s, SentPacket p)
+    private void OnAcked(Space s, SentPacket p, long now)
     {
         if (!p.InFlight) return;
         if (p.AckEliciting) s.AckElicitingInFlight--;
         BytesInFlight -= p.Size;
-        // No growth for packets sent before the current recovery period began.
-        if (p.TimeSent <= _recoveryStart) return;
-        if (Cwnd < Ssthresh) Cwnd += p.Size;
-        else Cwnd += (long)MaxDatagramSize * p.Size / Cwnd;
+        // No growth for packets sent before the current recovery period began, nor when the window wasn't the limit.
+        if (p.TimeSent <= _recoveryStart || !p.WindowLimited) return;
+        if (Cwnd < Ssthresh) { Cwnd += p.Size; return; } // slow start, for both
+        if (Algorithm == CongestionControl.NewReno) { Cwnd += (long)MaxDatagramSize * p.Size / Cwnd; return; }
+        CubicGrow(p.Size, now);
+    }
+
+    /// <summary>Congestion avoidance under CUBIC (RFC 9438 4.2-4.4).</summary>
+    private void CubicGrow(int acked, long now)
+    {
+        double mss = MaxDatagramSize;
+        if (_epochStart < 0)
+        {
+            // A new epoch (after slow start, or the first ACK after a reduction).
+            _epochStart = now;
+            if (_wMax <= Cwnd) { _wMax = Cwnd; _k = 0; }
+            else _k = Math.Cbrt((_wMax - Cwnd) / mss / CubicC);
+            _wEst = Cwnd;
+        }
+        double t = (now - _epochStart + SmoothedRtt) / 1e6; // the window one RTT from now
+        double target = (CubicC * Math.Pow(t - _k, 3)) * mss + _wMax;
+        // The Reno-friendly estimate grows like Reno would with CUBIC's beta (alpha = 3(1 - beta)/(1 + beta)).
+        _wEst += 3 * (1 - CubicBeta) / (1 + CubicBeta) * mss * acked / Cwnd;
+        if (target < _wEst) { Cwnd = (long)Math.Max(Cwnd, _wEst); return; }
+        target = Math.Clamp(target, Cwnd, 1.5 * Cwnd);
+        Cwnd += (long)Math.Max(1, (target - Cwnd) * acked / Cwnd);
     }
 
     /// <summary>Declare packets lost by the packet or time threshold (RFC 9002 6.1), and react as a congestion event.</summary>
@@ -250,6 +295,8 @@ internal sealed class Recovery
                 PersistentCongestions++;
                 Cwnd = MinWindow;
                 _recoveryStart = -1;
+                _epochStart = -1;
+                _wMax = _wLastMax = 0;
             }
         }
     }
@@ -259,15 +306,25 @@ internal sealed class Recovery
         if (sentTime <= _recoveryStart) return; // already in recovery for this
         CongestionEvents++;
         _recoveryStart = now;
-        Ssthresh = Math.Max(Cwnd / 2, MinWindow);
+        if (Algorithm == CongestionControl.Cubic)
+        {
+            // Fast convergence: below the last maximum, let go of more (RFC 9438 4.7).
+            _wMax = Cwnd < _wLastMax ? Cwnd * (1 + CubicBeta) / 2 : Cwnd;
+            _wLastMax = Cwnd;
+            _epochStart = -1;
+            Ssthresh = Math.Max((long)(Cwnd * CubicBeta), MinWindow);
+        }
+        else Ssthresh = Math.Max(Cwnd / 2, MinWindow);
         Cwnd = Ssthresh;
     }
 
     /// <summary>A new path (RFC 9000 9.4): congestion control and the RTT estimate start over; what's in flight stays counted.</summary>
     public void ResetForNewPath()
     {
-        Cwnd = Math.Min(10L * MaxDatagramSize, Math.Max(14720, 2L * MaxDatagramSize));
+        Cwnd = InitialWindow;
         Ssthresh = long.MaxValue;
+        _epochStart = -1;
+        _wMax = _wLastMax = 0;
         _recoveryStart = -1;
         HasRttSample = false;
         LatestRtt = MinRtt = 0;
@@ -342,6 +399,37 @@ internal sealed class Recovery
 
     /// <summary>When we last sent anything ack-eliciting (the anti-deadlock probe counts from it).</summary>
     public long LastSendTime => Math.Max(Spaces[0].LastAckElicitingSent, Math.Max(Spaces[1].LastAckElicitingSent, Spaces[2].LastAckElicitingSent));
+
+    // Pacing (RFC 9002 7.7): a token bucket filled at N × cwnd / smoothed RTT, holding at most the initial window,
+    // so a large window doesn't go out as one burst. N is 2 in slow start and 1.25 after.
+    private double _tokens = -1;
+    private long _tokensAt;
+
+    /// <summary>When a packet of <paramref name="size"/> may go out: now or later (the caller waits until then).</summary>
+    public long PacedAt(long now, int size)
+    {
+        Refill(now);
+        if (_tokens >= size) return now;
+        double rate = PacingRate;
+        return now + (long)Math.Ceiling((size - _tokens) / rate);
+    }
+
+    public void OnPaced(long now, int size)
+    {
+        Refill(now);
+        _tokens -= size;
+    }
+
+    /// <summary>Bytes per microsecond.</summary>
+    private double PacingRate => (Cwnd < Ssthresh ? 2.0 : 1.25) * Cwnd / Math.Max(SmoothedRtt, Granularity);
+
+    private void Refill(long now)
+    {
+        double cap = InitialWindow;
+        if (_tokens < 0) { _tokens = cap; _tokensAt = now; return; }
+        if (now > _tokensAt) _tokens = Math.Min(cap, _tokens + (now - _tokensAt) * PacingRate);
+        _tokensAt = now;
+    }
 
     /// <summary>The probe timeout without backoff, for the closing and draining periods (3 × PTO).</summary>
     public long Pto => SmoothedRtt + Math.Max(4 * RttVar, Granularity) + MaxAckDelay;

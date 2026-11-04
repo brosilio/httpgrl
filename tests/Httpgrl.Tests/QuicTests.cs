@@ -176,6 +176,8 @@ internal static class QuicTests
             T.True(!Packets.TryParse(H("c000000001 00 00 00 4100" + new string('0', 40)), 8, out _));
             T.True(!Packets.TryParse(H("c000000001 00 00 4100" + new string('0', 40)), 8, out _));
             T.True(!Packets.TryParse(H("40 0102030405060708"), 8, out _));
+            T.True(!Packets.TryParse(H("40 0102030405060708 00112233445566778899aabbccddeeff00"), 8, out _)); // no room for the sample
+            T.True(Packets.TryParse(H("40 0102030405060708 00112233445566778899aabbccddeeff0011223344"), 8, out _));
             T.True(!Packets.TryParse(H("c000000001 00 00 00 05 0000000000"), 8, out _)); // too short to sample
         });
 

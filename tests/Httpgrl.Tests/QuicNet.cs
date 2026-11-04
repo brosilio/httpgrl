@@ -23,6 +23,8 @@ internal sealed class QuicNet : IDisposable
     /// <summary>Where the client's datagrams come from (change it to simulate a NAT rebinding or a migration).</summary>
     public EndPoint ClientAddress = new IPEndPoint(IPAddress.Parse("192.0.2.1"), 40000);
     public readonly EndPoint ServerAddress = new IPEndPoint(IPAddress.Parse("198.51.100.1"), 443);
+    /// <summary>The most data-carrying datagrams the server sent at one instant (pacing spreads them out).</summary>
+    public int MaxServerBurst;
     /// <summary>Where the server sent each datagram, for tests of paths.</summary>
     public readonly List<EndPoint> ServerSentTo = new();
 
@@ -79,9 +81,11 @@ internal sealed class QuicNet : IDisposable
             Put(buf[..n], toServer: true, RewriteClientFrom?.Invoke(ClientAddress) ?? ClientAddress);
         }
         if (Server is null) return;
+        int burst = 0;
         while ((n = Server.Send(buf, Now, out var to)) > 0)
         {
             ServerSentTo.Add(to);
+            if (n > 200) MaxServerBurst = Math.Max(MaxServerBurst, ++burst); // data-carrying datagrams sent at one instant
             if (to.Equals(ClientAddress)) Put(buf[..n], toServer: false, ServerAddress); // only the client's current address is reachable
             else Dropped++;
         }

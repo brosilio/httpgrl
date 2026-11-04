@@ -148,7 +148,7 @@ internal static class QuicRecoveryTests
 
         T.Add("quic recovery: packet- and time-threshold loss, one congestion event per recovery period, PTO backoff", () =>
         {
-            var r = new Recovery();
+            var r = new Recovery(1200, CongestionControl.NewReno);
             var acked = new List<SentPacket>();
             var lost = new List<SentPacket>();
             long cwnd0 = r.Cwnd;
@@ -179,6 +179,66 @@ internal static class QuicRecoveryTests
             // Application-data probes wait for the handshake to be confirmed; an amplification-blocked server has no timer.
             T.Eq(0L, r.Deadline(false, false, true, out _, out _));
             T.Eq(0L, r.Deadline(true, true, true, out _, out _));
+        });
+
+        T.Add("quic cubic: 0.7x on loss with fast convergence; the cubic curve regains the old maximum near K; no growth when app-limited", () =>
+        {
+            var r = new Recovery(1200, CongestionControl.Cubic);
+            var acked = new List<SentPacket>();
+            var lost = new List<SentPacket>();
+            long now = 0, pn = 0;
+            // Get an RTT sample of 100 ms and leave slow start with a loss at a 120-packet window.
+            r.Cwnd = 144_000;
+            r.Ssthresh = 144_000;
+            void Round(int packets)
+            {
+                long sent = now;
+                long first = pn;
+                for (int i = 0; i < packets; i++) r.OnPacketSent(2, P(pn++, sent));
+                now += 100_000;
+                acked.Clear();
+                r.OnAck(2, [(first, pn - 1)], 0, now, true, acked, lost);
+            }
+            Round(1);
+            // A loss: pn 0..3 sent, 3 acknowledged later than... use the packet threshold.
+            for (int i = 0; i < 4; i++) r.OnPacketSent(2, P(pn++, now));
+            now += 100_000;
+            lost.Clear();
+            r.OnAck(2, [(pn - 1, pn - 1)], 0, now, true, acked, lost);
+            T.Eq(1L, r.CongestionEvents);
+            T.Eq((long)(144_000 * 0.7), r.Cwnd);
+            // A second loss below the previous maximum (in a new recovery period): fast convergence lowers the target further.
+            long w1 = r.Cwnd;
+            now += 1_000;
+            for (int i = 0; i < 4; i++) r.OnPacketSent(2, P(pn++, now));
+            now += 100_000;
+            r.OnAck(2, [(pn - 1, pn - 1)], 0, now, true, acked, lost);
+            T.Eq(2L, r.CongestionEvents);
+            T.Eq((long)(w1 * 0.7), r.Cwnd);
+            // Congestion avoidance with the window full every RTT: concave growth back toward the maximum
+            // (w1 * 1.7 / 2 after fast convergence), reached around K = cbrt(Wmax(1 - beta)/C) seconds.
+            double wMax = w1 * (1 + 0.7) / 2;
+            double k = Math.Cbrt(wMax * 0.3 / 1200 / 0.4);
+            long start = now;
+            long atK = 0;
+            while (now - start < (long)(k * 1e6) + 200_000)
+            {
+                Round((int)(r.Cwnd / 1200));
+                if (atK == 0 && now - start >= (long)(k * 1e6)) atK = r.Cwnd;
+            }
+            T.True(Math.Abs(atK - wMax) < wMax * 0.15);
+
+            // App-limited: a window barely used never grows.
+            var a = new Recovery(1200, CongestionControl.Cubic);
+            long w0 = a.Cwnd;
+            long t = 0;
+            for (int i = 0; i < 50; i++)
+            {
+                a.OnPacketSent(2, P(i, t));
+                t += 50_000;
+                a.OnAck(2, [(i, i)], 0, t, true, acked, lost);
+            }
+            T.Eq(w0, a.Cwnd);
         });
 
         T.Add("quic recovery: persistent congestion collapses the window; discarding a space forgets its packets", () =>

@@ -63,7 +63,8 @@ internal static class Packets
             h.DcidLength = shortDcidLength;
             h.PnOffset = 1 + shortDcidLength;
             h.Length = d.Length; // a short-header packet runs to the end of the datagram
-            return h.PnOffset < d.Length;
+            // Room for the header-protection sample: 4 bytes after the packet number's start, then 16 (RFC 9001 5.4.2).
+            return d.Length >= h.PnOffset + 4 + 16;
         }
 
         // Long header invariants (RFC 8999 5.1): flags, version, DCID length and DCID, SCID length and SCID.

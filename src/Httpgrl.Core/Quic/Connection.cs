@@ -27,6 +27,9 @@ internal sealed class QuicOptions
     public int MaxDatagramSize = 1200;
     /// <summary>Packets sent under one 1-RTT key before we update it (RFC 9001 6), well inside AES-GCM's 2^23 limit.</summary>
     public long KeyUpdateAfter = PacketKeys.ConfidentialityLimit / 2;
+    public CongestionControl CongestionControl = CongestionControl.Cubic;
+    /// <summary>Spread packets over the RTT instead of sending the window in bursts.</summary>
+    public bool Pacing = true;
 }
 
 /// <summary>
@@ -174,7 +177,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         _originalDcid = originalDcid;
         _newCid = newCid;
         _created = _lastActivity = now;
-        Recovery = new Recovery(o.MaxDatagramSize);
+        Recovery = new Recovery(o.MaxDatagramSize, o.CongestionControl);
         Recovery.MaxAckDelay = 25_000;
         _connRecvMax = o.ConnectionReceiveWindow;
         _maxStreamsBidi = o.MaxStreamsBidi;
@@ -310,7 +313,18 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         while (at < datagram.Length && _state != State.Closed)
         {
             var d = datagram[at..];
-            if (!Packets.TryParse(d, _scid.Length, out var h)) break;
+            if (!Packets.TryParse(d, _scid.Length, out var h))
+            {
+                // Too short to be a packet of ours, but maybe a stateless reset (RFC 9000 10.3.1).
+                if (at == 0 && (d[0] & 0xC0) == 0x40 && d.Length >= 21 && IsStatelessReset(d[^16..]))
+                {
+                    ClosedByPeer = true;
+                    CloseCode = QuicError.NoError;
+                    _closeReason = "stateless reset";
+                    Finish();
+                }
+                break;
+            }
             var packet = d[..h.Length];
             at += h.Length;
             try { ReceivePacket(packet, h, now); }
@@ -1160,6 +1174,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
             if (loss != 0) t = Math.Min(t, loss);
             foreach (var p in _pns)
                 if (p.AckElicitingUnacked > 0 && !p.Discarded) t = Math.Min(t, p.AckDeadline);
+            if (_pacedUntil > 0) t = Math.Min(t, _pacedUntil);
             return t;
         }
     }
@@ -1288,6 +1303,13 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
 
         int count = 0, pos = 0;
         bool ccOpen = Recovery.CanSend(_o.MaxDatagramSize);
+        // Pacing: data waits for its slot (ACKs and probes don't); the wait becomes a deadline.
+        _pacedUntil = 0;
+        if (ccOpen && _o.Pacing && _tls.HandshakeComplete)
+        {
+            long at = Recovery.PacedAt(now, _o.MaxDatagramSize);
+            if (at > now) { ccOpen = false; _pacedUntil = at; }
+        }
         for (int space = 0; space < 3; space++)
         {
             var p = _pns[space];
@@ -1323,8 +1345,13 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         for (int i = 0; i < count; i++) Seal(buf, ref _building[i], now);
         _bytesSent += pos;
         _pathSent += pos;
+        bool data = false;
+        for (int i = 0; i < count; i++) data |= _building[i].Sent.InFlight;
+        if (data && _o.Pacing) Recovery.OnPaced(now, pos);
         return pos;
     }
+
+    private long _pacedUntil;
 
     private bool _padPathFrame;
 

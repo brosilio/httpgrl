@@ -199,7 +199,7 @@ internal static partial class Fuzz
         bool closedByServer = server.IsDraining || server.IsClosed;
         // Let the server's reaction reach the client, and the client's answer come back.
         try { net.Run(() => false, maxUs: 300_000); }
-        catch (Exception e) when (e is not Finding) { throw new Finding($"{e.GetType().Name} while settling: {e.Message}"); }
+        catch (Exception e) when (e is not Finding) { throw new Finding($"{e.GetType().Name} while settling: {e.Message}\n{e.StackTrace}"); }
         while (net.Client.TryGetEvent(out _)) { }
         while (server.TryGetEvent(out _)) { }
         // Injected frames can make the server's view diverge from the client's (streams or connection IDs the client

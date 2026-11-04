@@ -141,7 +141,7 @@ internal static class QuicConnectionTests
                     Bandwidth = r.Next(2) == 0 ? 0 : r.Next(1_000_000, 50_000_000),
                 };
                 int size = r.Next(1, 300_000);
-                if (!Echo(net, size, streams: 3)) throw new Exception($"seed {seed}: loss {net.Loss:F2}, jitter {net.JitterUs}, delay {net.DelayUs}, bandwidth {net.Bandwidth}, {size} bytes");
+                if (!Echo(net, size, streams: 3, maxUs: 300_000_000)) throw new Exception($"seed {seed}: loss {net.Loss:F2}, jitter {net.JitterUs}, delay {net.DelayUs}, bandwidth {net.Bandwidth}, {size} bytes");
             }
         });
 
@@ -255,6 +255,28 @@ internal static class QuicConnectionTests
             T.True(net.Run(() => net.Server.Path.Equals(home) && net.Server.AddressValidated, maxUs: 10_000_000));
             T.Eq(1, net.Server.Migrations);
             T.True(!net.Server.IsClosed);
+        });
+
+        T.Add("quic congestion: CUBIC beats NewReno on a long fat path with light loss; pacing bounds bursts", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            long Transfer(CongestionControl cc, bool pacing, out int maxBurst, long bandwidth = 12_500_000, double loss = 0.002)
+            {
+                var o = new QuicOptions { CongestionControl = cc, Pacing = pacing, StreamReceiveWindow = 16 << 20, ConnectionReceiveWindow = 32 << 20, StreamSendBuffer = 16 << 20 };
+                using var net = new QuicNet(seed: 9, server: o, client: o) { DelayUs = 40_000, Loss = loss, Bandwidth = bandwidth };
+                long t0 = net.Now;
+                T.True(Echo(net, 4 << 20, maxUs: 600_000_000));
+                maxBurst = net.MaxServerBurst;
+                return net.Now - t0;
+            }
+            long cubic = Transfer(CongestionControl.Cubic, true, out _);
+            long reno = Transfer(CongestionControl.NewReno, true, out _);
+            T.True(cubic < reno);
+            // On an unlimited link a window's ACKs come back together: unpaced, the next window goes out at once.
+            Transfer(CongestionControl.Cubic, true, out int pacedBurst, bandwidth: 0, loss: 0);
+            Transfer(CongestionControl.Cubic, false, out int unpacedBurst, bandwidth: 0, loss: 0);
+            T.True(pacedBurst <= 12);          // the initial window's worth, at most
+            T.True(unpacedBurst > pacedBurst * 2);
         });
 
         T.Add("quic connection: small flow-control windows and a slow link still move 2 MiB (window updates, blocking)", () =>
