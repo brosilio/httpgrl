@@ -98,13 +98,19 @@ internal sealed class RequestHead(bool underscores)
         req.MethodValue = RequestParser.InternMethod(method);
         req.VersionValue = HttpVersion.Http20;
 
+        bool websocket = false;
         if (ReferenceEquals(req.MethodValue, HttpMethods.Connect))
         {
-            // Extended CONNECT (WebSockets over HTTP/2) comes later; plain CONNECT is refused as on HTTP/1.1.
-            if (_protocol is not null) { Malformed(":protocol isn't supported"); return -1; }
-            return 405;
+            // Plain CONNECT (a TCP tunnel) is refused, as on HTTP/1.1.
+            if (_protocol is null) return 405;
+            // Extended CONNECT (RFC 8441): a tunnel for :protocol over this stream. It needs :scheme and :path like any
+            // request, can't end with its HEADERS, and carries no request body.
+            if (endStream) { Malformed("extended CONNECT with END_STREAM"); return -1; }
+            if (req.HeaderList.Contains("Content-Length")) { Malformed("content-length on CONNECT"); return -1; }
+            if (!_protocol.Equals("websocket", StringComparison.OrdinalIgnoreCase)) return 501; // nothing else is tunnelled (h2c least of all)
+            websocket = true;
         }
-        if (_protocol is not null) { Malformed(":protocol outside CONNECT"); return -1; }
+        else if (_protocol is not null) { Malformed(":protocol outside CONNECT"); return -1; }
         // We only speak HTTP/2 over TLS: the scheme is https.
         if (_scheme != "https") { Malformed(_scheme is null ? "no :scheme" : ":scheme isn't https"); return -1; }
         if (string.IsNullOrEmpty(_path)) { Malformed("no :path"); return -1; }
@@ -159,7 +165,23 @@ internal sealed class RequestHead(bool underscores)
             if (endStream && n != 0) { Malformed("content-length without a body"); return -1; }
             req.ContentLengthValue = n;
         }
-        else if (!endStream) req.ChunkedValue = true; // a body of unknown length: HTTP/1.1's chunked, as far as anyone downstream knows
+        else if (!endStream && !websocket) req.ChunkedValue = true; // a body of unknown length: HTTP/1.1's chunked, as far as anyone downstream knows
+        if (websocket)
+        {
+            // Modules see what an HTTP/1.1 client would have sent: GET with Upgrade, so WebSocket handling (the proxy's
+            // tunnelling) works unchanged. The key is ours; HTTP/2 has none, and an HTTP/1.1 upstream needs one.
+            req.MethodValue = HttpMethods.Get;
+            req.ExtendedConnect = true;
+            req.ConnUpgrade = true;
+            headers.AddUnchecked("Upgrade", "websocket");
+            headers.AddUnchecked("Connection", "Upgrade");
+            if (!headers.Contains("Sec-WebSocket-Key"))
+            {
+                Span<byte> key = stackalloc byte[16];
+                System.Security.Cryptography.RandomNumberGenerator.Fill(key);
+                headers.AddUnchecked("Sec-WebSocket-Key", Convert.ToBase64String(key));
+            }
+        }
         var expect = headers.Get("Expect");
         if (expect is not null && !expect.Equals("100-continue", StringComparison.OrdinalIgnoreCase)) return 417;
         return _status;

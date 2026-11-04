@@ -102,7 +102,8 @@ internal sealed class Http2Session
             if (!await ReadPrefaceAsync().ConfigureAwait(false)) return;
             await WriteAsync(
                 FrameWriter.Settings((SettingId.HeaderTableSize, TableSize), (SettingId.EnablePush, 0), (SettingId.MaxConcurrentStreams, (uint)_maxStreams),
-                    (SettingId.InitialWindowSize, StreamWindow), (SettingId.MaxFrameSize, OurMaxFrame), (SettingId.MaxHeaderListSize, (uint)_maxHeaderList)),
+                    (SettingId.InitialWindowSize, StreamWindow), (SettingId.MaxFrameSize, OurMaxFrame), (SettingId.MaxHeaderListSize, (uint)_maxHeaderList),
+                    (SettingId.EnableConnectProtocol, 1)), // WebSockets over HTTP/2 (RFC 8441)
                 FrameWriter.WindowUpdate(0, ConnectionWindow - 65535)).ConfigureAwait(false);
 
             bool first = true;
@@ -411,7 +412,7 @@ internal sealed class Http2Session
 
         // A new stream. Its block is decoded whatever happens next: skipping it would desynchronize HPACK.
         var stream = new H2Stream(sid, this, _peerInitialWindow, StreamWindow);
-        var ctx = new HttpContextImpl(_rt, _info, stream, stream.Body, stream.Wire) { Mgr = _mgr };
+        var ctx = new HttpContextImpl(_rt, _info, stream, stream.Body, stream.Wire) { Mgr = _mgr, Upgrader = () => new H2TunnelStream(stream) };
         stream.Ctx = ctx;
         ctx.BeginRequest();
         _head.Begin(ctx.Req);
@@ -611,7 +612,8 @@ internal sealed class Http2Session
 
     public async ValueTask SendDataAsync(H2Stream s, ReadOnlyMemory<byte> data, bool endStream)
     {
-        s.WriteOpTimeout = _core.SendTimeoutMs; // a client that never opens its window is cut at send_timeout
+        // A client that never opens its window is cut at send_timeout; a tunnel keeps the idle timeout UpgradeAsync set.
+        if (s.IdleRefreshMs == 0) s.WriteOpTimeout = _core.SendTimeoutMs;
         do
         {
             int n = 0;

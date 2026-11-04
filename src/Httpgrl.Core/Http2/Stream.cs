@@ -173,6 +173,16 @@ internal sealed class H2RequestBody(H2Stream stream) : RequestBody
     public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
     public override int Read(byte[] buffer, int offset, int count) => ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
 
+    /// <summary>The stream becomes a tunnel: no body limits, rate or per-read timeout (its idle timeout governs, as on HTTP/1.1).</summary>
+    public void PrepareTunnel()
+    {
+        _started = true;
+        MaxSize = 0;
+        MinRate = 0;
+        ReadTimeoutMs = 0;
+        SendContinue = null;
+    }
+
     /// <summary>The stream is done: give back buffers; returns how many received bytes were never read (to credit the connection).</summary>
     public long Release()
     {
@@ -226,12 +236,14 @@ internal sealed class H2ResponseWire(H2Stream stream) : ResponseWire
 
     public override void BeginHead(HttpContextImpl ctx, int status, bool upgrade)
     {
-        if (upgrade) throw new InvalidOperationException("101 isn't possible on HTTP/2");
+        // An accepted WebSocket over HTTP/2 (RFC 8441) is a 200 on the CONNECT stream, not a 101; the tunnel's bytes are
+        // DATA frames, and its end is the stream's END_STREAM.
+        if (upgrade && !ctx.Req.ExtendedConnect) throw new InvalidOperationException("101 isn't possible on HTTP/2");
         var resp = ctx.Resp;
-        _noBody = ctx.Req.IsHead || HttpStatus.HasNoBody(status);
+        _noBody = upgrade || ctx.Req.IsHead || HttpStatus.HasNoBody(status);
         _head ??= new byte[512];
         _headLen = 0;
-        HpackEncoder.Encode(ref _head, ref _headLen, ":status", HttpStatus.Code(status));
+        HpackEncoder.Encode(ref _head, ref _headLen, ":status", HttpStatus.Code(upgrade ? 200 : status));
         if (ctx.Loc.Core.Tokens) HpackEncoder.Encode(ref _head, ref _headLen, "server", "httpgrl/" + ServerInfo.Version);
         HpackEncoder.Encode(ref _head, ref _headLen, "date", HttpDate.Value);
         long cl = resp.ContentLength;
@@ -241,7 +253,7 @@ internal sealed class H2ResponseWire(H2Stream stream) : ResponseWire
         for (int i = 0; i < h.Count; i++)
         {
             var name = h.NameAt(i);
-            if (Excluded(name)) continue;
+            if (Excluded(name) || (upgrade && name.Equals("Sec-WebSocket-Accept", StringComparison.OrdinalIgnoreCase))) continue;
             HpackEncoder.Encode(ref _head, ref _headLen, name.ToLowerInvariant(), h.ValueAt(i));
         }
         _headPending = true;
@@ -303,4 +315,33 @@ internal sealed class H2ResponseWire(H2Stream stream) : ResponseWire
             await stream.Session.SendDataAsync(stream, _buf is null ? default : _buf.AsMemory(0, n), endStream).ConfigureAwait(false);
         }
     }
+}
+
+/// <summary>The duplex stream a module gets from UpgradeAsync on an HTTP/2 WebSocket: DATA frames both ways.</summary>
+internal sealed class H2TunnelStream : Stream
+{
+    private readonly H2Stream _s;
+
+    public H2TunnelStream(H2Stream s)
+    {
+        _s = s;
+        s.Body.PrepareTunnel();
+    }
+
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) => _s.Body.ReadAsync(buffer, ct);
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
+    public override int Read(byte[] buffer, int offset, int count) => ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) =>
+        buffer.IsEmpty ? ValueTask.CompletedTask : _s.Session.SendDataAsync(_s, buffer, endStream: false);
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) => WriteAsync(buffer.AsMemory(offset, count), ct).AsTask();
+    public override void Write(byte[] buffer, int offset, int count) => WriteAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+    public override Task FlushAsync(CancellationToken ct) => Task.CompletedTask;
+    public override void Flush() { }
+    public override bool CanRead => true;
+    public override bool CanWrite => true;
+    public override bool CanSeek => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
 }

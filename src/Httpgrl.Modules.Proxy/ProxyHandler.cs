@@ -148,7 +148,8 @@ internal static class ProxyHandler
     /// speak HTTP/2 straight to the backend, past every rule configured here (h2c smuggling).</summary>
     internal static bool WantsUpgrade(HttpRequest req)
     {
-        if (req.Version != HttpVersion.Http11) return false;
+        // HTTP/1.1's Upgrade, or an HTTP/2 WebSocket (extended CONNECT), which the core presents the same way.
+        if (req.Version == HttpVersion.Http10) return false;
         var up = req.Headers.Get("Upgrade");
         if (string.IsNullOrWhiteSpace(up)) return false;
         foreach (var r in up.AsSpan().Split(','))

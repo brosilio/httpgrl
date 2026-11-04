@@ -18,6 +18,8 @@ internal sealed class RequestImpl : HttpRequest
     public long ContentLengthValue = -1;
     public bool ChunkedValue;
     public bool ExpectContinue, ConnClose, ConnKeepAlive, ConnUpgrade;
+    /// <summary>An HTTP/2 extended CONNECT for a WebSocket (RFC 8441), presented to modules as an HTTP/1.1 upgrade request.</summary>
+    public bool ExtendedConnect;
     public readonly HeaderCollection HeaderList = new();
     public RequestBody BodyValue = null!;
 
@@ -42,7 +44,7 @@ internal sealed class RequestImpl : HttpRequest
         HostValue = "";
         VersionValue = HttpVersion.Http11;
         ContentLengthValue = -1;
-        ChunkedValue = ExpectContinue = ConnClose = ConnKeepAlive = ConnUpgrade = false;
+        ChunkedValue = ExpectContinue = ConnClose = ConnKeepAlive = ConnUpgrade = ExtendedConnect = false;
         HeaderList.Clear();
         _id = null;
     }
@@ -300,7 +302,9 @@ internal sealed class HttpContextImpl : HttpContext
         if (Resp.HasStarted) throw new InvalidOperationException("response already started");
         if (Resp.Status != 101) throw new InvalidOperationException("upgrade requires status 101");
         if (idleTimeoutMs <= 0) throw new ArgumentOutOfRangeException(nameof(idleTimeoutMs));
-        var upgrader = Upgrader ?? throw new NotSupportedException("this protocol can't hand over its connection");
+        // HTTP/1.1 hands over its connection; HTTP/2 only an extended CONNECT stream (a WebSocket, RFC 8441).
+        var upgrader = (Req.VersionValue != HttpVersion.Http20 || Req.ExtendedConnect ? Upgrader : null)
+            ?? throw new NotSupportedException("this request can't be upgraded");
         Upgraded = true;
         _keepAlive = false;
         await Resp.StartAsync().ConfigureAwait(false);

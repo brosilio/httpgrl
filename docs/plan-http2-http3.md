@@ -107,8 +107,11 @@ Moved to Phase 1, where streams exist to test them against:
   reset, CONTINUATION and control-frame floods, the concurrency cap, a stalled upload, and a closed window.
 - **Defences checked off one at a time:** each test fails with its defence switched off.
 
-Still to do: WebSockets over HTTP/2 (extended CONNECT); the session-level fuzz target; HTTP/2 in the soak test and
-benchmark.
+WebSockets over HTTP/2 (extended CONNECT, RFC 8441) are done too. They're presented to modules as HTTP/1.1 upgrade
+requests, so the proxy tunnels them unchanged; tested with `ClientWebSocket` in HTTP/2-only mode, plus the refusals
+and the idle timeout. HTTP/2 is dogfooded on the production box with `http2 on`.
+
+Still to do: the session-level fuzz target; HTTP/2 in the soak test and benchmark.
 
 **Attacks to test, each with a test that fails without the defence:**
 - **Rapid reset (CVE-2023-44487):** streams opened and immediately reset still count, with a reset-rate limit.

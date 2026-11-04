@@ -76,6 +76,72 @@ internal static class Http2SessionTests
                 T.NotContains("enable HTTP/2; add", s.LogText());
         });
 
+        T.Add("http2: WebSockets over HTTP/2 (RFC 8441) reach an HTTP/1.1 WebSocket backend through the proxy", async () =>
+        {
+            await using var ws = FakeUpstream.WebSocketEcho();
+            await using var s = TestServer.Start(Conf($"location /ws/ {{ proxy_pass http://127.0.0.1:{ws.Port}; }}"), Populate);
+            using var handler = new SocketsHttpHandler { SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true, TargetHost = "h2.test" } };
+            using var invoker = new HttpMessageInvoker(handler);
+            using var c = new System.Net.WebSockets.ClientWebSocket();
+            c.Options.HttpVersion = System.Net.HttpVersion.Version20;
+            c.Options.HttpVersionPolicy = HttpVersionPolicy.RequestVersionExact; // no quiet fallback to HTTP/1.1
+            await c.ConnectAsync(new Uri($"wss://127.0.0.1:{s.Port}/ws/chat"), invoker, CancellationToken.None);
+            var buf = new byte[1 << 16];
+            foreach (var msg in new[] { "hello over h2", new string('x', 40_000) })
+            {
+                await c.SendAsync(Encoding.UTF8.GetBytes(msg), System.Net.WebSockets.WebSocketMessageType.Text, true, default);
+                var got = new MemoryStream();
+                System.Net.WebSockets.ValueWebSocketReceiveResult r;
+                do { r = await c.ReceiveAsync(buf.AsMemory(), default); got.Write(buf, 0, r.Count); } while (!r.EndOfMessage);
+                T.Eq(msg, Encoding.UTF8.GetString(got.ToArray()));
+            }
+            await c.SendAsync(new byte[] { 0, 1, 2, 255 }, System.Net.WebSockets.WebSocketMessageType.Binary, true, default);
+            var b = await c.ReceiveAsync(buf.AsMemory(), default);
+            T.True(buf.AsSpan(0, b.Count).SequenceEqual(new byte[] { 0, 1, 2, 255 }));
+            await c.CloseAsync(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, "bye", default);
+            T.Eq(System.Net.WebSockets.WebSocketState.Closed, c.State);
+            T.Contains("\"proto\":\"HTTP/2.0\"", s.LogText());
+        });
+
+        T.Add("http2: extended CONNECT is advertised, and only WebSockets are tunnelled", async () =>
+        {
+            await using var s = TestServer.Start(Conf(), Populate);
+            await using var h = await RawH2.ConnectAsync(s.Port);
+            T.Eq(1u, await h.ReadSettingAsync(SettingId.EnableConnectProtocol));
+            (string, string)[] Connect(string protocol) => [(":method", "CONNECT"), (":protocol", protocol), (":scheme", "https"), (":path", "/ws"), (":authority", "h2.test"), ("sec-websocket-version", "13")];
+            await h.SendHeadersAsync(1, false, Connect("h2c"));
+            T.Eq("501", await h.ReadStatusAsync(1));
+            await h.SendHeadersAsync(3, false, Connect("something-else"));
+            T.Eq("501", await h.ReadStatusAsync(3));
+            await h.SendHeadersAsync(5, false, (":method", "CONNECT"), (":authority", "h2.test:443")); // plain CONNECT
+            T.Eq("405", await h.ReadStatusAsync(5));
+            await h.SendHeadersAsync(7, true, Connect("websocket")); // END_STREAM: malformed
+            T.Eq(H2Error.ProtocolError, (await h.ReadResetOrHeadersAsync(7)).Code);
+            await h.SendHeadersAsync(9, true, (":method", "GET"), (":protocol", "websocket"), (":scheme", "https"), (":path", "/"), (":authority", "h2.test"));
+            T.Eq(H2Error.ProtocolError, (await h.ReadResetOrHeadersAsync(9)).Code);
+            // No WebSocket handler at a plain location: an ordinary answer, and the connection carries on.
+            await h.SendHeadersAsync(11, false, Connect("websocket"));
+            T.True(await h.ReadStatusAsync(11) is "404" or "405" or "400");
+        });
+
+        T.Add("http2: a WebSocket over HTTP/2 idles out at proxy_read_timeout, counted both ways", async () =>
+        {
+            await using var ws = FakeUpstream.WebSocketEcho();
+            await using var s = TestServer.Start(Conf($"location /ws/ {{ proxy_pass http://127.0.0.1:{ws.Port}; proxy_read_timeout 1s; }}"), Populate);
+            using var handler = new SocketsHttpHandler { SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true } };
+            using var invoker = new HttpMessageInvoker(handler);
+            using var c = new System.Net.WebSockets.ClientWebSocket();
+            c.Options.HttpVersion = System.Net.HttpVersion.Version20;
+            c.Options.HttpVersionPolicy = HttpVersionPolicy.RequestVersionExact;
+            c.Options.KeepAliveInterval = TimeSpan.Zero;
+            await c.ConnectAsync(new Uri($"wss://127.0.0.1:{s.Port}/ws/idle"), invoker, CancellationToken.None);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var buf = new byte[256];
+            try { await c.ReceiveAsync(buf.AsMemory(), new CancellationTokenSource(8000).Token); }
+            catch (Exception e) when (e is System.Net.WebSockets.WebSocketException or IOException or OperationCanceledException) { }
+            T.True(sw.ElapsedMilliseconds < 5000);
+        });
+
         T.Add("http2: request bodies reach an upstream, and upstream responses stream back", async () =>
         {
             await using var up = FakeUpstream.Echo();
@@ -281,6 +347,30 @@ internal sealed class RawH2 : IAsyncDisposable
             try { r = await _ssl.ReadAsync(_buf.AsMemory(_end), cts.Token); }
             catch (Exception e) when (e is IOException or OperationCanceledException or ObjectDisposedException) { Closed = true; return null; }
             if (r == 0) { Closed = true; return null; }
+            _end += r;
+        }
+    }
+
+    /// <summary>The value the server's first SETTINGS frame gives <paramref name="id"/>, or null if it doesn't.</summary>
+    public async Task<uint?> ReadSettingAsync(ushort id, int timeoutMs = 5000)
+    {
+        using var cts = new CancellationTokenSource(timeoutMs);
+        while (true)
+        {
+            int n = FrameReader.TryRead(_buf.AsSpan(_start, _end - _start), 1 << 20, out var f, out var p);
+            if (n > 0)
+            {
+                var payload = p.ToArray();
+                _start += n;
+                if (f.Type != FrameType.Settings || f.Has(FrameFlags.Ack)) continue;
+                await SendAsync(FrameWriter.SettingsAck());
+                for (int i = 0; i + 6 <= payload.Length; i += 6)
+                    if (BinaryPrimitives.ReadUInt16BigEndian(payload.AsSpan(i)) == id) return BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(i + 2));
+                return null;
+            }
+            if (_start > 0) { Buffer.BlockCopy(_buf, _start, _buf, 0, _end - _start); _end -= _start; _start = 0; }
+            int r = await _ssl.ReadAsync(_buf.AsMemory(_end), cts.Token);
+            if (r == 0) return null;
             _end += r;
         }
     }
