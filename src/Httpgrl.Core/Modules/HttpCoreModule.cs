@@ -97,6 +97,14 @@ internal sealed class HttpCoreModule(string prefix) : IModule
             Name = "http2_max_concurrent_streams", Contexts = [ContextKind.Http, ContextKind.Server], MinArgs = 1, MaxArgs = 1,
             Handler = i => i.Conf<HttpCoreConf>().Http2MaxConcurrentStreams = i.Int(0) is var n and >= 1 and <= 1000 ? n : throw i.Error("must be 1..1000"),
         });
+        r.AddDirective(new() { Name = "http3", Contexts = [ContextKind.Http, ContextKind.Server], MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().Http3 = i.Flag(0) });
+        r.AddDirective(new()
+        {
+            Name = "http3_max_concurrent_streams", Contexts = [ContextKind.Http, ContextKind.Server], MinArgs = 1, MaxArgs = 1,
+            Handler = i => i.Conf<HttpCoreConf>().Http3MaxConcurrentStreams = i.Int(0) is var n and >= 1 and <= 1000 ? n : throw i.Error("must be 1..1000"),
+        });
+        r.AddDirective(new() { Name = "quic_retry", Contexts = [ContextKind.Http, ContextKind.Server], MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().QuicRetry = i.Flag(0) });
+        r.AddDirective(new() { Name = "quic_gso", Contexts = [ContextKind.Http, ContextKind.Server], MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().QuicGso = i.Flag(0) });
         r.AddDirective(new() { Name = "underscores_in_headers", Contexts = [ContextKind.Http, ContextKind.Server], MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().UnderscoresInHeaders = i.Flag(0) });
         r.AddDirective(new() { Name = "server_tokens", Contexts = http, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<HttpCoreConf>().ServerTokens = i.Flag(0) });
 
@@ -118,6 +126,9 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         foreach (var server in setup.ScopesOf(ContextKind.Server))
         {
             var sc = server.Get<ServerConf>();
+            // HTTP/3 is opt-in: a quic listener without "http3 on" would be a socket nobody is served on.
+            if (sc.Listens.Find(l => l.Quic) is { } q && !server.Get<HttpCoreConf>().Http3Enabled)
+                throw new ConfigException("\"listen ... quic\" needs \"http3 on;\" in the server", q.Source);
             if (sc.Listens.Count == 0)
                 sc.Listens.Add(new ListenSpec(new IPEndPoint(IPAddress.Any, 80), true, false, false, 511, false, server.Source));
         }
@@ -224,7 +235,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         }
         else ep = ParseInet(i, a, out wildcard);
 
-        bool ssl = false, def = false, reusePort = false, proxyProtocol = false;
+        bool ssl = false, def = false, reusePort = false, proxyProtocol = false, quic = false;
         int backlog = 511;
         for (int k = 1; k < i.Args.Length; k++)
         {
@@ -243,13 +254,21 @@ internal sealed class HttpCoreModule(string prefix) : IModule
                 reusePort = true;
             }
             else if (o == "proxy_protocol") proxyProtocol = true;
+            else if (o == "quic") quic = true;
             else if (o == "http2") _listenHttp2.Add((i.Scope, i.Source)); // warned about in Configure, unless "http2 on" is there too
             else if (o is "deferred" or "fastopen" || o.StartsWith("so_keepalive", StringComparison.Ordinal) || o.StartsWith("ipv6only", StringComparison.Ordinal))
                 continue; // accepted for compatibility; no effect
             else throw i.Error($"invalid parameter \"{o}\"");
         }
+        if (quic)
+        {
+            // A UDP socket for HTTP/3: TLS is QUIC's own (never "ssl"), and there's no PROXY protocol or backlog for UDP.
+            if (ssl) throw i.Error("\"quic\" and \"ssl\" are separate listeners (listen 443 ssl; listen 443 quic;)");
+            if (proxyProtocol) throw i.Error("\"proxy_protocol\" doesn't apply to \"quic\"");
+            if (ep is not IPEndPoint) throw i.Error("\"quic\" needs an IP address and port");
+        }
         var sc = i.Conf<ServerConf>();
-        var spec = new ListenSpec(ep, wildcard, ssl, def, backlog, reusePort, i.Source, proxyProtocol);
+        var spec = new ListenSpec(ep, wildcard, ssl, def, backlog, reusePort, i.Source, proxyProtocol, quic);
         foreach (var l in sc.Listens) if (l.Key == spec.Key) throw i.Error($"duplicate listen {spec.Key}");
         sc.Listens.Add(spec);
     }

@@ -51,6 +51,15 @@ internal static class QuicTests
             T.Eq(0x25, (int)buf[0]);
         });
 
+        T.Add("quic clock: the endpoint's microsecond clock is positive, monotonic and close to real time (no overflow)", () =>
+        {
+            long a = QuicEndpoint.Now();
+            Thread.Sleep(50);
+            long b = QuicEndpoint.Now();
+            T.True(a > 0 && b > a);
+            T.True(b - a is >= 45_000 and < 1_000_000);
+        });
+
         T.Add("quic packet numbers: RFC 9000 A.2/A.3 examples, and decoding near the window edges", () =>
         {
             T.Eq(0xa82f9b32L, Packets.DecodePacketNumber(0xa82f30ea, 0x9b32, 16));

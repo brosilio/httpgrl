@@ -7,10 +7,20 @@ using Httpgrl.Core.Hosting;
 
 namespace Httpgrl.Core.Quic;
 
-/// <summary>What runs on a QUIC endpoint (HTTP/3, or a test protocol). Called on the endpoint's thread.</summary>
+/// <summary>What a new connection gets: the TLS contexts and limits of the configuration it starts under.</summary>
+internal readonly record struct QuicAccept(QuicTlsContext Tls, Func<string?, QuicTlsContext?> Select, QuicOptions Options);
+
+/// <summary>What runs on a QUIC endpoint (HTTP/3, or a test protocol). Every call is on the endpoint's thread.</summary>
 internal interface IQuicApplication
 {
+    /// <summary>The configuration a new connection from <paramref name="remote"/> starts under; null: the endpoint's own.</summary>
+    QuicAccept? Accept(EndPoint remote) => null;
+    void Started(QuicConnection c) { }
     void OnEvent(QuicConnection c, in QuicEvent e, long now);
+    /// <summary>The connection is gone (closed, timed out, or forgotten).</summary>
+    void Closed(QuicConnection c) { }
+    /// <summary>Once per turn of the endpoint's loop, at least every second.</summary>
+    void Tick(long now) { }
 }
 
 internal sealed class QuicEndpointOptions
@@ -62,13 +72,14 @@ internal sealed class QuicEndpoint : IDisposable
 
     private readonly Socket _socket;
     private readonly Socket _waker;
-    private readonly QuicEndpointOptions _o;
-    private readonly QuicTlsContext _defaultTls;
+    private QuicEndpointOptions _o;
+    private readonly QuicTlsContext? _defaultTls;
     private readonly Func<string?, QuicTlsContext?> _selectTls;
     private readonly IQuicApplication _app;
     private readonly ILogger _log;
     private readonly Dictionary<CidKey, Conn> _cids = new();
     private readonly HashSet<Conn> _conns = new();
+    private readonly Dictionary<QuicConnection, Conn> _byConn = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<IpKey, int> _perClient = new();
     private readonly PriorityQueue<Conn, long> _timers = new();
     private readonly Queue<Action> _posted = new();
@@ -98,7 +109,7 @@ internal sealed class QuicEndpoint : IDisposable
     public int Connections => _conns.Count;
     public EndPoint LocalEndPoint => _socket.LocalEndPoint!;
 
-    public QuicEndpoint(Socket socket, QuicTlsContext defaultTls, Func<string?, QuicTlsContext?> selectTls, IQuicApplication app, ILogger log, QuicEndpointOptions? options = null)
+    public QuicEndpoint(Socket socket, QuicTlsContext? defaultTls, Func<string?, QuicTlsContext?> selectTls, IQuicApplication app, ILogger log, QuicEndpointOptions? options = null)
     {
         _socket = socket;
         _defaultTls = defaultTls;
@@ -118,8 +129,18 @@ internal sealed class QuicEndpoint : IDisposable
         }
     }
 
-    /// <summary>Microseconds on the endpoint's monotonic clock.</summary>
-    public static long Now() => Stopwatch.GetTimestamp() * 1_000_000 / Stopwatch.Frequency;
+    private static readonly long ClockStart = Stopwatch.GetTimestamp();
+
+    /// <summary>
+    /// Microseconds on a monotonic clock that starts at one second when the process first uses QUIC: always positive
+    /// (connections use 0 for "no deadline"), and divided before it's multiplied (ticks × 10^6 overflows a long after
+    /// a few hours of uptime at nanosecond resolution).
+    /// </summary>
+    public static long Now()
+    {
+        long t = Stopwatch.GetTimestamp() - ClockStart, f = Stopwatch.Frequency;
+        return 1_000_000 + t / f * 1_000_000 + t % f * 1_000_000 / f;
+    }
 
     public void Start()
     {
@@ -130,9 +151,28 @@ internal sealed class QuicEndpoint : IDisposable
     /// <summary>Run <paramref name="a"/> on the endpoint's thread (the only one that may touch its connections).</summary>
     public void Post(Action a)
     {
-        lock (_posted) _posted.Enqueue(a);
-        Wake();
+        bool wake;
+        lock (_posted)
+        {
+            wake = _posted.Count == 0; // one wakeup per batch: the loop drains the whole queue
+            _posted.Enqueue(a);
+        }
+        if (wake) Wake();
     }
+
+    /// <summary>
+    /// Do <paramref name="work"/> on <paramref name="c"/> from any thread: on the endpoint's thread, if the connection
+    /// still exists; then send whatever it produced.
+    /// </summary>
+    public void Run(QuicConnection c, Action<QuicConnection> work) => Post(() =>
+    {
+        if (!_byConn.TryGetValue(c, out var conn)) return;
+        work(c);
+        Service(conn, Now());
+    });
+
+    /// <summary>Change the endpoint's settings (a reload); the new ones apply to new connections.</summary>
+    public void Update(QuicEndpointOptions o) => Post(() => _o = o);
 
     private void Wake()
     {
@@ -152,6 +192,8 @@ internal sealed class QuicEndpoint : IDisposable
                 long now = Now();
                 RunTimers(now);
                 RunPosted(now);
+                try { _app.Tick(now); }
+                catch (Exception x) when (x is not OutOfMemoryException) { _log.Error("quic application tick failed", new LogField("error", x.Message), new LogField("stack", x.StackTrace)); }
                 long next = _timers.TryPeek(out _, out long t) ? t : now + 1_000_000;
                 int waitUs = (int)Math.Clamp(next - now, 0, 1_000_000);
                 if (!_socket.Poll(waitUs, SelectMode.SelectRead)) continue;
@@ -258,10 +300,13 @@ internal sealed class QuicEndpoint : IDisposable
             return;
         }
         var scid = RandomNumberGenerator.GetBytes(CidLength);
+        // The application's configuration, else the endpoint's own; neither: nothing to answer with.
+        var accept = _app.Accept(from) ?? (_defaultTls is null ? (QuicAccept?)null : new QuicAccept(_defaultTls, _selectTls, _o.Connection));
+        if (accept is not { } acc) { Refused++; return; }
         QuicConnection qc;
         try
         {
-            qc = QuicConnection.Server(_defaultTls, _selectTls, _o.Connection, dcid, h.Scid(d).ToArray(), originalDcid, retryScid, validated,
+            qc = QuicConnection.Server(acc.Tls, acc.Select, acc.Options, dcid, h.Scid(d).ToArray(), originalDcid, retryScid, validated,
                 scid, ResetToken(scid), NewCid, from, now);
         }
         catch (Exception e) when (e is QuicException or InvalidOperationException)
@@ -271,6 +316,8 @@ internal sealed class QuicEndpoint : IDisposable
         }
         var conn = new Conn(qc, client);
         _conns.Add(conn);
+        _byConn[qc] = conn;
+        _app.Started(qc);
         _handshaking++;
         _perClient[client] = mine + 1;
         Accepted++;
@@ -361,6 +408,9 @@ internal sealed class QuicEndpoint : IDisposable
     private void Remove(Conn c)
     {
         if (!_conns.Remove(c)) return;
+        _byConn.Remove(c.C);
+        try { _app.Closed(c.C); }
+        catch (Exception x) when (x is not OutOfMemoryException) { _log.Error("quic application close failed", new LogField("error", x.Message), new LogField("stack", x.StackTrace)); }
         if (c.Handshaking) { c.Handshaking = false; _handshaking--; }
         foreach (var k in c.Cids)
             if (_cids.TryGetValue(k, out var x) && ReferenceEquals(x, c)) _cids.Remove(k);
@@ -491,8 +541,14 @@ internal sealed class QuicEndpoint : IDisposable
         _stop = true;
         Wake();
         _thread?.Join(2000);
-        foreach (var c in _conns) c.C.Dispose();
+        foreach (var c in _conns)
+        {
+            try { _app.Closed(c.C); } // the application lets go of what it holds (a configuration generation)
+            catch (Exception x) when (x is not OutOfMemoryException) { _log.Error("quic application close failed", new LogField("error", x.Message)); }
+            c.C.Dispose();
+        }
         _conns.Clear();
+        _byConn.Clear();
         _cids.Clear();
         _tokenAead.Dispose();
         _waker.Dispose();

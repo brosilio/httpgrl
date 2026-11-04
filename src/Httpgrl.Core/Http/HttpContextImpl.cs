@@ -303,7 +303,7 @@ internal sealed class HttpContextImpl : HttpContext
         if (Resp.Status != 101) throw new InvalidOperationException("upgrade requires status 101");
         if (idleTimeoutMs <= 0) throw new ArgumentOutOfRangeException(nameof(idleTimeoutMs));
         // HTTP/1.1 hands over its connection; HTTP/2 only an extended CONNECT stream (a WebSocket, RFC 8441).
-        var upgrader = (Req.VersionValue != HttpVersion.Http20 || Req.ExtendedConnect ? Upgrader : null)
+        var upgrader = (Req.VersionValue < HttpVersion.Http20 || Req.ExtendedConnect ? Upgrader : null)
             ?? throw new NotSupportedException("this request can't be upgraded");
         Upgraded = true;
         _keepAlive = false;

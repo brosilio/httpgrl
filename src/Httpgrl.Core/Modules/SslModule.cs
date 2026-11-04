@@ -31,6 +31,11 @@ public sealed class SslConf : ScopeConfig<SslConf>
     internal HashSet<TlsCipherSuite>? AllowedSuites;
     /// <summary>Built in Configure when ssl_verify_client is not off; shared by servers with identical settings.</summary>
     public ClientAuth? ClientAuth;
+    /// <summary>
+    /// The OpenSSL context for HTTP/3 (QUIC's TLS), for servers with a quic listener and http3 on. Null for servers
+    /// that require client certificates (not over HTTP/3 yet) or refuse handshakes: their names refuse QUIC handshakes.
+    /// </summary>
+    internal Quic.QuicTlsContext? QuicTls;
 
     protected override void Inherit(SslConf p)
     {
@@ -240,7 +245,7 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
         {
             var sc = server.Get<ServerConf>();
             var ssl = server.Get<SslConf>();
-            bool needs = sc.Listens.Exists(l => l.Ssl);
+            bool needs = sc.Listens.Exists(l => l.Ssl || l.Quic);
             if (!needs) continue;
             if (ssl.RejectHandshake == true) continue; // nothing to present: every handshake that routes here is refused
             if (ssl.Certificate is null || ssl.CertificateKey is null)
@@ -279,6 +284,25 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
                 }
             }
             ssl.ClientAuth = auth;
+            if (sc.Listens.Exists(l => l.Quic) && server.Get<HttpCoreConf>().Http3Enabled)
+            {
+                if (Quic.QuicTls.Unavailable is { } why)
+                {
+                    if (!_quicWarned) { _quicWarned = true; setup.Log.Warn("HTTP/3 unavailable, quic listeners are skipped", new LogField("reason", why)); }
+                }
+                else if (auth is not null)
+                    setup.Log.Warn("no HTTP/3 for a server that requires client certificates (not supported over QUIC yet)", new LogField("at", server.Source.ToString()));
+                else
+                {
+                    if (!_quicContexts.TryGetValue((cert, key), out var qtls))
+                    {
+                        try { qtls = Quic.QuicTlsContext.Server(cert, key, ["h3"]); }
+                        catch (InvalidOperationException e) { throw new ConfigException("HTTP/3: " + e.Message, ssl.CertificateSource); }
+                        _quicContexts[(cert, key)] = qtls;
+                    }
+                    ssl.QuicTls = qtls;
+                }
+            }
 
             // The trust list travels inside the certificate context, so a context is per (cert, key, CA bundle).
             string? trustKey = auth?.Trust is null ? null : Path.GetFullPath(ssl.ClientCa!, root); // the file, not its spelling
@@ -433,9 +457,14 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
     private readonly List<OcspStapler> _staplers = new();
 
     /// <summary>The configuration was replaced and its last connection is gone: stop its staplers (their state lives on).</summary>
+    private readonly Dictionary<(string, string), Quic.QuicTlsContext> _quicContexts = new();
+    private bool _quicWarned;
+
     public void Dispose()
     {
         foreach (var s in _staplers) s.Stop();
+        // Connections hold their own references to these (OpenSSL counts them), so freeing ours is safe while any live.
+        foreach (var c in _quicContexts.Values) c.Dispose();
     }
 
     internal static (X509Certificate2 Leaf, X509Certificate2Collection Chain) LoadCertificate(string certPath, string keyPath)

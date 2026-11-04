@@ -28,6 +28,9 @@ public sealed class HttpCoreConf : ScopeConfig<HttpCoreConf>
     public bool? UnderscoresInHeaders;
     public bool? Http2;
     public int? Http2MaxConcurrentStreams;
+    public bool? Http3;
+    public int? Http3MaxConcurrentStreams;
+    public bool? QuicRetry, QuicGso;
     /// <summary>disable_symlinks: null/off; "" = check from "/"; otherwise an absolute prefix, or "$document_root".</summary>
     public string? DisableSymlinksFrom;
     public bool? DisableSymlinks;
@@ -48,6 +51,12 @@ public sealed class HttpCoreConf : ScopeConfig<HttpCoreConf>
     /// <summary>http2 on: offered by ALPN (never by default).</summary>
     public bool Http2Enabled => Http2 ?? false;
     public int Http2MaxStreams => Http2MaxConcurrentStreams ?? 128;
+    /// <summary>http3 on: served on the server's quic listeners and advertised by Alt-Svc (never by default).</summary>
+    public bool Http3Enabled => Http3 ?? false;
+    public int Http3MaxStreams => Http3MaxConcurrentStreams ?? 128;
+    /// <summary>quic_retry on: validate every client's address with a Retry before keeping any state.</summary>
+    public bool QuicRetryEnabled => QuicRetry ?? false;
+    public bool QuicGsoEnabled => QuicGso ?? true;
     public string DefaultContentType => DefaultType ?? "text/plain";
 
     protected override void Inherit(HttpCoreConf p)
@@ -75,6 +84,10 @@ public sealed class HttpCoreConf : ScopeConfig<HttpCoreConf>
         UnderscoresInHeaders ??= p.UnderscoresInHeaders;
         Http2 ??= p.Http2;
         Http2MaxConcurrentStreams ??= p.Http2MaxConcurrentStreams;
+        Http3 ??= p.Http3;
+        Http3MaxConcurrentStreams ??= p.Http3MaxConcurrentStreams;
+        QuicRetry ??= p.QuicRetry;
+        QuicGso ??= p.QuicGso;
         if (DisableSymlinks is null) { DisableSymlinks = p.DisableSymlinks; DisableSymlinksFrom = p.DisableSymlinksFrom; }
     }
 }
@@ -95,9 +108,10 @@ public sealed class ServerConf : ScopeConfig<ServerConf>
     protected override void Inherit(ServerConf parent) { }
 }
 
-public sealed record ListenSpec(EndPoint EndPoint, bool IsWildcard, bool Ssl, bool DefaultServer, int Backlog, bool ReusePort, SourceLocation Source, bool ProxyProtocol = false)
+public sealed record ListenSpec(EndPoint EndPoint, bool IsWildcard, bool Ssl, bool DefaultServer, int Backlog, bool ReusePort, SourceLocation Source, bool ProxyProtocol = false, bool Quic = false)
 {
-    public string Key => EndPoint switch
+    /// <summary>The socket's identity: a quic (UDP) listener is a different socket from a TCP one on the same port.</summary>
+    public string Key => (Quic ? "quic:" : "") + EndPoint switch
     {
         IPEndPoint ip => (ip.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? $"[{ip.Address}]" : ip.Address.ToString()) + ":" + ip.Port,
         _ => EndPoint.ToString() ?? "",

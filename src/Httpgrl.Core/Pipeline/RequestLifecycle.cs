@@ -16,10 +16,12 @@ internal static class RequestLifecycle
     /// server-level location. Returns the status to reject with: <paramref name="reject"/>, or 421 when the host leads
     /// to a server the TLS handshake (<paramref name="tlsServer"/>, null without TLS) wasn't made for.
     /// </summary>
-    public static int Route(HttpContextImpl ctx, VirtualHosts hosts, ServerRt? tlsServer, int reject)
+    public static int Route(HttpContextImpl ctx, VirtualHosts hosts, ServerRt? tlsServer, int reject, bool clientAuthDone = true)
     {
         ctx.ServerRt = reject == 0 ? hosts.Resolve(ctx.Req.HostValue) : hosts.Default;
-        if (reject == 0 && tlsServer is not null)
+        // A handshake that verified no client certificate (QUIC, for now) never reaches a server that requires one.
+        if (reject == 0 && !clientAuthDone && ctx.ServerRt.ClientAuth is not null) reject = 421;
+        else if (reject == 0 && tlsServer is not null)
         {
             // A client may complete the handshake for one name (SNI) and then ask for another (Host). Never let that
             // carry it past a client-certificate policy it wasn't checked against (cf. nginx's 421).

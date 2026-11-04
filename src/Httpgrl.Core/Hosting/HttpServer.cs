@@ -28,6 +28,9 @@ public sealed class HttpServer : IAsyncDisposable
     private sealed class Listener(Socket socket, ListenBinding binding, HttpRuntime rt)
     {
         public readonly Socket Socket = socket;
+        /// <summary>A quic listener's HTTP/3 side (null for TCP).</summary>
+        public Quic.QuicEndpoint? Endpoint;
+        public Http3.Http3Application? App;
         public volatile State Current = new(binding, rt);
         /// <summary>Set when a reload drops this address: its connections can't move to a newer configuration.</summary>
         public volatile bool Closed;
@@ -49,6 +52,18 @@ public sealed class HttpServer : IAsyncDisposable
     }
 
     public int ActiveConnections => _mgr.Active;
+
+    /// <summary>Bound quic (HTTP/3) endpoints, for tests.</summary>
+    internal IReadOnlyList<EndPoint> QuicEndPoints
+    {
+        get { lock (_listeners) return _listeners.Values.Where(l => l.Endpoint is not null).Select(l => l.Socket.LocalEndPoint!).ToList(); }
+    }
+
+    /// <summary>Open HTTP/3 connections across quic listeners, for tests.</summary>
+    internal int QuicConnections
+    {
+        get { lock (_listeners) return _listeners.Values.Sum(l => l.Endpoint?.Connections ?? 0); }
+    }
 
     public void Start()
     {
@@ -147,10 +162,21 @@ public sealed class HttpServer : IAsyncDisposable
                     if (old.ReusePort != b.ReusePort || old.Backlog != b.Backlog)
                         _rt.Log.Warn("listen option change needs a restart; keeping the socket as it is", new LogField("addr", key));
                     l.Current = new Listener.State(b, next);
+                    if (l.App is not null)
+                    {
+                        l.App.Update(b, next);
+                        l.Endpoint!.Update(QuicOptions(b, next));
+                    }
                 }
                 foreach (var (key, l) in _listeners)
                     if (!wanted.Contains(key)) closing.Add((l.Socket, l.Current.Binding));
-                foreach (var (_, b) in closing) { _listeners[b.ToString()].Closed = true; _listeners.Remove(b.ToString()); }
+                foreach (var (_, b) in closing)
+                {
+                    var gone = _listeners[b.ToString()];
+                    gone.Closed = true;
+                    gone.Endpoint?.Dispose(); // its connections end with the socket
+                    _listeners.Remove(b.ToString());
+                }
                 foreach (var (key, sock, b) in opened) _listeners[key] = new Listener(sock, b, next);
                 _rt = next;
             }
@@ -192,7 +218,7 @@ public sealed class HttpServer : IAsyncDisposable
                 throw new IOException($"cannot listen on {b}: {e.Message}", e);
             }
             opened.Add((key, s, b));
-            rt.Log.Info("listening", new("addr", s.LocalEndPoint?.ToString() ?? key), new("ssl", b.Ssl));
+            rt.Log.Info("listening", new("addr", s.LocalEndPoint?.ToString() ?? key), new("ssl", b.Ssl), new("quic", b.Quic));
         }
         return opened;
     }
@@ -200,12 +226,38 @@ public sealed class HttpServer : IAsyncDisposable
     private void StartLoops(List<(string Key, Socket Socket, ListenBinding Binding)> opened)
     {
         int loops = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
-        foreach (var (key, _, _) in opened)
+        foreach (var (key, _, b) in opened)
         {
             Listener l;
             lock (_listeners) l = _listeners[key];
+            if (b.Quic) { StartQuic(l); continue; }
             for (int i = 0; i < loops; i++) _loops.Add(Task.Run(() => AcceptLoop(l)));
         }
+    }
+
+    /// <summary>A quic listener: HTTP/3 on its UDP socket, one endpoint thread, following reloads.</summary>
+    private void StartQuic(Listener l)
+    {
+        var (b, rt) = (l.Current.Binding, l.Current.Rt);
+        var app = new Http3.Http3Application(_mgr);
+        app.Update(b, rt);
+        var ep = new Quic.QuicEndpoint(l.Socket, null, _ => null, app, rt.Log, QuicOptions(b, rt));
+        app.Attach(ep);
+        l.App = app;
+        l.Endpoint = ep;
+        ep.Start();
+    }
+
+    private static Quic.QuicEndpointOptions QuicOptions(ListenBinding b, HttpRuntime rt)
+    {
+        var core = b.Hosts.Default.Root.Core;
+        return new Quic.QuicEndpointOptions
+        {
+            Retry = core.QuicRetryEnabled,
+            Gso = core.QuicGsoEnabled,
+            MaxConnections = rt.Events.MaxConnections,
+            MaxConnectionsPerClient = rt.Events.PerClient,
+        };
     }
 
     private static void CloseListener(Socket s, ListenBinding b)
@@ -222,6 +274,20 @@ public sealed class HttpServer : IAsyncDisposable
             var path = u.ToString();
             if (File.Exists(path) && new FileInfo(path).Length == 0) File.Delete(path); // stale socket from a previous run
             s = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        }
+        else if (b.Quic)
+        {
+            var ip = (IPEndPoint)b.EndPoint;
+            s = new Socket(ip.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            if (ip.AddressFamily == AddressFamily.InterNetworkV6) s.DualMode = false;
+            if (OperatingSystem.IsWindows()) s.ExclusiveAddressUse = true;
+            else SetReuseAddrOnly(s);
+            if (b.ReusePort) SetReusePort(s);
+            s.ReceiveBufferSize = Math.Max(s.ReceiveBufferSize, 4 << 20);
+            s.SendBufferSize = Math.Max(s.SendBufferSize, 4 << 20);
+            try { s.Bind(b.EndPoint); }
+            catch { s.Dispose(); throw; }
+            return s;
         }
         else
         {
@@ -319,15 +385,21 @@ public sealed class HttpServer : IAsyncDisposable
             _mgr.BeginShutdown();
             _rt.SignalRetiring(); // long-lived handlers (parked tunnel connections) wind down instead of holding up the exit
             List<TunnelDialer> dialers;
+            List<Listener> quic;
             lock (_listeners)
             {
-                foreach (var (_, l) in _listeners) CloseListener(l.Socket, l.Current.Binding);
+                quic = _listeners.Values.Where(l => l.Endpoint is not null).ToList();
+                foreach (var (_, l) in _listeners) if (l.Endpoint is null) CloseListener(l.Socket, l.Current.Binding);
                 _listeners.Clear();
                 dialers = [.. _tunnels.Values];
                 _tunnels.Clear();
             }
             foreach (var d in dialers) d.Close();
             long deadline = Environment.TickCount64 + timeoutMs;
+            // HTTP/3: GOAWAY everywhere, requests finish (within the timeout), then the sockets close.
+            foreach (var l in quic) { var app = l.App!; l.Endpoint!.Post(app.GoAwayAll); }
+            while (quic.Exists(l => l.Endpoint!.Connections > 0) && Environment.TickCount64 < deadline) await Task.Delay(50).ConfigureAwait(false);
+            foreach (var l in quic) { l.Endpoint!.Dispose(); CloseListener(l.Socket, l.Current.Binding); }
             while (_mgr.Active > 0 && Environment.TickCount64 < deadline) await Task.Delay(50).ConfigureAwait(false);
             if (_mgr.Active > 0)
             {

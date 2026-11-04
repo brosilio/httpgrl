@@ -82,6 +82,8 @@ internal sealed class TestServer : IAsyncDisposable
     private readonly JsonLogger _log;
     private readonly MemoryStream _logStream = new();
     public int Port => ((IPEndPoint)Server.EndPoints[0]).Port;
+    /// <summary>The first quic (HTTP/3) listener's UDP endpoint.</summary>
+    public IPEndPoint QuicEndPoint => (IPEndPoint)Server.QuicEndPoints[0];
 
     private TestServer(string dir, HttpServer server, JsonLogger log, MemoryStream ms)
     {

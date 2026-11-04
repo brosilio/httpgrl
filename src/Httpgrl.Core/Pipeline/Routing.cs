@@ -115,6 +115,11 @@ internal sealed class ServerRt
     public readonly bool RejectHandshake;
     /// <summary>Suites this server may negotiate; null where the OS chooses (Windows).</summary>
     public readonly HashSet<System.Net.Security.TlsCipherSuite>? AllowedSuites;
+    /// <summary>
+    /// The Alt-Svc value its TCP responses carry when it serves HTTP/3 (http3 on, a quic listener, a QUIC context):
+    /// <c>h3=":port"; ma=86400</c>. An explicit add_header Alt-Svc wins.
+    /// </summary>
+    public readonly string? AltSvc;
 
     public ServerRt(IConfigScope scope)
     {
@@ -127,6 +132,9 @@ internal sealed class ServerRt
         Stapler = scope.Get<SslConf>().Stapler;
         RejectHandshake = scope.Get<SslConf>().RejectHandshake == true;
         AllowedSuites = scope.Get<SslConf>().AllowedSuites;
+        if (Root.Core.Http3Enabled && scope.Get<SslConf>().QuicTls is not null
+            && scope.Get<ServerConf>().Listens.Find(l => l.Quic) is { EndPoint: IPEndPoint q })
+            AltSvc = $"h3=\":{q.Port}\"; ma=86400";
     }
 
     public LocationRt Find(string path, out Match? match)
@@ -203,8 +211,10 @@ internal sealed class VirtualHosts
 }
 
 /// <summary>One bound socket and the virtual hosts reachable through it.</summary>
-internal sealed class ListenBinding(EndPoint endPoint, bool ssl, int backlog, bool reusePort)
+internal sealed class ListenBinding(EndPoint endPoint, bool ssl, int backlog, bool reusePort, bool quic = false)
 {
+    /// <summary><c>listen ... quic</c>: a UDP socket serving HTTP/3.</summary>
+    public readonly bool Quic = quic;
     public readonly EndPoint EndPoint = endPoint;
     public readonly bool Ssl = ssl;
     public readonly int Backlog = backlog;
@@ -227,7 +237,7 @@ internal sealed class ListenBinding(EndPoint endPoint, bool ssl, int backlog, bo
         return Hosts;
     }
 
-    public override string ToString() => EndPoint switch
+    public override string ToString() => (Quic ? "quic:" : "") + EndPoint switch
     {
         IPEndPoint ip when ip.AddressFamily == AddressFamily.InterNetworkV6 => $"[{ip.Address}]:{ip.Port}",
         _ => EndPoint.ToString() ?? "",
@@ -265,20 +275,23 @@ internal static class RoutingBuilder
 
         // Bind wildcard addresses once; specific addresses on the same port/family become sub-tables.
         var bindings = new List<ListenBinding>();
-        var wild = new Dictionary<(AddressFamily, int), ListenBinding>();
+        var wild = new Dictionary<(AddressFamily, int, bool), ListenBinding>();
         foreach (var (spec, hosts) in groups.Values)
         {
+            // A quic listener is skipped where HTTP/3 can't run (logged once by the ssl module); the rest still starts.
+            if (spec.Quic && Quic.QuicTls.Unavailable is not null) continue;
             if (spec.EndPoint is IPEndPoint ip && spec.IsWildcard)
             {
-                var b = new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort) { Hosts = hosts, ProxyProtocol = spec.ProxyProtocol };
-                wild[(ip.AddressFamily, ip.Port)] = b;
+                var b = new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort, spec.Quic) { Hosts = hosts, ProxyProtocol = spec.ProxyProtocol };
+                wild[(ip.AddressFamily, ip.Port, spec.Quic)] = b;
                 bindings.Add(b);
             }
         }
         foreach (var (spec, hosts) in groups.Values)
         {
             if (spec.IsWildcard) continue;
-            if (spec.EndPoint is IPEndPoint ip && ip.Port != 0 && wild.TryGetValue((ip.AddressFamily, ip.Port), out var w))
+            if (spec.Quic && Quic.QuicTls.Unavailable is not null) continue;
+            if (spec.EndPoint is IPEndPoint ip && ip.Port != 0 && wild.TryGetValue((ip.AddressFamily, ip.Port, spec.Quic), out var w))
             {
                 if (w.Ssl != spec.Ssl) throw new ConfigException($"conflicting \"ssl\" parameter for port {ip.Port}", spec.Source);
                 if (w.ReusePort != spec.ReusePort) throw new ConfigException($"conflicting \"reuseport\" parameter for port {ip.Port}", spec.Source);
@@ -292,7 +305,7 @@ internal static class RoutingBuilder
                 tunnel = http.Children.FirstOrDefault(c => c.Kind == TunnelModule.Kind && c.Get<TunnelConf>().Name == te.Name)?.Get<TunnelConf>().Spec
                     ?? throw new ConfigException($"no tunnel \"{te.Name}\" defined", spec.Source);
             }
-            bindings.Add(new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort) { Hosts = hosts, ProxyProtocol = spec.ProxyProtocol, Tunnel = tunnel });
+            bindings.Add(new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort, spec.Quic) { Hosts = hosts, ProxyProtocol = spec.ProxyProtocol, Tunnel = tunnel });
         }
         return bindings;
     }

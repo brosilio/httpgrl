@@ -9,7 +9,7 @@ namespace Httpgrl.Core.Http2;
 /// <c>:authority</c> and <c>Host</c> agreeing, one valid <c>content-length</c>, and the same path, host and value rules.
 /// A malformed request is a stream error (PROTOCOL_ERROR); a refusal with a status (431, 405) is answered normally.
 /// </summary>
-internal sealed class RequestHead(bool underscores)
+internal sealed class RequestHead(bool underscores, HttpVersion version = HttpVersion.Http20)
 {
     private RequestImpl _req = null!;
     private string? _method, _scheme, _path, _authority, _protocol;
@@ -96,7 +96,7 @@ internal sealed class RequestHead(bool underscores)
         if (method.Length is 0 or > 32) { Malformed("invalid :method"); return -1; }
         foreach (byte b in method) if (!HttpChars.IsToken(b)) { Malformed("invalid :method"); return -1; }
         req.MethodValue = RequestParser.InternMethod(method);
-        req.VersionValue = HttpVersion.Http20;
+        req.VersionValue = version; // HTTP/3 (RFC 9114 4.3) has the same rules for its fields
 
         bool websocket = false;
         if (ReferenceEquals(req.MethodValue, HttpMethods.Connect))

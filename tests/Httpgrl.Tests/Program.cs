@@ -28,5 +28,6 @@ QuicConnectionTests.Register();
 QuicEndpointTests.Register();
 QuicInteropCases.Register();
 Http3Tests.Register();
+Http3SessionTests.Register();
 Fuzz.Register();
 return await T.RunAsync(args.Length > 0 ? args[0] : null);

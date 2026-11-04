@@ -174,6 +174,8 @@ internal sealed class ResponseImpl(HttpContextImpl ctx, ResponseWire wire) : Htt
         t.Phase = "response";
         if (t.MeasuresSendRate) t.StartRate(core.SendMinRateBps);
 
+        // Advertise HTTP/3 on the other protocols' responses (an explicit add_header Alt-Svc wins).
+        if (ctx.ServerRt?.AltSvc is { } alt && ctx.Req.VersionValue < HttpVersion.Http30 && !Headers.Contains("Alt-Svc")) Headers.Set("Alt-Svc", alt);
         wire.BeginHead(ctx, status, upgrade);
 
         if (_encoderFactory is not null && !_noBody && !upgrade)

@@ -1102,6 +1102,9 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
 
     public bool StreamExists(long id) => _streams.ContainsKey(id);
 
+    /// <summary>Bytes readable on a stream right now (in order).</summary>
+    public int StreamAvailable(long id) => _streams.TryGetValue(id, out var s) && s.Recv is not null ? s.Recv.Readable : 0;
+
     private void Enqueue(QuicStream s)
     {
         if (s.InSendQueue) return;

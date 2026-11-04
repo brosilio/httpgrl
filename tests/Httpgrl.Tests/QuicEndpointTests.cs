@@ -58,11 +58,11 @@ internal static class QuicEndpointTests
         private readonly EndPoint _server;
         private readonly byte[] _buf = new byte[65536];
 
-        public UdpClient(EndPoint server, QuicTlsContext tls, string alpn = "echo", QuicOptions? o = null)
+        public UdpClient(EndPoint server, QuicTlsContext tls, string alpn = "echo", QuicOptions? o = null, string sni = "quic.test")
         {
             _server = server;
             Socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-            C = QuicConnection.Client(tls, "quic.test", [alpn], o ?? new QuicOptions(), QuicNet.Cids, server, QuicEndpoint.Now());
+            C = QuicConnection.Client(tls, sni, [alpn], o ?? new QuicOptions(), QuicNet.Cids, server, QuicEndpoint.Now());
         }
 
         public bool Run(Func<bool> done, int timeoutMs = 10_000)
