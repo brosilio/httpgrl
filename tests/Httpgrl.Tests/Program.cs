@@ -21,5 +21,6 @@ Http2Tests.Register();
 Http2SessionTests.Register();
 QuicTests.Register();
 QuicTlsTests.Register();
+QuicRecoveryTests.Register();
 Fuzz.Register();
 return await T.RunAsync(args.Length > 0 ? args[0] : null);
