@@ -25,21 +25,22 @@ namespace Httpgrl.Tests;
 internal static partial class Fuzz
 {
     /// <summary><c>Run</c> returns true when the parser accepted the input (reported, so a run that never gets past the first check is visible).</summary>
-    private sealed record Target(string Name, byte[][] Seeds, byte[][] Dict, Func<byte[], bool> Run, int MaxLen = 16 * 1024);
+    /// <summary>A fuzz target. <paramref name="Serial"/>: it drives one shared, stateful fixture, so it runs on one thread (a lock would make the slow-input check time the queue, not the input).</summary>
+    private sealed record Target(string Name, byte[][] Seeds, byte[][] Dict, Func<byte[], bool> Run, int MaxLen = 16 * 1024, bool Serial = false);
 
     public sealed class Finding(string message) : Exception(message);
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
         RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
-        QuicVarIntTarget(), QuicPacketTarget(), QuicFramesTarget(), QuicTransportParametersTarget(),
+        QuicVarIntTarget(), QuicPacketTarget(), QuicFramesTarget(), QuicTransportParametersTarget(), QuicConnectionTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection" })
         {
-            int iterations = name == "config" ? 3_000 : name == "h2-session" ? 2_000 : 20_000;
+            int iterations = name == "config" ? 3_000 : name == "h2-session" ? 2_000 : name == "quic-connection" ? 1_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
             {
                 var t = Array.Find(All.Value, x => x.Name == name)!;
@@ -96,7 +97,7 @@ internal static partial class Fuzz
                 Interlocked.Increment(ref done);
             }
         }
-        int n = parallel ? Math.Max(1, Environment.ProcessorCount) : 1;
+        int n = parallel && !t.Serial ? Math.Max(1, Environment.ProcessorCount) : 1;
         var threads = new Thread[n];
         for (int k = 0; k < n; k++) (threads[k] = new Thread(Worker, 16 << 20) { IsBackground = true }).Start();
         foreach (var th in threads) th.Join();

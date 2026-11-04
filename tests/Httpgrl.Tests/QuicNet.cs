@@ -1,0 +1,131 @@
+using System.Security.Cryptography;
+using Httpgrl.Core.Quic;
+
+namespace Httpgrl.Tests;
+
+/// <summary>
+/// A deterministic network for two QUIC connections: a virtual clock (microseconds), seeded randomness, and
+/// configurable loss, delay, jitter (hence reordering), duplication and bandwidth. Nothing here is real time, so a
+/// test of retransmission after loss runs in milliseconds and the same way every time.
+/// </summary>
+internal sealed class QuicNet : IDisposable
+{
+    public long Now = 1_000_000;
+    public double Loss, Duplicate;
+    public long DelayUs = 10_000, JitterUs;
+    /// <summary>Bytes per second each way; 0: unlimited.</summary>
+    public long Bandwidth;
+    /// <summary>Drop datagrams in this direction while the predicate says so (targeted loss).</summary>
+    public Func<bool, byte[], bool>? DropIf;
+    public long Delivered, Dropped;
+
+    private readonly Random _rng;
+    private readonly PriorityQueue<(byte[] Data, bool ToServer), (long, long)> _wire = new();
+    private long _seq;
+    private readonly long[] _linkFree = new long[2];
+
+    public QuicConnection Client = null!;
+    public QuicConnection? Server;
+    public readonly QuicTlsContext ServerTls, ClientTls;
+    public readonly QuicOptions ServerOptions, ClientOptions;
+    private readonly string _dir;
+    /// <summary>Server-side datagrams before the server connection exists (to test what the first flight carries).</summary>
+    public long ServerBytesBeforeValidation = -1;
+
+    public static Func<(byte[], byte[])> Cids => () => (RandomNumberGenerator.GetBytes(8), RandomNumberGenerator.GetBytes(16));
+
+    public QuicNet(int seed = 1, QuicOptions? server = null, QuicOptions? client = null, string[]? alpn = null)
+    {
+        _rng = new Random(seed);
+        _dir = Directory.CreateTempSubdirectory("httpgrl-quicnet-").FullName;
+        ProxyTests.MakeCert("quic.test", _dir, "q").Dispose();
+        ServerTls = QuicTlsContext.Server(Path.Combine(_dir, "q.crt"), Path.Combine(_dir, "q.key"), ["test"]);
+        ClientTls = QuicTlsContext.Client(Path.Combine(_dir, "q.crt"));
+        ServerOptions = server ?? new QuicOptions();
+        ClientOptions = client ?? new QuicOptions();
+        Client = QuicConnection.Client(ClientTls, "quic.test", alpn ?? ["test"], ClientOptions, Cids, Now);
+    }
+
+    private void Put(byte[] data, bool toServer)
+    {
+        if (_rng.NextDouble() < Loss || DropIf?.Invoke(toServer, data) == true) { Dropped++; return; }
+        long at = Now;
+        if (Bandwidth > 0)
+        {
+            int dir = toServer ? 0 : 1;
+            long start = Math.Max(Now, _linkFree[dir]);
+            _linkFree[dir] = start + data.Length * 1_000_000L / Bandwidth;
+            at = _linkFree[dir];
+        }
+        at += DelayUs + (JitterUs > 0 ? _rng.NextInt64(JitterUs) : 0);
+        _wire.Enqueue((data, toServer), (at, _seq++));
+        if (_rng.NextDouble() < Duplicate) _wire.Enqueue(((byte[])data.Clone(), toServer), (at + 1000, _seq++));
+    }
+
+    private void Flush()
+    {
+        var buf = new byte[1500];
+        int n;
+        while ((n = Client.Send(buf, Now)) > 0) Put(buf[..n], toServer: true);
+        if (Server is null) return;
+        while ((n = Server.Send(buf, Now)) > 0) Put(buf[..n], toServer: false);
+    }
+
+    private void Deliver(byte[] data, bool toServer)
+    {
+        Delivered++;
+        if (!toServer) { Client.Receive(data, Now); return; }
+        if (Server is null)
+        {
+            if (!Packets.TryParse(data, 8, out var h) || h.Type != PacketType.Initial || data.Length < 1200) return;
+            var dcid = h.Dcid(data).ToArray();
+            var (scid, token) = Cids();
+            Server = QuicConnection.Server(ServerTls, _ => ServerTls, ServerOptions, dcid, h.Scid(data).ToArray(), dcid, null, false, scid, token, Cids, Now);
+        }
+        Server.Receive(data, Now);
+    }
+
+    /// <summary>Run until <paramref name="done"/> holds, nothing more can happen, or <paramref name="maxUs"/> of virtual time passes. True if done.</summary>
+    public bool Run(Func<bool> done, long maxUs = 60_000_000)
+    {
+        long until = Now + maxUs;
+        for (int steps = 0; steps < 2_000_000; steps++)
+        {
+            Flush();
+            if (done()) return true;
+            long next = long.MaxValue;
+            if (_wire.TryPeek(out _, out var pri)) next = pri.Item1;
+            foreach (var c in new[] { Client, Server })
+                if (c is not null && c.Deadline != 0) next = Math.Min(next, c.Deadline);
+            if (next == long.MaxValue || next > until) return done();
+            if (next > Now) Now = next;
+            while (_wire.TryPeek(out var item, out pri) && pri.Item1 <= Now)
+            {
+                _wire.Dequeue();
+                Deliver(item.Data, item.ToServer);
+            }
+            foreach (var c in new[] { Client, Server })
+                if (c is not null && c.Deadline != 0 && c.Deadline <= Now) c.OnTimeout(Now);
+        }
+        throw new Exception("simulation didn't settle");
+    }
+
+    public bool Connected => Client.HandshakeComplete && Server is { HandshakeComplete: true };
+
+    /// <summary>Drain a connection's events, returning them.</summary>
+    public static List<QuicEvent> Events(QuicConnection c)
+    {
+        var l = new List<QuicEvent>();
+        while (c.TryGetEvent(out var e)) l.Add(e);
+        return l;
+    }
+
+    public void Dispose()
+    {
+        Client.Dispose();
+        Server?.Dispose();
+        ServerTls.Dispose();
+        ClientTls.Dispose();
+        try { Directory.Delete(_dir, true); } catch (IOException) { }
+    }
+}

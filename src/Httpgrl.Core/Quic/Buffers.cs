@@ -149,7 +149,8 @@ internal sealed class SendBuffer
     public long Sent => _sent;
     public long Acked => _base;
     public bool Finished => _finAt >= 0;
-    public bool AllAcked => Finished ? _finAcked && _base == _finAt : _base == End;
+    /// <summary>Finished, and everything up to and including the FIN acknowledged (until then the writer may add more).</summary>
+    public bool AllAcked => Finished && _finAcked && _base == _finAt;
     public int Buffered => _len;
 
     public void Write(ReadOnlySpan<byte> data)

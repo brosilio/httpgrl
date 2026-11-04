@@ -149,3 +149,67 @@ internal static partial class Fuzz
             return any;
         }, MaxLen: 512);
 }
+
+internal static partial class Fuzz
+{
+    private static readonly object QuicConnGate = new();
+    private static QuicNet? _quicNet;
+
+    /// <summary>
+    /// A live server connection (handshake done over the virtual network) fed arbitrary 1-RTT frame payloads. Only
+    /// QuicException may come out of frame handling (turned into CONNECTION_CLOSE); afterwards the server's replies
+    /// must never make the client find a malformed frame, nor the server fail internally, and the exchange must settle.
+    /// </summary>
+    private static Target QuicConnectionTarget()
+    {
+        var seed = new byte[512];
+        int p = 0;
+        p += QuicFrameWriter.Stream(seed.AsSpan(p), 0, 0, "hello"u8, false);
+        p += QuicFrameWriter.Stream(seed.AsSpan(p), 4, 10, "x"u8, true);
+        p += QuicFrameWriter.MaxData(seed.AsSpan(p), 1 << 30);
+        p += QuicFrameWriter.MaxStreamData(seed.AsSpan(p), 0, 1 << 20);
+        p += QuicFrameWriter.ResetStream(seed.AsSpan(p), 8, 1, 5);
+        p += QuicFrameWriter.StopSending(seed.AsSpan(p), 0, 3);
+        p += QuicFrameWriter.MaxStreams(seed.AsSpan(p), true, 10);
+        p += QuicFrameWriter.Ping(seed.AsSpan(p));
+        byte[][] seeds = [seed[..p], Convert.FromHexString("0a02000568656c6c6f"), Convert.FromHexString("1801000801020304050607080000000000000000000000000000000000"),
+            Convert.FromHexString("190005"), Convert.FromHexString("1a0102030405060708"), Convert.FromHexString("0201000000"), Convert.FromHexString("1c000000"), Convert.FromHexString("1600")];
+        return new Target("quic-connection", seeds,
+            B("\x08", "\x0a", "\x0b", "\x0f", "\x04", "\x05", "\x10", "\x11", "\x12", "\x13", "\x18", "\x19", "\x02", "\x1c", "\x1d", "\x00", "\x02", "\x03", "\x40\x00", "\x80\x00\x00\x00", "\xff"),
+            data =>
+            {
+                lock (QuicConnGate) return RunQuicConnection(data);
+            }, MaxLen: 1024, Serial: true);
+    }
+
+    private static bool RunQuicConnection(byte[] data)
+    {
+        if (QuicTls.Unavailable is not null) return false;
+        var net = _quicNet;
+        if (net is null || net.Server is null || net.Server.IsDraining || net.Server.IsClosed || net.Client.IsDraining || net.Client.IsClosed)
+        {
+            net?.Dispose();
+            net = _quicNet = new QuicNet(seed: 1, server: new QuicOptions { MaxDatagramFrameSize = 1200, MaxStreamsBidi = 20 },
+                client: new QuicOptions { MaxDatagramFrameSize = 1200 });
+            if (!net.Run(() => net.Connected && net.Client.HandshakeConfirmed && net.Server!.HandshakeConfirmed)) throw new Finding("handshake failed");
+        }
+        var server = net.Server!;
+        try { server.InjectFrames(data, net.Now); }
+        catch (Exception e) { throw new Finding($"{e.GetType().Name} escaped frame handling: {e.Message}"); }
+        bool closedByServer = server.IsDraining || server.IsClosed;
+        // Let the server's reaction reach the client, and the client's answer come back.
+        try { net.Run(() => false, maxUs: 300_000); }
+        catch (Exception e) when (e is not Finding) { throw new Finding($"{e.GetType().Name} while settling: {e.Message}"); }
+        while (net.Client.TryGetEvent(out _)) { }
+        while (server.TryGetEvent(out _)) { }
+        // Injected frames can make the server's view diverge from the client's (streams or connection IDs the client
+        // never created), so the client may object to the state of what it's sent: stream state, limits, flow control,
+        // protocol violations about IDs. What it must never see is a malformed frame, or the server falling over.
+        var c = net.Client;
+        if (c.CloseCode is QuicError.FrameEncodingError or QuicError.InternalError or QuicError.TransportParameterError or QuicError.KeyUpdateError
+            or (>= QuicError.CryptoError and <= QuicError.CryptoError + 255) && !c.ClosedByPeer)
+            throw new Finding($"the server's replies made the client close: {c.CloseCode} ({c.CloseReason})");
+        if (server.CloseCode is QuicError.InternalError && !server.ClosedByPeer) throw new Finding("the server hit an internal error: " + server.CloseReason);
+        return !closedByServer;
+    }
+}
