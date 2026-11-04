@@ -15,5 +15,6 @@ OpsTests.Register();
 StaplingTests.Register();
 ProxyProtocolTests.Register();
 CompressionTests.Register();
+TunnelTests.Register();
 Fuzz.Register();
 return await T.RunAsync(args.Length > 0 ? args[0] : null);

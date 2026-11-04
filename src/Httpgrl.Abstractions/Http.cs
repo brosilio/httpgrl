@@ -32,6 +32,12 @@ public abstract class HttpContext
     public abstract bool IsInternal { get; }
     /// <summary>Signalled when the client connection is torn down (timeout, reset, shutdown).</summary>
     public abstract CancellationToken Aborted { get; }
+    /// <summary>
+    /// Signalled when the configuration this request runs under stops being current: a reload replaced it, or the
+    /// server is shutting down. Long-lived handlers (parked connections, streams) wind down on it; otherwise
+    /// <c>reload_drain_timeout</c> or the shutdown timeout cuts them.
+    /// </summary>
+    public abstract CancellationToken ConfigurationRetired { get; }
     /// <summary>Time since the request head was received.</summary>
     public abstract TimeSpan Elapsed { get; }
     /// <summary>Set false to close the connection after this response.</summary>

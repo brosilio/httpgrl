@@ -98,7 +98,7 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `reload_drain_timeout t;` | main | `60s` | *(httpgrl-specific)* After a reload, connections still on the old configuration (tunnels, long polls, slow transfers) are closed this long after it. `0` closes them at the next sweep (within 250 ms). nginx reuses `worker_shutdown_timeout` for this and defaults to no limit. |
 | `worker_connections n;` | events | `16384` | Global connection cap. When full, the longest-idle keep-alive connection is evicted. |
 | `connections_per_client n;` | events | `256` | Cap per IPv4 address or per IPv6 /64. `0` disables it. *(httpgrl-specific)* |
-| `server`, `listen`, `server_name` | | `*:80` | `listen [addr:]port \| [v6]:port \| unix:/path [ssl] [proxy_protocol] [default_server] [reuseport] [backlog=n]`. With `proxy_protocol`, every connection must start with a PROXY protocol v1 or v2 header (from a load balancer or TCP relay), read within `ssl_handshake_timeout`. A missing, malformed or slow header closes the connection, and the parser never reads past the header. The relayed addresses are in `$proxy_protocol_addr`, `$proxy_protocol_port`, `$proxy_protocol_server_addr` and `$proxy_protocol_server_port`; `$remote_addr` stays the socket peer, as in nginx. Only enable it on sockets that only your relay can reach: anyone who can connect can claim any address. Server names can be exact, `*.x`, `x.*`, `.x`, or `~regex`. |
+| `server`, `listen`, `server_name` | | `*:80` | `listen [addr:]port \| [v6]:port \| unix:/path [ssl] [proxy_protocol] [default_server] [reuseport] [backlog=n]`, or `listen tunnel:name` (see [Reverse tunnels](#reverse-tunnels)). With `proxy_protocol`, every connection must start with a PROXY protocol v1 or v2 header (from a load balancer or TCP relay), read within `ssl_handshake_timeout`. A missing, malformed or slow header closes the connection, and the parser never reads past the header. The relayed addresses are in `$proxy_protocol_addr`, `$proxy_protocol_port`, `$proxy_protocol_server_addr` and `$proxy_protocol_server_port`; `$remote_addr` stays the socket peer, as in nginx. Only enable it on sockets that only your relay can reach: anyone who can connect can claim any address. Server names can be exact, `*.x`, `x.*`, `.x`, or `~regex`. |
 | `listen ... reuseport` | server | off | Sets `SO_REUSEPORT` so other processes of the same user can share the port, for multi-process setups or zero-downtime restarts. Every listener on that address must agree. Without it, a second instance fails to start. Unix only. |
 | `location [=\|^~\|~\|~*] uri {}`, `location @name {}` | server, location | | nginx matching order. Nesting is supported. |
 | `root path;` / `alias path;` | | `<confdir>/html` | Both accept `$variables`. |
@@ -298,11 +298,86 @@ server {
 Variables: `$proxy_host $proxy_port $proxy_add_x_forwarded_for $upstream_addr $upstream_status`. Responses stream
 through without buffering (nginx's `proxy_buffering off`), and are flushed whenever the upstream pauses, so SSE and long-polling work.
 
+A pooled connection that the upstream closed or reset before answering is retried quietly (up to twice, idempotent
+requests only), since keep-alive races aren't the upstream's fault. Anything the upstream actually sent, such as a
+malformed or ambiguous answer, is reported and counted as a failure even on a pooled connection.
+
+### Reverse tunnels
+
+*(httpgrl; nginx has no equivalent.)* Serve sites from a machine with no open ports, such as a box on a home network
+behind NAT. The **agent** (the machine with the content) dials out to a **remote** httpgrl with a public address and
+parks a few connections there. The remote sends requests down those connections and the agent answers them. Both ends
+are ordinary httpgrl configurations.
+
+```nginx
+# remote (public)
+http {
+    upstream home { tunnel; }                       # peers are whichever agents have dialed in
+    server {
+        listen 443 ssl;  server_name tunnel.example.com;
+        ssl_certificate ...;  ssl_certificate_key ...;
+        ssl_verify_client optional;  ssl_client_certificate /etc/httpgrl/agents-ca.pem;
+        location = /.well-known/httpgrl-tunnel { tunnel_accept home; }
+    }
+    server {
+        listen 443 ssl;  server_name home.example.com;
+        location / { proxy_pass http://home; proxy_set_header Host $host; }
+    }
+}
+
+# agent (behind NAT)
+http {
+    tunnel home {
+        connect tunnel.example.com:443;
+        certificate /etc/httpgrl/home.crt;  certificate_key /etc/httpgrl/home.key;   # CN or a DNS SAN = "home"
+    }
+    server {
+        listen tunnel:home;  server_name home.example.com;
+        location / { proxy_pass http://127.0.0.1:8080; }            # or root, or anything else
+    }
+}
+```
+
+How it works:
+- The agent opens TLS connections to the remote, presenting its certificate, and sends
+  `GET /.well-known/httpgrl-tunnel` with `Upgrade: httpgrl-tunnel`.
+- The remote answers `101` and parks the connection in the `tunnel` upstream's pool. From then on the direction is
+  reversed: the remote writes requests and the agent serves them like any accepted connection (its own `server`
+  blocks, locations, limits and logs apply).
+- On the remote, it's a normal upstream: strict parsing of the agent's answers, keep-alive reuse, request bodies,
+  WebSockets and `X-Forwarded-For` all work as with any other `proxy_pass`.
+- The agent keeps `pool` idle connections parked and dials a replacement as soon as one starts serving. A request
+  that finds the pool empty waits up to `proxy_connect_timeout` for one. If no agent has been connected for longer
+  than that, requests fail at once (502) instead of each waiting.
+- Each parked connection has a read pending, so one the agent closes (or one that dies) leaves the pool at once.
+  The remote closes idle parked connections after `idle=` and the agent redials. Doing it from the remote's side
+  means a request can never be written into a connection the agent is just closing.
+
+| Directive | Context | Default | Notes |
+|---|---|---|---|
+| `upstream name { tunnel [max=n]; }` | upstream | `max=64` | Peers are agents that dialed in through `tunnel_accept`. At most `n` connections are parked or serving at once; past that, agents get a 503 and back off. Can't be combined with `server` or `health_check`. Use `proxy_pass http://name` (the tunnel is already TLS, so `https://` is a config error). `keepalive_timeout`/`keepalive_requests` apply. |
+| `tunnel_accept upstream [client=name] [idle=t];` | location | `client=` the upstream's name, `idle=120s` | Accepts agents into the named tunnel upstream. **The agent's client certificate must verify against `ssl_client_certificate`, and its CN or a DNS SAN must be `client=`** (by default, the tunnel's name). So a certificate issued for one tunnel can't park in, or squat, another; otherwise it's a 403. The handshake must be a bodiless HTTP/1.1 `GET` upgrading to `httpgrl-tunnel` (400 otherwise). Use `ssl_verify_client on` on a dedicated server, or `optional` when the same server also serves ordinary clients. Keep `idle` above `proxy_read_timeout`, since a request that's waiting for the agent's answer counts as idle. |
+| `tunnel name { connect host[:port]; certificate f; certificate_key f; ... }` | http | | The agent side. `connect` is the remote (port 443 by default; hostnames are resolved on each dial). `certificate`/`certificate_key` (required) are what the remote checks. `trusted_certificate f` verifies the remote against this PEM bundle instead of the system roots. `server_name n` is the name the remote's certificate must match, also used for SNI and `Host` (default: the `connect` host; required when that's an IP). `uri /path` defaults to `/.well-known/httpgrl-tunnel`. `pool n` idle connections (default 4), `max n` in total (default 64). `connect_timeout t` (default 10s) covers TCP, TLS and the upgrade handshake. `idle_timeout t` (default 5m) is a backstop: normally the remote closes idle connections first. Relative paths resolve against the config directory. |
+| `listen tunnel:name [default_server];` | server | | Puts the server behind the tunnel. Nothing is bound. Requests arrive as plain HTTP/1.1 inside the tunnel's TLS, so `$scheme` is `http` and `$remote_addr` is the remote. The original client is in `X-Forwarded-For` if the remote sets it. Connections stay open between requests whatever `keepalive_timeout` says (the remote decides when it's done with one); `keepalive_requests` still applies. |
+
+Details:
+- **Failures.** The agent backs off exponentially, with jitter, from 1s up to 30s while the remote is unreachable or
+  refusing. It logs the first failure and then each doubling, and logs `tunnel connected` once it recovers. TCP
+  keep-alives on the agent's sockets notice a remote that silently went away.
+- **Reload, remote side.** Parked connections of the old configuration are closed right away (connections in use
+  finish their request first). The agents redial into the new configuration, and requests arriving meanwhile wait
+  for them, so nothing fails.
+- **Reload, agent side.** If the tunnel's remote, URI, name, certificate and trust are unchanged, its connections
+  are kept: they move to the new configuration at their next request, as plaintext keep-alives do. If any of those
+  changed, the connections are closed and redialed with the new settings, so rotating the agent's certificate
+  takes effect.
+
 ## Security model
 
 **Fuzzing.** Every parser of untrusted or semi-trusted bytes has a mutation-fuzz target in
 `tests/Httpgrl.Tests/Fuzz.cs`: the request head, the URI normalizer, chunked bodies, upstream response heads, the
-config parser (with every module's directives) and CRLs. Each target states which rejections are legitimate and
+config parser (with every module's directives), CRLs, OCSP responses, PROXY protocol headers, `Accept-Encoding`
+and the tunnel handshake response. Each target states which rejections are legitimate and
 which invariants an accepted input must hold (e.g. never both `Content-Length` and `chunked`, no dot segments
 in a path). The test suite runs a fixed-seed pass of each, so CI is also a regression fuzz. For long runs:
 
@@ -441,6 +516,7 @@ Then add it to the list in `src/Httpgrl/Program.cs`. There is no reflection and 
 - **Lifetime:** a module instance belongs to one loaded configuration. Every reload builds fresh instances from the list in `Program.cs`, so per-configuration state can live in fields. If a module implements `IDisposable`, it is disposed once the configuration it belongs to has been replaced *and* its last connection has ended (the proxy closes its upstream pools this way).
 - **Counters:** `ctx.Stats()` returns a `ServerStats` snapshot (connections by state, requests, responses by class, reloads, dropped log lines, uptime). `stub_status` is built on it.
 - **Changing the URI:** `ctx.SetUri(path, query, reselectLocation)` rewrites the request URI in place (normalized by the core), optionally choosing the location again. `rewrite` is built on it.
+- **Long-lived handlers:** `ctx.ConfigurationRetired` is cancelled when a reload replaces the configuration the request runs under, or when the server starts shutting down. A handler that holds a connection indefinitely (tunnel parking does) should let go on it, rather than wait to be cut by `reload_drain_timeout` or the shutdown timeout. `ctx.Aborted` is the connection itself going away.
 - **Request end:** `ctx.OnRequestEnd(callback, state)` runs exactly once when the request is over, whether it completed or the connection broke mid-request. Use it to release per-request reservations (`limit_conn` does).
 - **State across reloads:** `setup.Persistent(key, () => new T())` hands back the object the previous configuration stored under `key`, or makes a new one. Rate-limit zones use it so a `SIGHUP` doesn't reset everyone's counters. A failed reload never touches it, and keys the new configuration doesn't ask for are dropped.
 - **Content negotiation:** `AcceptEncoding.Choose(header, gzip, brotli)`, `Accepts` and `AddVary` implement RFC 9110 `Accept-Encoding` handling once, for every module that needs it.

@@ -201,6 +201,15 @@ internal sealed class HttpCoreModule(string prefix) : IModule
             if (a.Length <= 5) throw i.Error("empty unix socket path");
             ep = new UnixDomainSocketEndPoint(a[5..]);
         }
+        else if (a.StartsWith("tunnel:", StringComparison.Ordinal))
+        {
+            // Requests arrive over connections we dial out (see the "tunnel" block). Nothing is bound, and the inner
+            // protocol is plain HTTP/1.1 inside the tunnel's TLS: none of the socket options apply.
+            if (a.Length <= 7) throw i.Error("empty tunnel name");
+            for (int k = 1; k < i.Args.Length; k++)
+                if (i.Args[k] is not ("default_server" or "default")) throw i.Error($"parameter \"{i.Args[k]}\" doesn't apply to a tunnel");
+            ep = new TunnelEndPoint(a[7..]);
+        }
         else ep = ParseInet(i, a, out wildcard);
 
         bool ssl = false, def = false, reusePort = false, proxyProtocol = false;

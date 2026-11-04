@@ -26,8 +26,17 @@ internal sealed class Http1Session
     /// <summary>The server whose TLS settings the handshake used (chosen by SNI).</summary>
     private ServerRt? _tlsServer;
 
-    public Http1Session(Connection conn, ListenBinding binding, HttpRuntime rt, ConnectionManager mgr, Func<(ListenBinding, HttpRuntime)?> current)
+    /// <summary>Tunnel connections: the dialer's TLS stream (already handshaken) and its bookkeeping. Null when accepted.</summary>
+    private readonly Stream? _established;
+    private readonly ReadOnlyMemory<byte> _preread;
+    private readonly TunnelLink? _link;
+
+    public Http1Session(Connection conn, ListenBinding binding, HttpRuntime rt, ConnectionManager mgr, Func<(ListenBinding, HttpRuntime)?> current,
+        Stream? established = null, ReadOnlyMemory<byte> preread = default, TunnelLink? link = null)
     {
+        _established = established;
+        _preread = preread;
+        _link = link;
         _current = current;
         _conn = conn;
         _binding = binding;
@@ -40,11 +49,18 @@ internal sealed class Http1Session
     {
         var info = new ConnectionInfo(_conn.Id, _conn.Socket.RemoteEndPoint, _conn.Socket.LocalEndPoint, _binding.Ssl);
         var core0 = _hosts.Default.Root.Core; // pre-Host limits come from the default server, as in nginx
-        var input = new InputBuffer(4096);
+        var input = new InputBuffer(Math.Max(4096, _preread.Length));
         HttpContextImpl? ctx = null;
         try
         {
-            Stream transport = new TransportStream(_conn);
+            Stream transport = _established ?? new TransportStream(_conn);
+            _transport = transport;
+            if (!_preread.IsEmpty)
+            {
+                // The remote sent its first request right behind the 101: it's the start of our input.
+                _preread.Span.CopyTo(input.Buf);
+                input.End = _preread.Length;
+            }
             if (_binding.ProxyProtocol)
             {
                 _conn.Phase = "proxy protocol";
@@ -98,7 +114,13 @@ internal sealed class Http1Session
                 _conn.ReadOpTimeout = 0;
                 if (input.Count == 0)
                 {
-                    if (first)
+                    if (_link is not null)
+                    {
+                        // Parked at the remote, which closes idle tunnel connections itself; ours is only a backstop.
+                        _conn.SetIdle(_link.IdleTimeoutMs);
+                        _link.Dialer.OnIdle(_link);
+                    }
+                    else if (first)
                     {
                         _conn.Phase = "request header";
                         _conn.BaseDeadline = Environment.TickCount64 + core0.ClientHeaderTimeoutMs;
@@ -108,6 +130,7 @@ internal sealed class Http1Session
                     if (n <= 0) return;
                     _conn.SetActive();
                 }
+                if (_link is not null) _link.Dialer.OnActive(_link);
                 // A plaintext connection between requests carries no state from its configuration: after a reload it
                 // continues under the new one instead of being closed (closing idle keep-alives races clients that
                 // just sent a request, and they can't safely retry a POST). TLS connections were closed at reload:
@@ -119,7 +142,7 @@ internal sealed class Http1Session
                     lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders);
                     ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport, Mgr = _mgr };
                 }
-                if (!first)
+                if (!first || _link is not null)
                 {
                     // The whole head must arrive within client_header_timeout of its first byte; trickling doesn't extend it.
                     _conn.Phase = "request header";
@@ -185,7 +208,9 @@ internal sealed class Http1Session
                 ctx.EndRequest();
                 _mgr.CountResponse(ctx.Resp.Status);
 
-                if (!reusable || keepaliveMs <= 0 || (_rt.Retired && _binding.Ssl))
+                // A tunnel connection stays open between requests whatever keepalive_timeout says: the remote decides when
+                // it's done with it (closing it from here races a request the remote may be sending).
+                if (!reusable || (keepaliveMs <= 0 && _link is null) || (_rt.Retired && _binding.Ssl))
                 {
                     if (!ctx.Upgraded && clean) await LingeringCloseAsync(transport, input).ConfigureAwait(false);
                     return;
@@ -210,6 +235,7 @@ internal sealed class Http1Session
             ctx?.EndRequest(); // a request cut short still releases what it reserved
             ctx?.Resp.ReturnBuffer();
             input.Dispose();
+            if (_link is not null) _link.Dialer.OnClosed(_link);
             _mgr.Release(_conn);
             _rt.Release();
             try { await _transport.DisposeAsync().ConfigureAwait(false); } catch (Exception) { /* already torn down */ }
@@ -271,7 +297,7 @@ internal sealed class Http1Session
         _conn.BaseDeadline = Environment.TickCount64 + LingerMs;
         try
         {
-            if (transport is SslStream ssl) await ssl.ShutdownAsync().ConfigureAwait(false);
+            if (transport is SslStream ssl) await ssl.ShutdownAsync().ConfigureAwait(false); // TLS servers and dialed tunnels alike
             _conn.Socket.Shutdown(SocketShutdown.Send);
             input.Consume(input.Count);
             long seen = 0;

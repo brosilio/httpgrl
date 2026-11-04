@@ -21,6 +21,28 @@ internal static class ProxyTests
 
     public static void Register()
     {
+        T.Add("proxy: a malformed answer on a pooled connection is reported, not quietly retried as a stale connection", async () =>
+        {
+            // The first request on the connection is answered properly; the second gets ambiguous framing. Retrying that
+            // on a fresh connection (as if the pooled one had just gone stale) would hide the upstream's misbehaviour.
+            await using var up = new FakeUpstream(async (st, rd) =>
+            {
+                int n = 0;
+                while (true)
+                {
+                    var (head, _) = await rd.ReadRequestAsync();
+                    if (head.Length == 0) return;
+                    if (n++ == 0) await st.WriteAsync("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"u8.ToArray());
+                    else await st.WriteAsync("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"u8.ToArray());
+                }
+            });
+            await using var s = TestServer.Start(Conf($"location / {{ proxy_pass http://127.0.0.1:{up.Port}; }}"));
+            T.Eq(200, Status(await s.Raw(Get("/a"))));
+            T.Eq(502, Status(await s.Raw(Get("/b"))));
+            T.Eq(1, up.Accepted);
+            T.Contains("both Content-Length and Transfer-Encoding", s.LogText());
+        });
+
         T.Add("proxy_buffering: a slow client doesn't hold the upstream connection; off and X-Accel-Buffering: no stream", async () =>
         {
             var big = new byte[8 << 20];

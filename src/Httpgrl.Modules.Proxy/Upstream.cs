@@ -6,6 +6,9 @@ namespace Httpgrl.Modules.Proxy;
 
 internal sealed class UpstreamServer(EndPoint endPoint, string name, int weight, int maxFails, int failTimeoutMs, bool backup, bool down)
 {
+    /// <summary>The single peer of a tunnel upstream: whoever has connections parked.</summary>
+    public static UpstreamServer ForTunnel(string name) => new(new TunnelPeer(name), name, 1, 0, 10_000, false, false);
+
     public readonly EndPoint EndPoint = endPoint;
     public readonly string Name = name;
     public readonly int Weight = weight;
@@ -153,6 +156,7 @@ internal sealed class UpstreamGroup
     /// </summary>
     public UpstreamConn? TakeIdle(UpstreamServer s, object? identity)
     {
+        if (Tunnel is { } pool) return pool.TakeIdle();
         if (KeepAlive <= 0) return null;
         long now = Environment.TickCount64;
         while (true)
@@ -181,14 +185,24 @@ internal sealed class UpstreamGroup
     public void Retire()
     {
         _retired = true;
+        Tunnel?.Retire();
         var all = new List<UpstreamConn>();
         lock (_lock)
             foreach (var s in _primary.Concat(_backup)) { all.AddRange(s.Idle); s.Idle.Clear(); }
         foreach (var c in all) c.Dispose();
     }
 
+    /// <summary>Set for <c>upstream { tunnel; }</c>: connections come from agents, not from connecting.</summary>
+    public TunnelPool? Tunnel { get; init; }
+
     public void ReturnIdle(UpstreamConn c)
     {
+        if (Tunnel is { } pool)
+        {
+            if (_retired || c.Requests >= KeepAliveRequests || !c.IsReusable()) c.Dispose();
+            else pool.Park(c);
+            return;
+        }
         if (_retired || c.Server.Removed || KeepAlive <= 0 || c.Requests >= KeepAliveRequests || !c.IsReusable()) { c.Dispose(); return; }
         c.IdleSince = Environment.TickCount64;
         UpstreamConn? evicted = null;
@@ -210,7 +224,8 @@ internal sealed class UpstreamGroup
 internal sealed class UpstreamConn : IDisposable
 {
     public readonly UpstreamServer Server;
-    public readonly Socket Socket;
+    /// <summary>Null for a tunnel connection (an upgraded client stream we don't own the socket of).</summary>
+    public readonly Socket? Socket;
     public Stream Stream;
     public byte[] Buf;
     public int Start, End;
@@ -221,8 +236,37 @@ internal sealed class UpstreamConn : IDisposable
     // Reads and writes time out separately: while a request body uploads, the response head is read at the same time.
     private readonly CancellationTokenSource _readCts = new(), _writeCts = new();
     private int _disposed;
+    private Action? _onDispose;
+    /// <summary>
+    /// Tunnel connections, while parked: a read is kept pending so a connection the agent closed (or that died) leaves
+    /// the pool at once. The next request's first read takes over its result (the agent sends nothing unprompted).
+    /// </summary>
+    private Task<int>? _watch;
 
-    private UpstreamConn(UpstreamServer server, Socket socket, Stream stream, int bufSize, object? identity)
+    /// <summary>A parked agent connection (tunnel upstreams). <paramref name="onDispose"/> runs once, when it's done.</summary>
+    public static UpstreamConn ForTunnel(UpstreamServer server, Stream stream, int bufSize, Action onDispose) =>
+        new(server, null, stream, bufSize, null) { _onDispose = onDispose };
+
+    /// <summary>Start watching a parked tunnel connection; <paramref name="fired"/> runs if anything arrives (or it breaks) before it's used.</summary>
+    public void StartWatch(Action<UpstreamConn> fired)
+    {
+        Start = End = 0;
+        Task<int> w;
+        try { w = Stream.ReadAsync(Buf.AsMemory()).AsTask(); }
+        catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { w = Task.FromException<int>(e); }
+        _watch = w;
+        w.ContinueWith(static (t, st) =>
+        {
+            _ = t.Exception; // observed: a broken parked connection is routine
+            var (c, f) = ((UpstreamConn, Action<UpstreamConn>))st!;
+            f(c);
+        }, (this, fired), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    /// <summary>True if the watch read has completed: the parked connection is closed or misbehaved.</summary>
+    public bool WatchFired => _watch is { IsCompleted: true };
+
+    private UpstreamConn(UpstreamServer server, Socket? socket, Stream stream, int bufSize, object? identity)
     {
         Server = server;
         Identity = identity;
@@ -266,12 +310,22 @@ internal sealed class UpstreamConn : IDisposable
     public bool IsReusable()
     {
         if (Volatile.Read(ref _disposed) != 0 || Buffered != 0) return false;
+        if (Socket is null) return !WatchFired;
         try { return Socket.Connected && !Socket.Poll(0, SelectMode.SelectRead); }
         catch (Exception e) when (e is SocketException or ObjectDisposedException) { return false; }
     }
 
     public async ValueTask<int> ReadAsync(Memory<byte> into, int timeoutMs)
     {
+        if (_watch is { } w)
+        {
+            // The watch read went into the start of Buf; the first read of a response always asks for exactly there.
+            _watch = null;
+            if (!System.Runtime.InteropServices.MemoryMarshal.TryGetArray<byte>(into, out var seg) || seg.Array != Buf || seg.Offset != 0)
+                throw new InvalidOperationException("first read of a parked connection must fill the buffer from its start");
+            try { return timeoutMs > 0 ? await w.WaitAsync(TimeSpan.FromMilliseconds(timeoutMs)).ConfigureAwait(false) : await w.ConfigureAwait(false); }
+            catch (TimeoutException) { throw new OperationCanceledException("read timed out"); }
+        }
         if (timeoutMs > 0) _readCts.CancelAfter(timeoutMs);
         try { return await Stream.ReadAsync(into, timeoutMs > 0 ? _readCts.Token : default).ConfigureAwait(false); }
         finally { if (timeoutMs > 0) _readCts.TryReset(); }
@@ -309,14 +363,19 @@ internal sealed class UpstreamConn : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        try { Stream.Dispose(); } catch (Exception e) when (e is IOException or ObjectDisposedException or SocketException) { }
+        try { Stream.Dispose(); } catch (Exception e) when (e is IOException or ObjectDisposedException or SocketException or InvalidOperationException) { }
         _readCts.Dispose();
         _writeCts.Dispose();
+        _onDispose?.Invoke();
     }
 }
 
 /// <summary>The upstream misbehaved (protocol violation, premature close, oversized header): answer 502.</summary>
-internal sealed class UpstreamException(string message) : Exception(message);
+internal sealed class UpstreamException(string message) : Exception(message)
+{
+    /// <summary>The connection closed before a single byte of response: what a pooled connection the peer dropped looks like.</summary>
+    public bool ClosedEarly { get; init; }
+}
 
 /// <summary>
 /// Re-resolves the hostnames of upstream peers every interval (system resolver: /etc/hosts, nsswitch, DNS). A failed

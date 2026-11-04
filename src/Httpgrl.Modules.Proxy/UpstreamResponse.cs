@@ -44,7 +44,7 @@ internal sealed class UpstreamResponse
                     conn.Start = 0;
                 }
                 int n = await conn.ReadAsync(conn.Buf.AsMemory(conn.End), timeoutMs).ConfigureAwait(false);
-                if (n == 0) throw new UpstreamException(conn.Buffered == 0 ? "upstream closed connection before responding" : "upstream closed connection mid-header");
+                if (n == 0) throw conn.Buffered == 0 ? new UpstreamException("upstream closed connection before responding") { ClosedEarly = true } : new UpstreamException("upstream closed connection mid-header");
                 conn.End += n;
             }
             if (headLen + 4 > maxHead) throw new UpstreamException("upstream sent too big header"); // may arrive in one read

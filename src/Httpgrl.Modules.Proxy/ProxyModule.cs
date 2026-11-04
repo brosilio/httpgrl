@@ -76,7 +76,17 @@ public sealed class UpstreamConf : ScopeConfig<UpstreamConf>
     public readonly List<UpstreamServerSpec> Servers = new();
     public int? KeepAlive, KeepAliveTimeout, KeepAliveRequests;
     internal HealthCheckSpec? HealthCheck;
+    /// <summary><c>tunnel [max=N]</c>: peers are agents that dial in (see tunnel_accept), at most this many connections.</summary>
+    public int? TunnelMax;
+    public SourceLocation TunnelSource;
     protected override void Inherit(UpstreamConf parent) { }
+}
+
+/// <summary>tunnel_accept (location-only).</summary>
+public sealed class TunnelAcceptConf : ScopeConfig<TunnelAcceptConf>
+{
+    internal TunnelAcceptSpec? Spec;
+    protected override void Inherit(TunnelAcceptConf parent) { }
 }
 
 public sealed record UpstreamServerSpec(string Address, int Weight, int MaxFails, int FailTimeoutMs, bool Backup, bool Down, SourceLocation Source, bool Resolve = false);
@@ -114,6 +124,8 @@ public sealed class ProxyModule : IModule, IDisposable
         r.AddDirective(new() { Name = "keepalive_timeout", Contexts = up, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<UpstreamConf>().KeepAliveTimeout = i.Millis(0) });
         r.AddDirective(new() { Name = "keepalive_requests", Contexts = up, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<UpstreamConf>().KeepAliveRequests = i.Int(0) });
 
+        r.AddDirective(new() { Name = "tunnel", Contexts = up, MaxArgs = 1, Handler = TunnelUpstream });
+        r.AddDirective(new() { Name = "tunnel_accept", Contexts = [ContextKind.Location], MinArgs = 1, MaxArgs = 3, Handler = TunnelAccept });
         r.AddDirective(new() { Name = "proxy_pass", Contexts = [ContextKind.Location], MinArgs = 1, MaxArgs = 1, Handler = Pass });
         r.AddDirective(new()
         {
@@ -228,6 +240,39 @@ public sealed class ProxyModule : IModule, IDisposable
         i.Conf<UpstreamConf>().Servers.Add(new UpstreamServerSpec(i.Args[0], weight, maxFails, failTimeout, backup, down, i.Source, resolve));
     }
 
+    private static void TunnelUpstream(DirectiveInvocation i)
+    {
+        var u = i.Conf<UpstreamConf>();
+        int max = 64;
+        foreach (var a in i.Args)
+        {
+            if (a.StartsWith("max=", StringComparison.Ordinal) && int.TryParse(a.AsSpan(4), out max) && max is >= 1 and <= 4096) continue;
+            throw i.Error($"invalid parameter \"{a}\"; expected max=1..4096");
+        }
+        u.TunnelMax = max;
+        u.TunnelSource = i.Source;
+    }
+
+    private static void TunnelAccept(DirectiveInvocation i)
+    {
+        var name = i.Args[0];
+        string? client = null;
+        int idle = 120_000;
+        for (int k = 1; k < i.Args.Length; k++)
+        {
+            var a = i.Args[k];
+            if (a.StartsWith("client=", StringComparison.Ordinal) && a.Length > 7) { client = a[7..]; continue; }
+            if (a.StartsWith("idle=", StringComparison.Ordinal) && ConfigValue.TryParseMillis(a.AsSpan(5), out idle) && idle >= 1000) continue;
+            throw i.Error($"invalid parameter \"{a}\"; expected client=NAME or idle=TIME (at least 1s)");
+        }
+        var spec = new TunnelAcceptSpec(name, client ?? name, idle, i.Source);
+        i.Conf<TunnelAcceptConf>().Spec = spec;
+        var h = i.Conf<LocationHandlerConf>();
+        if (h.Handler is not null) throw i.Error($"location already handled by \"{h.Owner}\"");
+        h.Owner = "tunnel_accept";
+        h.Handler = ctx => TunnelAcceptor.AcceptAsync(ctx, spec);
+    }
+
     private static void HealthCheck(DirectiveInvocation i)
     {
         string uri = "/";
@@ -324,8 +369,17 @@ public sealed class ProxyModule : IModule, IDisposable
         foreach (var scope in setup.ScopesOf(Upstream))
         {
             var u = scope.Get<UpstreamConf>();
-            if (u.Servers.Count == 0) throw new ConfigException($"no servers in upstream \"{u.Name}\"", scope.Source);
             if (groups.ContainsKey(u.Name)) throw new ConfigException($"duplicate upstream \"{u.Name}\"", scope.Source);
+            if (u.TunnelMax is int tmax)
+            {
+                // Its peers are whichever agents have dialed in: there's nothing to list, resolve or probe.
+                if (u.Servers.Count > 0) throw new ConfigException($"upstream \"{u.Name}\" is a tunnel; it can't also have \"server\" entries", u.TunnelSource);
+                if (u.HealthCheck is not null) throw new ConfigException($"upstream \"{u.Name}\" is a tunnel; \"health_check\" doesn't apply (a parked connection that dies leaves the pool at once)", u.TunnelSource);
+                var pool = new TunnelPool(u.Name, tmax);
+                groups[u.Name] = new UpstreamGroup(u.Name, [pool.Server], tmax, u.KeepAliveTimeout ?? 60_000, u.KeepAliveRequests ?? 1000) { Tunnel = pool };
+                continue;
+            }
+            if (u.Servers.Count == 0) throw new ConfigException($"no servers in upstream \"{u.Name}\"", scope.Source);
             var servers = new List<UpstreamServer>();
             var resolvable = new List<ResolvableSpec>();
             foreach (var s in u.Servers)
@@ -347,8 +401,9 @@ public sealed class ProxyModule : IModule, IDisposable
             {
                 if (groups.Count == 0) throw new ConfigException("proxy_pass with variables needs upstream blocks to choose from", pc.PassSource);
                 pc.DynTargets = new Dictionary<string, ProxyTarget>(StringComparer.OrdinalIgnoreCase);
-                foreach (var name in groups.Keys)
-                    pc.DynTargets[name] = BuildTarget(pc, groups, implicitGroups, setup.Log, (pc.DynTls ? "https://" : "http://") + name);
+                foreach (var (name, g) in groups)
+                    if (!(pc.DynTls && g.Tunnel is not null)) // tunnels are TLS already, and spoken to in plain HTTP inside
+                        pc.DynTargets[name] = BuildTarget(pc, groups, implicitGroups, setup.Log, (pc.DynTls ? "https://" : "http://") + name);
                 pc.RedirectRules = pc.Redirects is null ? [] : RedirectRules(pc, setup); // no "default" mapping for a variable URL
                 continue;
             }
@@ -357,6 +412,14 @@ public sealed class ProxyModule : IModule, IDisposable
         }
         _groups.AddRange(groups.Values);
         _groups.AddRange(implicitGroups.Values);
+
+        foreach (var loc in setup.ScopesOf(ContextKind.Location))
+        {
+            if (!loc.TryGet<TunnelAcceptConf>(out var ta) || ta.Spec is not { } spec) continue;
+            if (!groups.TryGetValue(spec.Upstream, out var g) || g.Tunnel is null)
+                throw new ConfigException($"tunnel_accept: no \"upstream {spec.Upstream} {{ tunnel; }}\" block", spec.Source);
+            spec.Pool = g.Tunnel;
+        }
 
         // Health checks probe with the scheme/TLS settings that every location proxying to the group shares.
         var checkers = new Dictionary<UpstreamGroup, HealthChecker>();
@@ -502,7 +565,11 @@ public sealed class ProxyModule : IModule, IDisposable
         else
         {
             SplitHostPort(authority, defPort, src, out host, out port, out bool explicitPort);
-            if (!explicitPort && groups.TryGetValue(authority, out group)) { }
+            if (!explicitPort && groups.TryGetValue(authority, out group))
+            {
+                if (tls && group.Tunnel is not null)
+                    throw new ConfigException($"upstream \"{authority}\" is a tunnel (already TLS end to end): use http://", src);
+            }
             else
             {
                 var key = (tls ? "s:" : "") + host + ":" + port;

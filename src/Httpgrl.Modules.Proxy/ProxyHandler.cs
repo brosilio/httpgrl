@@ -57,6 +57,20 @@ internal static class ProxyHandler
             if (server is null) break;
             var conn = t.Group.TakeIdle(server, t.Ssl);
             bool reused = conn is not null;
+            if (conn is null && t.Group.Tunnel is { } pool)
+            {
+                // No agent connection parked: the agent refills its pool as soon as one is taken, so wait a little.
+                conn = await pool.WaitAsync(conf.ConnectTimeoutMs, abort).ConfigureAwait(false);
+                if (conn is null)
+                {
+                    if (abort.IsCancellationRequested) return HandlerResult.Drop;
+                    tried.Add(server);
+                    failStatus = 502;
+                    ctx.Log.Warn("no tunnel connection available", new("upstream", server.Display), new("uri", req.RawTarget));
+                    continue;
+                }
+                reused = true; // a parked connection, like a pooled one: if it turns out dead, retry quietly
+            }
             if (conn is null)
             {
                 try { conn = await UpstreamConn.ConnectAsync(server, t, conf.ConnectTimeoutMs, Math.Max(conf.HeaderBufferSize, MinConnBuffer), abort).ConfigureAwait(false); }
@@ -101,8 +115,10 @@ internal static class ProxyHandler
                 if (abort.IsCancellationRequested) return HandlerResult.Drop;
                 bool timedOut = e is OperationCanceledException;
                 bool replayable = !bodyStarted && (!headSent || idempotent);
-                // A pooled connection the peer closed after our liveness check: retry quietly, it's not the peer's fault.
-                if (reused && !timedOut && replayable && stale++ < StaleRetries) continue;
+                // A pooled connection the peer closed (or reset) after our liveness check: retry quietly, it's not the peer's
+                // fault. Anything the peer actually sent (a malformed or ambiguous answer) is its fault, and is reported.
+                bool closedOnUs = e is IOException or SocketException or ObjectDisposedException || (e is UpstreamException { ClosedEarly: true });
+                if (reused && closedOnUs && replayable && stale++ < StaleRetries) continue;
                 t.Group.Fail(server);
                 tried.Add(server);
                 failStatus = timedOut ? 504 : 502;

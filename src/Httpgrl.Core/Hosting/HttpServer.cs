@@ -18,6 +18,8 @@ public sealed class HttpServer : IAsyncDisposable
     private ConnectionManager _mgr = null!;
     /// <summary>Keyed by endpoint (see <see cref="ListenBinding.ToString"/>).</summary>
     private readonly Dictionary<string, Listener> _listeners = new(StringComparer.Ordinal);
+    /// <summary><c>listen tunnel:NAME</c> bindings, keyed by tunnel name. Guarded by <see cref="_listeners"/>.</summary>
+    private readonly Dictionary<string, TunnelDialer> _tunnels = new(StringComparer.Ordinal);
     private readonly List<Task> _loops = new();
     private readonly SemaphoreSlim _reloadLock = new(1, 1);
     private volatile bool _stopping;
@@ -43,7 +45,7 @@ public sealed class HttpServer : IAsyncDisposable
     /// <summary>Actual bound endpoints (port 0 resolved), in binding order.</summary>
     public IReadOnlyList<EndPoint> EndPoints
     {
-        get { lock (_listeners) return _rt.Bindings.ConvertAll(b => _listeners[b.ToString()].Socket.LocalEndPoint!); }
+        get { lock (_listeners) return _rt.Bindings.FindAll(b => b.Tunnel is null).ConvertAll(b => _listeners[b.ToString()].Socket.LocalEndPoint!); }
     }
 
     public int ActiveConnections => _mgr.Active;
@@ -56,6 +58,48 @@ public sealed class HttpServer : IAsyncDisposable
         lock (_listeners)
             foreach (var (key, s, b) in opened) _listeners[key] = new Listener(s, b, _rt);
         StartLoops(opened);
+        SyncTunnels(_rt);
+    }
+
+    /// <summary>Tunnel dialers for <paramref name="rt"/>: kept (and switched over) while a tunnel's identity is unchanged, else replaced.</summary>
+    private void SyncTunnels(HttpRuntime rt)
+    {
+        var start = new List<TunnelDialer>();
+        var stop = new List<TunnelDialer>();
+        lock (_listeners)
+        {
+            var wanted = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var b in rt.Bindings)
+            {
+                if (b.Tunnel is not { } spec) continue;
+                wanted.Add(spec.Name);
+                if (_tunnels.TryGetValue(spec.Name, out var d))
+                {
+                    if (d.Spec.Identity == spec.Identity) { d.Update(b, rt); continue; }
+                    // New remote, certificate or trust: connections made under the old settings mustn't carry on.
+                    stop.Add(d);
+                }
+                var nd = new TunnelDialer(b, rt, _mgr);
+                _tunnels[spec.Name] = nd;
+                start.Add(nd);
+            }
+            foreach (var (name, d) in _tunnels)
+                if (!wanted.Contains(name)) stop.Add(d);
+            foreach (var d in stop)
+                if (_tunnels.TryGetValue(d.Spec.Name, out var cur) && ReferenceEquals(cur, d)) _tunnels.Remove(d.Spec.Name);
+        }
+        foreach (var d in stop) d.Close();
+        foreach (var d in start)
+        {
+            rt.Log.Info("tunnel started", new("tunnel", d.Spec.Name), new("remote", d.Spec.Host + ":" + d.Spec.Port), new("pool", (long)d.Spec.Pool));
+            d.Start();
+        }
+    }
+
+    /// <summary>Idle and total connections of a tunnel (tests).</summary>
+    internal (int Idle, int Total)? TunnelCounts(string name)
+    {
+        lock (_listeners) return _tunnels.TryGetValue(name, out var d) ? d.Counts() : null;
     }
 
     /// <summary>
@@ -95,6 +139,7 @@ public sealed class HttpServer : IAsyncDisposable
                 var wanted = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var b in next.Bindings)
                 {
+                    if (b.Tunnel is not null) continue;
                     var key = b.ToString();
                     wanted.Add(key);
                     if (!_listeners.TryGetValue(key, out var l)) continue;
@@ -110,6 +155,7 @@ public sealed class HttpServer : IAsyncDisposable
                 _rt = next;
             }
             StartLoops(opened);
+            SyncTunnels(next);
             foreach (var (sock, b) in closing)
             {
                 _rt.Log.Info("stopped listening", new LogField("addr", b.ToString()));
@@ -135,6 +181,7 @@ public sealed class HttpServer : IAsyncDisposable
         var opened = new List<(string, Socket, ListenBinding)>();
         foreach (var b in rt.Bindings)
         {
+            if (b.Tunnel is not null) continue; // dialed, not bound
             var key = b.ToString();
             lock (_listeners) if (_listeners.ContainsKey(key)) continue;
             Socket s;
@@ -269,11 +316,16 @@ public sealed class HttpServer : IAsyncDisposable
             _stopping = true;
             if (_mgr is null) { _rt.Retire(); return; } // never started
             _mgr.BeginShutdown();
+            _rt.SignalRetiring(); // long-lived handlers (parked tunnel connections) wind down instead of holding up the exit
+            List<TunnelDialer> dialers;
             lock (_listeners)
             {
                 foreach (var (_, l) in _listeners) CloseListener(l.Socket, l.Current.Binding);
                 _listeners.Clear();
+                dialers = [.. _tunnels.Values];
+                _tunnels.Clear();
             }
+            foreach (var d in dialers) d.Close();
             long deadline = Environment.TickCount64 + timeoutMs;
             while (_mgr.Active > 0 && Environment.TickCount64 < deadline) await Task.Delay(50).ConfigureAwait(false);
             if (_mgr.Active > 0)

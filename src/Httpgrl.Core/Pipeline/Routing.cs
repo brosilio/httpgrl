@@ -200,6 +200,8 @@ internal sealed class ListenBinding(EndPoint endPoint, bool ssl, int backlog, bo
     public readonly bool ReusePort = reusePort;
     /// <summary>Every connection starts with a PROXY protocol header (mandatory).</summary>
     public bool ProxyProtocol { get; init; }
+    /// <summary><c>listen tunnel:NAME</c>: nothing is bound; connections are dialed out per this spec.</summary>
+    public TunnelSpec? Tunnel { get; init; }
     public VirtualHosts Hosts = new();
     /// <summary>When bound to a wildcard address: servers listening on specific local addresses of the same port.</summary>
     public Dictionary<IPAddress, VirtualHosts>? ByAddress;
@@ -273,7 +275,13 @@ internal static class RoutingBuilder
                 (w.ByAddress ??= new())[ip.Address] = hosts;
                 continue;
             }
-            bindings.Add(new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort) { Hosts = hosts, ProxyProtocol = spec.ProxyProtocol });
+            TunnelSpec? tunnel = null;
+            if (spec.EndPoint is TunnelEndPoint te)
+            {
+                tunnel = http.Children.FirstOrDefault(c => c.Kind == TunnelModule.Kind && c.Get<TunnelConf>().Name == te.Name)?.Get<TunnelConf>().Spec
+                    ?? throw new ConfigException($"no tunnel \"{te.Name}\" defined", spec.Source);
+            }
+            bindings.Add(new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort) { Hosts = hosts, ProxyProtocol = spec.ProxyProtocol, Tunnel = tunnel });
         }
         return bindings;
     }

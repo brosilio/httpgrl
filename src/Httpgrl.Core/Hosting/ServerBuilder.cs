@@ -29,7 +29,7 @@ public static class ServerBuilder
     private static HttpRuntime Build(IEnumerable<IModule> extra, JsonLogger log, string prefix, Func<ConfigParser, ConfigScope> parse,
         IReadOnlyDictionary<string, object> previous)
     {
-        IModule[] modules = [new HttpCoreModule(prefix), new SslModule(prefix), new AccessLogModule(), .. extra];
+        IModule[] modules = [new HttpCoreModule(prefix), new SslModule(prefix), new TunnelModule(prefix), new AccessLogModule(), .. extra];
 
         var registry = new Registry();
         foreach (var m in modules)

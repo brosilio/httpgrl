@@ -31,12 +31,12 @@ internal static class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(),
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake" })
         {
             int iterations = name == "config" ? 3_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
@@ -389,6 +389,26 @@ internal static class Fuzz
                 return true;
             }, MaxLen: 2048);
     }
+
+    /// <summary>The remote's answer to a tunnel agent's Upgrade (what the agent reads before serving anything).</summary>
+    private static Target TunnelHandshakeTarget() => new("tunnel-handshake",
+        B("HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: httpgrl-tunnel\r\n\r\nGET / HTTP/1.1\r\n",
+          "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n", "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n"),
+        B("\r\n", "\r", "\n", ":", " ", "\t", "HTTP/1.1 ", "HTTP/1.0 ", "101", "200", "Upgrade", "Connection", "httpgrl-tunnel", "upgrade", "\x00", "\x7f"),
+        data =>
+        {
+            int r = Httpgrl.Core.Modules.TunnelHandshake.Parse(data, out int status);
+            if (r > data.Length) throw new Finding($"consumed {r} of {data.Length} bytes");
+            if (r > Httpgrl.Core.Modules.TunnelHandshake.MaxHead) throw new Finding("head longer than the cap");
+            if (r == 0 && data.Length >= Httpgrl.Core.Modules.TunnelHandshake.MaxHead) throw new Finding("wants more bytes past the cap");
+            if (r <= 0) return false;
+            if (status != 101 || !data.AsSpan().StartsWith("HTTP/1.1 101"u8)) throw new Finding("accepted something other than a 101");
+            if (!data.AsSpan(0, r).EndsWith("\r\n\r\n"u8) || data.AsSpan(0, r - 2).IndexOf("\r\n\r\n"u8) >= 0) throw new Finding("head boundary is not the first empty line");
+            var text = Encoding.Latin1.GetString(data, 0, r);
+            if (!text.Contains("httpgrl-tunnel", StringComparison.OrdinalIgnoreCase)) throw new Finding("accepted without our Upgrade token");
+            foreach (char c in text) if ((c < 0x20 && c is not ('\t' or '\r' or '\n')) || c == 0x7f) throw new Finding("control character in an accepted head");
+            return true;
+        }, MaxLen: 10_000);
 
     /// <summary>OCSP responses (what a responder, or a man in the middle on its plain-HTTP path, sends us to staple).</summary>
     private static Target OcspTarget()

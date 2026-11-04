@@ -94,6 +94,7 @@ internal sealed class HttpContextImpl : HttpContext
     public override IConfigScope Location => Loc.Scope;
     public override bool IsInternal => Internal;
     public override CancellationToken Aborted => Conn.AbortToken;
+    public override CancellationToken ConfigurationRetired => Rt.RetiredToken;
     /// <summary>Modules may only turn keep-alive off; the core decides whether it was allowed at all.</summary>
     public override bool KeepAlive { get => _keepAlive; set { if (!value) _keepAlive = false; } }
     public override TimeSpan Elapsed => Stopwatch.GetElapsedTime(_start);

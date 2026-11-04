@@ -300,7 +300,19 @@ internal sealed class HttpRuntime
     {
         Volatile.Write(ref _retireDeadline, deadline);
         _retired = true;
+        SignalRetiring();
         if (Volatile.Read(ref _connections) == 0) DisposeModules();
+    }
+
+    private readonly CancellationTokenSource _retiredCts = new();
+    /// <summary>Cancelled once this generation stops being current (reload or shutdown); see HttpContext.ConfigurationRetired.</summary>
+    public CancellationToken RetiredToken => _retiredCts.Token;
+
+    /// <summary>Tell long-lived handlers to wind down (also at the start of a shutdown, before connections are waited for).</summary>
+    public void SignalRetiring()
+    {
+        try { _retiredCts.Cancel(); }
+        catch (AggregateException e) { Log.Error("retire callback failed", new LogField("error", e.InnerException?.Message)); }
     }
 
     private void DisposeModules()
