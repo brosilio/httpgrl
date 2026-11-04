@@ -304,7 +304,15 @@ internal sealed class ResponseImpl(HttpContextImpl ctx) : HttpResponse
 
 public static class ServerInfo
 {
-    public static readonly string Version = typeof(ServerInfo).Assembly.GetName().Version?.ToString(3) ?? "0";
+    /// <summary>
+    /// The semver version from <c>&lt;Version&gt;</c> (pre-release labels included, e.g. 0.2.0-rc.1). Build metadata
+    /// (the "+commit" the SDK appends) is dropped: it would put the source revision in every opt-in Server header.
+    /// </summary>
+    public static readonly string Version = Semver(
+        System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(typeof(ServerInfo).Assembly)?.InformationalVersion
+        ?? typeof(ServerInfo).Assembly.GetName().Version?.ToString(3) ?? "0.0.0");
+
+    internal static string Semver(string v) => v.IndexOf('+') is var plus and >= 0 ? v[..plus] : v;
     internal static readonly byte[] HeaderWithVersion = System.Text.Encoding.ASCII.GetBytes("Server: httpgrl/" + Version + "\r\n");
 }
 

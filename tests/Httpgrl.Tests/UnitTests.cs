@@ -11,6 +11,14 @@ internal static class UnitTests
 {
     public static void Register()
     {
+        T.Add("version: the reported version is semver, without build metadata", () =>
+        {
+            var v = Httpgrl.Core.Http.ServerInfo.Version;
+            T.True(System.Text.RegularExpressions.Regex.IsMatch(v, @"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"));
+            T.Eq("0.2.0-rc.1", Httpgrl.Core.Http.ServerInfo.Semver("0.2.0-rc.1+3f2a9c1"));
+            T.Eq("1.0.0", Httpgrl.Core.Http.ServerInfo.Semver("1.0.0"));
+        });
+
         // ---------------- URI normalization ----------------
         T.Add("uri: dot segments and slashes", () =>
         {
