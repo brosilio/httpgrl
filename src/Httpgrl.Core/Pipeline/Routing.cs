@@ -113,6 +113,8 @@ internal sealed class ServerRt
     public readonly ClientAuth? ClientAuth;
     public readonly OcspStapler? Stapler;
     public readonly bool RejectHandshake;
+    /// <summary>Suites this server may negotiate; null where the OS chooses (Windows).</summary>
+    public readonly HashSet<System.Net.Security.TlsCipherSuite>? AllowedSuites;
 
     public ServerRt(IConfigScope scope)
     {
@@ -124,6 +126,7 @@ internal sealed class ServerRt
         ClientAuth = scope.Get<SslConf>().ClientAuth;
         Stapler = scope.Get<SslConf>().Stapler;
         RejectHandshake = scope.Get<SslConf>().RejectHandshake == true;
+        AllowedSuites = scope.Get<SslConf>().AllowedSuites;
     }
 
     public LocationRt Find(string path, out Match? match)

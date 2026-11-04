@@ -80,6 +80,14 @@ deliberate:
   under AOT. `StaplingAccess.SelfTest` turns a missing member into a config error, never a silent no-op.
 - Don't add more of these without the owner's agreement.
 
+## OpenSSL's process default (one deliberate piece of global state)
+
+`src/Httpgrl.Core/Modules/OpenSslDefaults.cs` loads the AEAD-only cipher default into OpenSSL's process-wide
+`system_default` (public OpenSSL API, from memory), so .NET can keep caching server contexts and TLS sessions resume.
+It's fixed, installed once, and identical for every configuration, so loading a configuration still changes nothing
+the running one depends on. Don't make it follow `ssl_ciphers` or vary between reloads; per-server lists use a
+`CipherSuitesPolicy`. The "tls: sessions resume" and "ssl_ciphers" tests pin both properties.
+
 ## Reload
 
 `SIGHUP` builds a complete new configuration (fresh module instances) and swaps it in only if *everything*

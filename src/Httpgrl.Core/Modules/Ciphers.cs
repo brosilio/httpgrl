@@ -71,21 +71,65 @@ internal static class Ciphers
 
     public static IReadOnlyList<TlsCipherSuite> DefaultSuites => [.. Tls13, .. Tls12Default];
 
+    /// <summary>The suites a server allows, and the same as OpenSSL strings (null where a suite has no OpenSSL name here).</summary>
+    public sealed record Choice(TlsCipherSuite[] Suites, string? OpenSsl12, string OpenSsl13)
+    {
+        public bool IsTls13(TlsCipherSuite s) => Array.IndexOf(Tls13, s) >= 0;
+    }
+
     /// <summary>
-    /// The policy for an <c>ssl_ciphers</c> value (null: the AEAD-only default), as an opaque object for
-    /// <see cref="Apply"/>. Null on Windows, whose TLS stack (SChannel) can't be given a suite list per server.
+    /// The suites for an <c>ssl_ciphers</c> value (null: the AEAD-only default). Null on Windows, whose TLS stack
+    /// (SChannel) can't be given a suite list per server: there the OS decides, and an explicit list is an error.
     /// </summary>
-    public static object? Resolve(string? spec, SourceLocation src, Action<string> warn)
+    public static Choice? Resolve(string? spec, SourceLocation src, Action<string> warn)
     {
         if (OperatingSystem.IsWindows())
         {
             if (spec is not null) throw new ConfigException("ssl_ciphers: this platform's TLS stack doesn't allow choosing cipher suites", src);
             return null;
         }
-        if (spec is null) return new CipherSuitesPolicy([.. Tls13, .. Tls12Default]);
-        var (suites, warning) = Parse(spec, src);
-        if (warning is not null) warn(warning);
-        return new CipherSuitesPolicy(suites);
+        List<TlsCipherSuite> suites;
+        if (spec is null) suites = [.. Tls13, .. Tls12Default];
+        else
+        {
+            string? warning;
+            (suites, warning) = Parse(spec, src);
+            if (warning is not null) warn(warning);
+        }
+        var t12 = new List<string>();
+        var t13 = new List<string>();
+        bool named = true;
+        foreach (var x in suites)
+        {
+            if (Array.IndexOf(Tls13, x) >= 0) { t13.Add(x.ToString()); continue; }
+            var n = OpenSslName(x);
+            if (n is null) named = false;
+            else t12.Add(n);
+        }
+        return new Choice([.. suites], named ? string.Join(':', t12) : null, string.Join(':', t13));
+    }
+
+    private static string? OpenSslName(TlsCipherSuite s)
+    {
+        foreach (var (k, v) in OpenSslNames) if (v == s && !k.StartsWith("TLS_", StringComparison.Ordinal)) return k;
+        return null;
+    }
+
+    public static bool IsDefault(Choice c) => c.Suites.AsSpan().SequenceEqual([.. Tls13, .. Tls12Default]);
+
+    /// <summary>Make the AEAD-only default OpenSSL's process-wide default (see OpenSslDefaults). Null if in force, else why not.</summary>
+    public static string? EnsureProcessDefault()
+    {
+        if (OperatingSystem.IsWindows()) return "the OS chooses the suites";
+        var d = Resolve(null, default, _ => { })!;
+        return OpenSslDefaults.Ensure(d.OpenSsl12!, d.OpenSsl13);
+    }
+
+    /// <summary>The fallback: the same suites as a CipherSuitesPolicy, which costs session resumption (.NET won't cache).</summary>
+    public static object? Policy(Choice? choice)
+    {
+        if (OperatingSystem.IsWindows() || choice is null) return null;
+        return new CipherSuitesPolicy(choice.Suites);
     }
 
     public static void Apply(SslServerAuthenticationOptions o, object? policy)

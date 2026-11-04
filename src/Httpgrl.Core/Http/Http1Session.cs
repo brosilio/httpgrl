@@ -82,6 +82,14 @@ internal sealed class Http1Session
                 var ssl = new ClientAuthSslStream(transport);
                 _transport = transport = ssl;
                 await ssl.AuthenticateAsServerAsync(SelectTls, this, CancellationToken.None).ConfigureAwait(false);
+                // Fail closed: the suite list is set on .NET's cached OpenSSL context (OpenSslContextAccess). Should the
+                // runtime ever rebuild that context without it, a suite outside the list is caught here, not served.
+                if (_tlsServer!.AllowedSuites is { } allowed && !allowed.Contains(ssl.NegotiatedCipherSuite))
+                {
+                    _rt.Log.Warn("negotiated a cipher suite outside ssl_ciphers; closing", new("conn", _conn.Id),
+                        new("suite", ssl.NegotiatedCipherSuite.ToString()), new("remote", info.RemoteAddress));
+                    return;
+                }
                 X509Certificate2? clientCert = null;
                 string? verdict = null;
                 if (_tlsServer!.ClientAuth is { } auth)

@@ -27,6 +27,8 @@ public sealed class SslConf : ScopeConfig<SslConf>
     public SourceLocation CrlSource;
     /// <summary>Built in Configure for every server that listens with ssl.</summary>
     public SslServerAuthenticationOptions? Options;
+    /// <summary>The suites this server may negotiate (null where the OS chooses). Checked after every handshake.</summary>
+    internal HashSet<TlsCipherSuite>? AllowedSuites;
     /// <summary>Built in Configure when ssl_verify_client is not off; shared by servers with identical settings.</summary>
     public ClientAuth? ClientAuth;
 
@@ -231,7 +233,9 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
         var auths = new Dictionary<(VerifyClient, string?, int, string?), ClientAuth>();
         var crlSets = new Dictionary<string, CrlSet>();
         var caBundles = new Dictionary<string, X509Certificate2Collection>();
-        var policies = new Dictionary<string, object?>(StringComparer.Ordinal);
+        var choices = new Dictionary<string, Ciphers.Choice?>(StringComparer.Ordinal);
+        string? processDefault = Ciphers.EnsureProcessDefault();
+        var warnedPrime = new HashSet<string>(StringComparer.Ordinal);
         foreach (var server in setup.ScopesOf(ContextKind.Server))
         {
             var sc = server.Get<ServerConf>();
@@ -280,7 +284,9 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
             string? trustKey = auth?.Trust is null ? null : Path.GetFullPath(ssl.ClientCa!, root); // the file, not its spelling
             bool stapling = ssl.Stapling == true;
             string? stapleFile = ssl.StaplingFile is null ? null : Path.GetFullPath(ssl.StaplingFile, root);
-            var ckey = (cert, key, trustKey, stapling ? (stapleFile ?? "") + "|" + ssl.StaplingResponder : null);
+            // Cipher suites are set on .NET's cached SSL_CTX, which is keyed by the certificate context: servers with
+            // different suite lists must not share one (see OpenSslContextAccess).
+            var ckey = (cert, key, trustKey, (stapling ? (stapleFile ?? "") + "|" + ssl.StaplingResponder : "") + "\u0001" + (ssl.Ciphers ?? ""));
             if (!cache.TryGetValue(ckey, out var entry))
             {
                 (X509Certificate2 Leaf, X509Certificate2Collection Chain) loaded;
@@ -297,8 +303,8 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
             var context = entry.Context;
             ssl.Stapler = entry.Stapler;
             var ckey2 = ssl.Ciphers ?? "";
-            if (!policies.TryGetValue(ckey2, out var policy))
-                policies[ckey2] = policy = Ciphers.Resolve(ssl.Ciphers, ssl.CiphersSource,
+            if (!choices.TryGetValue(ckey2, out var choice))
+                choices[ckey2] = choice = Ciphers.Resolve(ssl.Ciphers, ssl.CiphersSource,
                     w => setup.Log.Warn("ssl_ciphers: " + w, new LogField("at", ssl.CiphersSource.ToString())));
             ssl.Options = new SslServerAuthenticationOptions
             {
@@ -320,7 +326,20 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
                 AllowRenegotiation = false,
                 EncryptionPolicy = EncryptionPolicy.RequireEncryption,
             };
-            Ciphers.Apply(ssl.Options, policy);
+            if (choice is not null)
+            {
+                ssl.AllowedSuites = [.. choice.Suites];
+                // The default list is OpenSSL's process-wide default (OpenSslDefaults): no policy, so .NET caches the
+                // server's SSL_CTX and sessions resume. An explicit list needs a CipherSuitesPolicy, which costs
+                // resumption (.NET won't cache), as does a process default that couldn't be put in place.
+                bool viaDefault = Ciphers.IsDefault(choice) && processDefault is null;
+                if (!viaDefault)
+                {
+                    Ciphers.Apply(ssl.Options, Ciphers.Policy(choice));
+                    if (Ciphers.IsDefault(choice) && processDefault is not null && warnedPrime.Add(processDefault))
+                        setup.Log.Warn("TLS session resumption unavailable; cipher suites enforced without it", new LogField("reason", processDefault));
+                }
+            }
         }
     }
 

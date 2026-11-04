@@ -74,6 +74,35 @@ internal static class IntegrationTests
         catch (Exception e) when (e is System.Security.Authentication.AuthenticationException or IOException) { return null; }
     }
 
+    private static bool HasOpenSsl()
+    {
+        try { using var p = Process.Start(new ProcessStartInfo("openssl", ["version"]) { RedirectStandardOutput = true })!; p.WaitForExit(); return p.ExitCode == 0; }
+        catch (System.ComponentModel.Win32Exception) { return false; }
+    }
+
+    /// <summary>Run openssl with <paramref name="stdin"/> (then EOF); its stdout and stderr together.</summary>
+    private static async Task<string> OpenSsl(string[] args, string stdin)
+    {
+        var psi = new ProcessStartInfo("openssl") { RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        using var p = Process.Start(psi)!;
+        var o = p.StandardOutput.ReadToEndAsync();
+        var e = p.StandardError.ReadToEndAsync();
+        await p.StandardInput.WriteAsync(stdin);
+        await Task.Delay(300); // let the response arrive before EOF closes the connection
+        p.StandardInput.Close();
+        using var cts = new CancellationTokenSource(15_000);
+        await p.WaitForExitAsync(cts.Token);
+        return await o + await e;
+    }
+
+    private static int Count(string hay, string needle)
+    {
+        int n = 0;
+        for (int i = hay.IndexOf(needle, StringComparison.Ordinal); i >= 0; i = hay.IndexOf(needle, i + 1, StringComparison.Ordinal)) n++;
+        return n;
+    }
+
     public static void Register()
     {
         T.Add("http: static file, HEAD, content type", async () =>
@@ -338,6 +367,31 @@ internal static class IntegrationTests
                 ("ssl_ciphers TLS_RSA_WITH_3DES_EDE_CBC_SHA;", "isn't allowed"),
             })
                 T.Contains(msg, T.Throws<ConfigException>(() => TestServer.Start(Conf(conf), Populate).DisposeAsync().AsTask().GetAwaiter().GetResult()).Message);
+        });
+
+        T.Add("tls: sessions resume (TLS 1.2 IDs, TLS 1.3 tickets) with the strict default suites still enforced", async () =>
+        {
+            // .NET caches its OpenSSL context, where resumable sessions live, only without a CipherSuitesPolicy. The
+            // AEAD-only default is OpenSSL's process default instead (OpenSslDefaults), so both hold at once. This pins
+            // that: if a runtime or OpenSSL update breaks it, resumption (or the suite check) fails here.
+            if (!OperatingSystem.IsLinux()) return;
+            if (!HasOpenSsl()) throw new Exception("this test needs the openssl command-line tool");
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0 ssl; server_name t.test;
+                  ssl_certificate {DIR}/t.crt; ssl_certificate_key {DIR}/t.key;
+                  return 200 "ok"; } }
+                """, d => ProxyTests.MakeCert("t.test", d, "t"));
+            T.NotContains("session resumption unavailable", s.LogText());
+            var addr = $"127.0.0.1:{s.Port}";
+            // TLS 1.2: -reconnect makes five more connections offering the first one's session.
+            var r12 = await OpenSsl(["s_client", "-connect", addr, "-servername", "t.test", "-tls1_2", "-reconnect"], "");
+            T.True(Count(r12, "\nReused, TLSv1.2") >= 4);
+            // TLS 1.3: a ticket saved from one connection resumes the next.
+            var sess = Path.Combine(s.Dir, "sess.pem");
+            await OpenSsl(["s_client", "-connect", addr, "-servername", "t.test", "-tls1_3", "-sess_out", sess], "GET / HTTP/1.1\r\nHost: t.test\r\nConnection: close\r\n\r\n");
+            T.Contains("Reused, TLSv1.3", await OpenSsl(["s_client", "-connect", addr, "-servername", "t.test", "-tls1_3", "-sess_in", sess], ""));
+            // And the default suites are still the strict ones.
+            T.Eq(null, await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls12, System.Net.Security.TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256));
         });
 
         T.Add("security: FIFO in the web root neither hangs nor serves", async () =>
