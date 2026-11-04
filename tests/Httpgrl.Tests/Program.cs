@@ -4,6 +4,7 @@ if (args is ["--fuzz", ..]) return Fuzz.RunCli(args);
 if (args is ["--soak", ..]) return Soak.RunCli(args);
 if (args is ["--bench", ..]) return Bench.RunCli(args);
 if (args is ["--bench-h2", ..]) return Bench.RunH2Cli(args);
+if (args is ["--quic-echo", ..]) return QuicEndpointTests.RunEchoCli(args);
 
 UnitTests.Register();
 IntegrationTests.Register();
@@ -23,5 +24,6 @@ QuicTests.Register();
 QuicTlsTests.Register();
 QuicRecoveryTests.Register();
 QuicConnectionTests.Register();
+QuicEndpointTests.Register();
 Fuzz.Register();
 return await T.RunAsync(args.Length > 0 ? args[0] : null);

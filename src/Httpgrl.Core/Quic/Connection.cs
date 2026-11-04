@@ -309,6 +309,15 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         int headerLen = h.PnOffset + pnLen;
         if (!p.Recv.Open(packet, headerLen, pn))
         {
+            // Undecryptable, and ending in a reset token the peer gave us: it lost our state (RFC 9000 10.3.1).
+            if (h.Type == PacketType.OneRtt && packet.Length >= 21 && IsStatelessReset(packet[^16..]))
+            {
+                ClosedByPeer = true;
+                CloseCode = QuicError.NoError;
+                _closeReason = "stateless reset";
+                Finish();
+                return;
+            }
             if (p.Recv.Forged >= PacketKeys.IntegrityLimit) CloseWithError(QuicError.AeadLimitReached, 0, "too many forged packets", app: false, now);
             return;
         }
@@ -351,6 +360,14 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         // A server stops using Initial keys once it has a Handshake packet (RFC 9001 4.9.1).
         if (IsServer && space == 1 && !_pns[0].Discarded) DiscardSpace(0);
         AfterTls(now);
+    }
+
+    private bool IsStatelessReset(ReadOnlySpan<byte> tail)
+    {
+        bool match = false;
+        if (PeerStatelessResetToken is { } t) match |= CryptographicOperations.FixedTimeEquals(t, tail);
+        foreach (var c in _peerCids) match |= CryptographicOperations.FixedTimeEquals(c.Token, tail);
+        return match;
     }
 
     private bool IsOurCid(ReadOnlySpan<byte> dcid)
