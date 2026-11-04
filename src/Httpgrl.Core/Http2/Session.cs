@@ -429,7 +429,7 @@ internal sealed class Http2Session
         {
             Wasted();
             _rt.Log.Debug("malformed http/2 request", new("conn", _conn.Id), new("stream", (long)sid), new("reason", _head.Why));
-            await WriteAsync(FrameWriter.RstStream(sid, H2Error.ProtocolError)).ConfigureAwait(false);
+            ResetLater(sid, H2Error.ProtocolError);
             return;
         }
         bool refuse;
@@ -446,7 +446,7 @@ internal sealed class Http2Session
         if (refuse)
         {
             Wasted();
-            await WriteAsync(FrameWriter.RstStream(sid, H2Error.RefusedStream)).ConfigureAwait(false);
+            ResetLater(sid, H2Error.RefusedStream);
             return;
         }
         if (code == 0 && ctx.Req.ContentLengthValue >= 0) stream.Body.Expected = ctx.Req.ContentLengthValue;
@@ -483,11 +483,13 @@ internal sealed class Http2Session
         }
         bool end = f.Has(FrameFlags.EndStream);
         if (payload.Length == 0 && !end) Control();
-        if (s is null || s.RemoteClosed)
+        if (s is null || s.RemoteClosed || WeReset(sid))
         {
-            // A stream that's closed (or never got a handler): give the window back, and tell the client to stop.
+            // A stream that's closed (or never got a handler): give the window back. If we reset it, frames still in
+            // flight are expected and must be ignored (RFC 9113 5.1); otherwise tell the client to stop.
             await CreditAsync(null, f.Length).ConfigureAwait(false);
-            if (s is null) await WriteAsync(FrameWriter.RstStream(sid, H2Error.StreamClosed)).ConfigureAwait(false);
+            if (WeReset(sid)) return;
+            if (s is null) ResetLater(sid, H2Error.StreamClosed);
             else throw new H2Exception(H2Error.StreamClosed, sid, "DATA after END_STREAM");
             return;
         }
@@ -502,7 +504,7 @@ internal sealed class Http2Session
         lock (_lock) _streams.TryGetValue(e.StreamId, out s);
         _rt.Log.Debug("http/2 stream error", new("conn", _conn.Id), new("stream", (long)e.StreamId), new("code", e.Code.ToString()), new("reason", e.Message));
         if (s is not null) s.Abort(e.Message, e.Code, sendReset: true);
-        else ResetLater(e.StreamId, e.Code);
+        else if (!WeReset(e.StreamId)) ResetLater(e.StreamId, e.Code);
     }
 
     // ------------------------------------------------------------------ streams
@@ -694,7 +696,25 @@ internal sealed class Http2Session
         ResetLater(s.Id, code);
     }
 
-    private void ResetLater(int sid, H2Error code) => _ = SafeWrite(FrameWriter.RstStream(sid, code));
+    private void ResetLater(int sid, H2Error code)
+    {
+        lock (_resetIds)
+        {
+            if (!_resetIds.Add(sid)) return; // one RST_STREAM per stream
+            _resetOrder.Enqueue(sid);
+            if (_resetOrder.Count > 1024) _resetIds.Remove(_resetOrder.Dequeue());
+        }
+        _ = SafeWrite(FrameWriter.RstStream(sid, code));
+    }
+
+    // Streams we've reset (the most recent 1024): frames the client already had in flight on them are ignored.
+    private readonly HashSet<int> _resetIds = new();
+    private readonly Queue<int> _resetOrder = new();
+
+    private bool WeReset(int sid)
+    {
+        lock (_resetIds) return _resetIds.Contains(sid);
+    }
 
     private async Task SafeWrite(byte[] frame)
     {

@@ -22,7 +22,7 @@ namespace Httpgrl.Tests;
 /// The test suite runs a short fixed-seed pass of every target. Long runs:
 ///   dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz [target|all] [seconds] [seed]
 /// </summary>
-internal static class Fuzz
+internal static partial class Fuzz
 {
     /// <summary><c>Run</c> returns true when the parser accepted the input (reported, so a run that never gets past the first check is visible).</summary>
     private sealed record Target(string Name, byte[][] Seeds, byte[][] Dict, Func<byte[], bool> Run, int MaxLen = 16 * 1024);
@@ -31,14 +31,14 @@ internal static class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(),
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames", "h2-session" })
         {
-            int iterations = name == "config" ? 3_000 : 20_000;
+            int iterations = name == "config" ? 3_000 : name == "h2-session" ? 2_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
             {
                 var t = Array.Find(All.Value, x => x.Name == name)!;
