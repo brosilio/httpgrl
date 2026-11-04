@@ -58,6 +58,22 @@ internal static class IntegrationTests
 
     private static string Get(string path, string extra = "") => $"GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{extra}\r\n";
 
+    /// <summary>A TLS handshake offering only <paramref name="suite"/> (any, if null). Returns the negotiated suite, or null if refused.</summary>
+    private static async Task<System.Net.Security.TlsCipherSuite?> Handshake(int port, System.Security.Authentication.SslProtocols protocol, System.Net.Security.TlsCipherSuite? suite)
+    {
+        using var tcp = new System.Net.Sockets.TcpClient();
+        await tcp.ConnectAsync(System.Net.IPAddress.Loopback, port);
+        using var ssl = new System.Net.Security.SslStream(tcp.GetStream(), false, (_, _, _, _) => true);
+        var o = new System.Net.Security.SslClientAuthenticationOptions { TargetHost = "t.test", EnabledSslProtocols = protocol };
+        if (suite is { } one && !OperatingSystem.IsWindows()) o.CipherSuitesPolicy = new System.Net.Security.CipherSuitesPolicy([one]);
+        try
+        {
+            await ssl.AuthenticateAsClientAsync(o);
+            return ssl.NegotiatedCipherSuite;
+        }
+        catch (Exception e) when (e is System.Security.Authentication.AuthenticationException or IOException) { return null; }
+    }
+
     public static void Register()
     {
         T.Add("http: static file, HEAD, content type", async () =>
@@ -273,6 +289,55 @@ internal static class IntegrationTests
             // Expect: 100-continue that's never honored (answered early): the body may never come, so the connection closes.
             r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: {hidden.Length}\r\nExpect: 100-continue\r\n\r\n{hidden}{next}");
             T.NotContains("EVIL", r);
+        });
+
+        T.Add("ssl_ciphers: AEAD-only by default; explicit lists are exact; OpenSSL expressions fall back with a warning", async () =>
+        {
+            if (OperatingSystem.IsWindows()) return; // SChannel: the OS chooses the suites
+            static string Conf(string ciphers) => $$"""
+                http { server { listen 127.0.0.1:0 ssl; server_name t.test;
+                  ssl_certificate {DIR}/t.crt; ssl_certificate_key {DIR}/t.key; {{ciphers}}
+                  return 200 "ok"; } }
+                """;
+            static void Populate(string d) => ProxyTests.MakeCert("t.test", d, "t");
+            const System.Net.Security.TlsCipherSuite Cbc = System.Net.Security.TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+                Gcm = System.Net.Security.TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                Chacha = System.Net.Security.TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256;
+
+            // Default: TLS 1.2 CBC (SSL Labs: weak) is refused; AEAD suites and TLS 1.3 work.
+            await using (var s = TestServer.Start(Conf(""), Populate))
+            {
+                T.Eq(null, await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls12, Cbc));
+                T.Eq(Gcm, await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls12, Gcm));
+                T.Eq(Chacha, await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls12, Chacha));
+                T.True(await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls13, null) is not null);
+            }
+            // An explicit list is exactly that list for TLS 1.2 (OpenSSL names here); TLS 1.3 keeps its own suites.
+            await using (var s = TestServer.Start(Conf("ssl_ciphers ECDHE-ECDSA-AES128-SHA256;"), Populate))
+            {
+                T.Eq(Cbc, await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls12, Cbc));
+                T.Eq(null, await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls12, Gcm));
+                T.True(await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls13, null) is not null);
+            }
+            // IANA names work too.
+            await using (var s = TestServer.Start(Conf("ssl_ciphers TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256;"), Populate))
+                T.Eq(Chacha, await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls12, Chacha));
+            // nginx's default expression: not evaluable without OpenSSL's rule engine, so the safe default plus a warning.
+            await using (var s = TestServer.Start(Conf("ssl_ciphers HIGH:!aNULL:!MD5;"), Populate))
+            {
+                T.Eq(null, await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls12, Cbc));
+                T.Eq(Gcm, await Handshake(s.Port, System.Security.Authentication.SslProtocols.Tls12, Gcm));
+                T.Contains("OpenSSL cipher expressions", s.LogText());
+            }
+            foreach (var (conf, msg) in new[]
+            {
+                ("ssl_ciphers ECDHE-RSA-NOPE-SHA256;", "unknown cipher suite"),
+                ("ssl_ciphers TLS_RSA_WITH_RC4_128_SHA;", "isn't allowed"),
+                ("ssl_ciphers TLS_RSA_WITH_NULL_SHA256;", "isn't allowed"),
+                ("ssl_ciphers TLS_DH_anon_WITH_AES_128_GCM_SHA256;", "isn't allowed"),
+                ("ssl_ciphers TLS_RSA_WITH_3DES_EDE_CBC_SHA;", "isn't allowed"),
+            })
+                T.Contains(msg, T.Throws<ConfigException>(() => TestServer.Start(Conf(conf), Populate).DisposeAsync().AsTask().GetAwaiter().GetResult()).Message);
         });
 
         T.Add("security: FIFO in the web root neither hangs nor serves", async () =>

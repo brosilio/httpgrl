@@ -10,6 +10,8 @@ public sealed class SslConf : ScopeConfig<SslConf>
     public string? Certificate, CertificateKey;
     public SourceLocation CertificateSource;
     public SslProtocols? Protocols;
+    public string? Ciphers;
+    public SourceLocation CiphersSource;
     public bool? Stapling;
     /// <summary>ssl_reject_handshake: refuse any TLS handshake that routes to this server (no certificate needed).</summary>
     public bool? RejectHandshake;
@@ -32,6 +34,7 @@ public sealed class SslConf : ScopeConfig<SslConf>
     {
         if (Certificate is null) { Certificate = p.Certificate; CertificateKey = p.CertificateKey; CertificateSource = p.CertificateSource; }
         Protocols ??= p.Protocols;
+        if (Ciphers is null) { Ciphers = p.Ciphers; CiphersSource = p.CiphersSource; }
         Stapling ??= p.Stapling;
         RejectHandshake ??= p.RejectHandshake;
         StaplingFile ??= p.StaplingFile;
@@ -147,7 +150,7 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
 {
     public string Name => "http_ssl";
 
-    private static readonly string[] Ignored = ["ssl_ciphers", "ssl_prefer_server_ciphers", "ssl_session_cache", "ssl_session_timeout", "ssl_session_tickets", "ssl_dhparam", "ssl_ecdh_curve"];
+    private static readonly string[] Ignored = ["ssl_prefer_server_ciphers", "ssl_session_cache", "ssl_session_timeout", "ssl_session_tickets", "ssl_dhparam", "ssl_ecdh_curve"];
     private readonly List<(string, SourceLocation)> _ignoredSeen = new();
 
     public void Register(IModuleRegistry r)
@@ -156,6 +159,7 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
         r.AddDirective(new() { Name = "ssl_certificate", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => { var c = i.Conf<SslConf>(); c.Certificate = i.Args[0]; c.CertificateSource = i.Source; } });
         r.AddDirective(new() { Name = "ssl_certificate_key", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<SslConf>().CertificateKey = i.Args[0] });
         r.AddDirective(new() { Name = "ssl_protocols", Contexts = ctx, MinArgs = 1, MaxArgs = -1, Handler = Protocols });
+        r.AddDirective(new() { Name = "ssl_ciphers", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => { var c = i.Conf<SslConf>(); c.Ciphers = i.Args[0]; c.CiphersSource = i.Source; } });
         r.AddDirective(new() { Name = "ssl_reject_handshake", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<SslConf>().RejectHandshake = i.Flag(0) });
         r.AddDirective(new() { Name = "ssl_stapling", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => { var c = i.Conf<SslConf>(); c.Stapling = i.Flag(0); c.StaplingSource = i.Source; } });
         r.AddDirective(new() { Name = "ssl_stapling_file", Contexts = ctx, MinArgs = 1, MaxArgs = 1, Handler = i => i.Conf<SslConf>().StaplingFile = i.Args[0] });
@@ -227,6 +231,7 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
         var auths = new Dictionary<(VerifyClient, string?, int, string?), ClientAuth>();
         var crlSets = new Dictionary<string, CrlSet>();
         var caBundles = new Dictionary<string, X509Certificate2Collection>();
+        var policies = new Dictionary<string, object?>(StringComparer.Ordinal);
         foreach (var server in setup.ScopesOf(ContextKind.Server))
         {
             var sc = server.Get<ServerConf>();
@@ -291,6 +296,10 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
             }
             var context = entry.Context;
             ssl.Stapler = entry.Stapler;
+            var ckey2 = ssl.Ciphers ?? "";
+            if (!policies.TryGetValue(ckey2, out var policy))
+                policies[ckey2] = policy = Ciphers.Resolve(ssl.Ciphers, ssl.CiphersSource,
+                    w => setup.Log.Warn("ssl_ciphers: " + w, new LogField("at", ssl.CiphersSource.ToString())));
             ssl.Options = new SslServerAuthenticationOptions
             {
                 ServerCertificateContext = context,
@@ -311,6 +320,7 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
                 AllowRenegotiation = false,
                 EncryptionPolicy = EncryptionPolicy.RequireEncryption,
             };
+            Ciphers.Apply(ssl.Options, policy);
         }
     }
 
