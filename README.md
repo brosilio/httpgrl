@@ -406,7 +406,7 @@ level with buffering off.
 A finding prints the seed, iteration and input, which reproduce it exactly. It's dependency-free and not
 coverage-guided, so it's a complement to, not a replacement for, a coverage-guided fuzzer.
 
-**Timeouts and slow clients.** One sweeper thread enforces every deadline. There are no per-operation timers.
+**Timeouts and slow clients.** A sweeper thread checks every connection's deadlines; each connection only stamps times into its record, so enforcement stays cheap however many connections there are.
 - Header timeout: the whole request head must arrive within `client_header_timeout` of its first byte. Trickling one byte at a time does not extend it.
 - Idle connections: an idle new or keep-alive connection is closed at its deadline.
 - Slow uploads and slow readers: body reads and response writes each have a per-operation timeout plus a minimum transfer rate. That covers slow-body uploads and slow-read downloads.

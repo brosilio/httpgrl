@@ -18,9 +18,21 @@ Status: plan, 2026-11-04. Nothing here is implemented yet.
    - **QUIC packet protection:** .NET's `AesGcm`, AES-ECB (header protection) and `HKDF`, which call OpenSSL.
      Initially QUIC offers only the AES-GCM suites. The ChaCha20 header-protection mask needs raw ChaCha20, which
      .NET doesn't expose, and AES-GCM is the mandatory suite anyway. ChaCha20 can come later through OpenSSL's EVP.
-4. **HTTP/3 needs OpenSSL 3.5 or newer.** On older systems a `quic` listener logs why it's unavailable and is
-   skipped; HTTP/1.1 and HTTP/2 are unaffected. HTTP/3 is Linux-first, like the rest of the project.
-5. **Server side only.** `proxy_pass` upstreams and reverse tunnels stay HTTP/1.1.
+4. **HTTP/3 is Linux-only and needs OpenSSL 3.5 or newer.** Elsewhere, a `quic` listener logs once why HTTP/3 is
+   unavailable, and the server starts anyway (`-t` reports it too), so one config file works on old and new systems.
+   HTTP/1.1 and HTTP/2 are unaffected.
+5. **Off by default, permanently.** `http2 on;` and `http3 on;` are required to enable them. There's no plan to flip
+   the default; HTTP/1.1 stays the only protocol a config gets without asking.
+6. **`Alt-Svc` is automatic when `http3 on`.** A server with HTTP/3 enabled and a `quic` listener advertises it on
+   its TCP responses, with the right port. An explicit `add_header Alt-Svc` wins. (A deviation: nginx needs the
+   header added by hand.)
+7. **WebSockets over HTTP/2 and HTTP/3 (extended CONNECT, RFC 8441/9220) come before WebTransport,** which then
+   reuses the same machinery.
+8. **Timers: whatever works best.** The HTTP/1 sweeper stays for its deadlines. QUIC's millisecond timers (loss
+   detection, PTO, pacing, ACK delay) get the best mechanism we can find, most likely one timing wheel shared by all
+   QUIC connections on a dedicated thread. The requirement from AGENTS.md is the intent: cheap per connection at
+   scale, and impossible for a client to dodge.
+9. **Server side only.** `proxy_pass` upstreams and reverse tunnels stay HTTP/1.1.
 
 ## Who writes what
 
@@ -70,7 +82,9 @@ Today each connection owns one reusable `HttpContextImpl`, and requests run one 
 - **Reload and shutdown:** GOAWAY with the last stream ID; in-flight streams finish within `reload_drain_timeout`.
 - **Directives:** nginx's `http2 on|off` (server level), plus limits: `http2_max_concurrent_streams`,
   `http2_max_field_size`, `http2_max_header_size`, `http2_recv_buffer_size`.
-- **Later, optional:** WebSockets over HTTP/2 through extended CONNECT (RFC 8441).
+- **Then:** WebSockets over HTTP/2 through extended CONNECT (RFC 8441, `SETTINGS_ENABLE_CONNECT_PROTOCOL`). The
+  existing `UpgradeAsync` handlers (proxy tunnels) get a duplex stream either way, so modules don't care which
+  protocol carried the request. Done before Phase 2 starts.
 
 **Attacks to test, each with a test that fails without the defence:**
 - **Rapid reset (CVE-2023-44487):** streams opened and immediately reset still count, with a reset-rate limit.
@@ -139,33 +153,30 @@ reaching the pipeline that HTTP/1 would have refused.
 - **GOAWAY** on reload and shutdown.
 - **Listening:** `listen 443 quic [reuseport];` (nginx syntax) next to the TCP listener on the same port, opened and
   closed transactionally with it on reload.
-- **Advertising:** `Alt-Svc: h3=":443"; ma=86400` on TCP responses from servers that also listen with `quic`
-  (**deviation:** automatic, where nginx needs `add_header`; `http3 off` turns it off). Document HTTPS DNS records
-  for first-visit HTTP/3.
+- **Advertising:** with `http3 on`, `Alt-Svc: h3=":<quic port>"; ma=86400` on the server's TCP responses
+  (automatic; an explicit `add_header Alt-Svc` wins). Document HTTPS DNS records for first-visit HTTP/3.
 - **Directives:** `http3 on|off`, `http3_max_concurrent_streams`, `quic_retry`, `quic_gso`, plus the shared header
   limits.
-- **Later, optional:** WebSockets over HTTP/3 through extended CONNECT (RFC 9220).
+- **Then:** WebSockets over HTTP/3 through extended CONNECT (RFC 9220), reusing HTTP/2's handling.
 
 ## Phase 4: hardening and release
 
 - Soak and load tests with HTTP/2 and HTTP/3 mixed into `--soak`, plus bad-network runs through the virtual network.
 - Interop matrix: browsers, curl, h2load, and the QUIC interop runner.
-- Default policy: HTTP/2 and HTTP/3 ship **off by default** until they pass the hardening bar, then become on by
-  default in a release whose changelog says so.
+- Both stay opt-in (`http2 on;`, `http3 on;`) for good; hardening is about trusting them on the open internet, not
+  about flipping a default.
 
 ## Phase 5: datagrams, extended CONNECT, WebTransport
 
 - HTTP datagrams and capsules (RFC 9297) over our own QUIC DATAGRAM support.
-- Extended CONNECT on HTTP/2 and HTTP/3, with an `Httpgrl.Abstractions` session API: accepting and opening streams,
-  datagrams, drain, and close with error codes. Modules never see QUIC types.
+- A WebTransport session API in `Httpgrl.Abstractions`, built on the extended CONNECT support from Phases 1 and 3:
+  accepting and opening streams, datagrams, drain, and close with error codes. Modules never see QUIC types.
 - WebTransport over HTTP/3 to whichever draft browsers implement at that point, behind a capability flag.
 
 ## Cross-cutting
 
-- **Timers (a deliberate AGENTS.md deviation, owner sign-off needed).** QUIC's loss detection and pacing need
-  millisecond timers per connection; the 250 ms sweeper can't drive them. The proposal is one timer-wheel thread
-  for all QUIC connections, in the same spirit as the sweeper: one thread, no per-operation timer objects. The
-  sweeper keeps enforcing the coarse deadlines (idle, handshake, minimum rates, drain).
+- **Timers:** see decision 8. Whatever QUIC uses, the coarse deadlines (idle, handshake, minimum rates, reload
+  drain) stay enforced the same way for every protocol.
 - **Reload:** UDP sockets belong to `HttpServer` like TCP listeners and are kept across reloads. QUIC connections
   stay on the generation they were authenticated under, get GOAWAY at reload, and are closed after
   `reload_drain_timeout`. The connection-ID table survives reloads.
@@ -194,11 +205,3 @@ Each phase is merged only with its fuzz targets, attack tests and AOT runs, as e
   unavailable, never half-working.
 - **Attack surface.** HTTP/2 and QUIC are where recent server CVEs cluster. That's why each phase lands with fuzz
   targets and attack tests, and why both ship off by default at first.
-
-## Open questions for the owner
-
-1. Sign-off on the QUIC timer-wheel thread (above).
-2. HTTP/2 and HTTP/3 off by default until hardened: agreed?
-3. Automatic `Alt-Svc` (a deviation from nginx), or nginx-style manual?
-4. HTTP/3 Linux-only and OpenSSL ≥ 3.5-only at first: agreed?
-5. WebSockets over HTTP/2 and HTTP/3 (RFC 8441/9220) before or after WebTransport?
