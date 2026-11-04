@@ -398,7 +398,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         r.AddVariable("dollar", _ => "$");
         r.AddVariable("uri", c => c.Request.Path);
         r.AddVariable("document_uri", c => c.Request.Path);
-        r.AddVariable("request_uri", c => c.Request.RawTarget);
+        r.AddVariable("request_uri", c => ((HttpContextImpl)c).Req.RequestUriValue);
         r.AddVariable("args", c => c.Request.Query);
         r.AddVariable("query_string", c => c.Request.Query);
         r.AddVariable("is_args", c => c.Request.Query.Length > 0 ? "?" : "");

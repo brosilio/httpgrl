@@ -126,6 +126,9 @@ internal static class RequestParser
             if (pathAndQuery[0] == '?') return 400;
         }
         if (pathAndQuery.IndexOf((byte)'#') >= 0) return 400;
+        // nginx's $request_uri: what the client asked for on this server, never a scheme and host it chose. With the raw
+        // absolute target, "return 302 $request_uri;" would redirect anywhere the request names.
+        req.RequestUriValue = uriHost is null ? req.RawTargetValue : Encoding.Latin1.GetString(pathAndQuery);
 
         if (pathAndQuery.Length == 1 && pathAndQuery[0] == '*')
         {
@@ -223,6 +226,8 @@ internal static class RequestParser
                 char c = host[i];
                 if (!(char.IsAsciiHexDigit(c) || c is ':' or '.')) return null;
             }
+            // Only a real IPv6 literal ("[]" or "[:::::]" would otherwise pass as names nothing else agrees on).
+            if (!System.Net.IPAddress.TryParse(host.AsSpan(1, close - 1), out var ip6) || ip6.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6) return null;
             if (close + 1 < host.Length && !ValidPort(host.AsSpan(close + 1))) return null;
             return host[..(close + 1)].ToLowerInvariant();
         }
@@ -232,8 +237,8 @@ internal static class RequestParser
             if (!ValidPort(host.AsSpan(colon))) return null;
             end = colon;
         }
-        if (end > 0 && host[end - 1] == '.') end--;
-        if (end == 0) return null;
+        if (end > 0 && host[end - 1] == '.') end--; // one trailing dot: the absolute form of the same name
+        if (end == 0 || host[end - 1] == '.') return null; // "a.." (nginx rejects ".." anywhere)
         bool needLower = false;
         char prev = '\0';
         for (int i = 0; i < end; i++)

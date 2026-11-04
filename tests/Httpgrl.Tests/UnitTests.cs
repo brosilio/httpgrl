@@ -116,6 +116,14 @@ internal static class UnitTests
             T.Eq(null, RequestParser.NormalizeHost("a b"));
             T.Eq(null, RequestParser.NormalizeHost("a:x"));
             T.Eq(null, RequestParser.NormalizeHost("[::1"));
+            T.Eq(null, RequestParser.NormalizeHost("a.."));
+            T.Eq(null, RequestParser.NormalizeHost("a..:80"));
+            T.Eq(null, RequestParser.NormalizeHost("[]"));
+            T.Eq(null, RequestParser.NormalizeHost("[:::::]"));
+            T.Eq(null, RequestParser.NormalizeHost("[1.2.3.4]"));
+            T.Eq("[::1]", RequestParser.NormalizeHost("[::1]:8080"));
+            T.Eq("[2001:db8::a]", RequestParser.NormalizeHost("[2001:DB8::A]"));
+            T.Eq("a", RequestParser.NormalizeHost("a."));
         });
         T.Add("parser: incomplete head limits", () =>
         {

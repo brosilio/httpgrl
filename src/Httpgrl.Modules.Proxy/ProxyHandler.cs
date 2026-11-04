@@ -130,7 +130,12 @@ internal static class ProxyHandler
 
             t.Group.Success(server);
             ctx.Items[ProxyModule.UpstreamStatusKey] = resp.Status.ToString(System.Globalization.CultureInfo.InvariantCulture);
-            return await RelayAsync(ctx, conf, t, conn, resp, upgrade).ConfigureAwait(false);
+            try { return await RelayAsync(ctx, conf, t, conn, resp, upgrade).ConfigureAwait(false); }
+            catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+            {
+                conn.Dispose(); // a proxy_redirect regex timed out mid-relay: the core answers 500; the connection mustn't leak
+                throw;
+            }
         }
 
         if (tried.Count == 0) ctx.Log.Error("no upstream available", new LogField("upstream", t.Group.Name));

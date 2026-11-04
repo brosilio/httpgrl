@@ -6,4 +6,7 @@
     <!-- Modules see only the plugin API, never the engine. -->
     <ProjectReference Include="../Httpgrl.Abstractions/Httpgrl.Abstractions.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Httpgrl.Tests" />
+  </ItemGroup>
 </Project>

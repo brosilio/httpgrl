@@ -13,6 +13,15 @@ namespace Httpgrl.Tests;
 
 internal static class ProxyTests
 {
+    private static readonly ConcurrentQueue<string> up_heads = new();
+
+    private static int Count(string hay, string needle)
+    {
+        int n = 0;
+        for (int i = hay.IndexOf(needle, StringComparison.Ordinal); i >= 0; i = hay.IndexOf(needle, i + 1, StringComparison.Ordinal)) n++;
+        return n;
+    }
+
     private static string Get(string path, string extra = "") => $"GET {path} HTTP/1.1\r\nHost: front.test\r\nConnection: close\r\n{extra}\r\n";
 
     private static string Conf(string locations, string http = "") => $$"""
@@ -21,6 +30,43 @@ internal static class ProxyTests
 
     public static void Register()
     {
+        T.Add("proxy: smuggling: the upstream sees exactly the messages we parsed, re-framed", async () =>
+        {
+            // A raw recorder upstream: every byte it receives is kept, and it answers each request it can frame.
+            var raw = new MemoryStream();
+            await using var up = new FakeUpstream(async (st, rd) =>
+            {
+                var tee = new TeeStream(st, raw);
+                var reader = new RequestReader(tee, new System.Collections.Concurrent.ConcurrentQueue<string>());
+                while (true)
+                {
+                    var (head, body) = await reader.ReadRequestAsync();
+                    if (head.Length == 0) return;
+                    up_heads.Enqueue(head.Split("\r\n")[0]);
+                    await st.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {body.Length}\r\n\r\n"));
+                    await st.WriteAsync(body);
+                }
+            });
+            await using var s = TestServer.Start(Conf($"location / {{ proxy_pass http://127.0.0.1:{up.Port}; }}"));
+
+            // 1. A body that looks like a request, pipelined ahead of a real one: two requests upstream, not three.
+            var hidden = "GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n";
+            var r = await s.Raw($"POST /a HTTP/1.1\r\nHost: f\r\nContent-Length: {hidden.Length}\r\n\r\n{hidden}GET /b HTTP/1.1\r\nHost: f\r\nConnection: close\r\n\r\n");
+            T.Eq(2, Count(r, "HTTP/1.1 200 OK"));
+            // 2. Chunk extensions and trailers from the client are dropped: the body is re-chunked from what we decoded.
+            r = await s.Raw("POST /c HTTP/1.1\r\nHost: f\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                + "3;ext=\"0\\r\\n\\r\\nGET /ext HTTP/1.1\"\r\nabc\r\n0\r\nX-Trailer: injected\r\n\r\n");
+            T.Eq(200, Status(r));
+            T.True(Body(r) == "abc");
+            await Task.Delay(100);
+            var heads = string.Join("|", up_heads);
+            T.Eq("POST /a HTTP/1.1|GET /b HTTP/1.1|POST /c HTTP/1.1", heads);
+            var seen = Encoding.Latin1.GetString(raw.ToArray());
+            T.NotContains("ext=", seen);
+            T.NotContains("X-Trailer", seen);
+            T.Contains("\r\n\r\n3\r\nabc\r\n0\r\n\r\n", seen);
+        });
+
         T.Add("proxy: underscored header names never reach the upstream (CGI header-folding spoof)", async () =>
         {
             await using var up = FakeUpstream.Echo();
@@ -855,6 +901,29 @@ internal sealed class FakeUpstream : IAsyncDisposable
 }
 
 /// <summary>Reads HTTP/1.1 requests (Content-Length or chunked) off a stream, keeping leftovers between requests.</summary>
+/// <summary>Copies everything read from <paramref name="inner"/> into <paramref name="sink"/> (a raw wire recorder).</summary>
+internal sealed class TeeStream(Stream inner, MemoryStream sink) : Stream
+{
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+    {
+        int n = await inner.ReadAsync(buffer, ct);
+        lock (sink) sink.Write(buffer.Span[..n]);
+        return n;
+    }
+    public override Task<int> ReadAsync(byte[] b, int o, int c, CancellationToken ct) => ReadAsync(b.AsMemory(o, c), ct).AsTask();
+    public override int Read(byte[] b, int o, int c) => ReadAsync(b, o, c, default).GetAwaiter().GetResult();
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> b, CancellationToken ct = default) => inner.WriteAsync(b, ct);
+    public override void Write(byte[] b, int o, int c) => inner.Write(b, o, c);
+    public override void Flush() => inner.Flush();
+    public override bool CanRead => true;
+    public override bool CanWrite => true;
+    public override bool CanSeek => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+}
+
 internal sealed class RequestReader(Stream s, ConcurrentQueue<string> log)
 {
     private readonly List<byte> _buf = new();

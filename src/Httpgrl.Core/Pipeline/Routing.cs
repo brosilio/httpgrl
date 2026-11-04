@@ -157,7 +157,7 @@ internal sealed class VirtualHosts
         foreach (var name in s.Names)
         {
             if (name.Length == 0 || name == "_") continue;
-            if (name[0] == '~') { _regex.Add((new Regex(name[1..], RegexOptions.CultureInvariant | RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(50)), s)); continue; }
+            if (name[0] == '~') { _regex.Add((HostRegex(name[1..]), s)); continue; }
             if (name.StartsWith("*.", StringComparison.Ordinal)) _leading.Add((name[1..], s));
             else if (name.EndsWith(".*", StringComparison.Ordinal)) _trailing.Add((name[..^1], s));
             else if (name[0] == '.') { TryExact(name[1..], s, log, src); _leading.Add((name, s)); }
@@ -168,6 +168,14 @@ internal sealed class VirtualHosts
     }
 
     private bool _explicitDefault;
+
+    /// <summary>Matched against the client's Host: linear-time engine when the pattern allows, else a match timeout.</summary>
+    private static Regex HostRegex(string pattern)
+    {
+        const RegexOptions o = RegexOptions.CultureInvariant | RegexOptions.IgnoreCase;
+        try { return new Regex(pattern, o | RegexOptions.NonBacktracking); }
+        catch (NotSupportedException) { return new Regex(pattern, o, TimeSpan.FromMilliseconds(50)); }
+    }
 
     private void TryExact(string name, ServerRt s, ILogger log, SourceLocation src)
     {

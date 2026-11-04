@@ -9,6 +9,8 @@ internal sealed class RequestImpl : HttpRequest
 {
     public string MethodValue = HttpMethods.Get;
     public string RawTargetValue = "";
+    /// <summary>$request_uri: the origin-form path and query of the target (the scheme and authority of an absolute-form one dropped).</summary>
+    public string RequestUriValue = "";
     public string PathValue = "/";
     public string QueryValue = "";
     public string HostValue = "";
@@ -34,6 +36,7 @@ internal sealed class RequestImpl : HttpRequest
     {
         MethodValue = HttpMethods.Get;
         RawTargetValue = "";
+        RequestUriValue = "";
         PathValue = "/";
         QueryValue = "";
         HostValue = "";
@@ -247,7 +250,7 @@ internal sealed class HttpContextImpl : HttpContext
     }
 
     /// <summary>A query built from decoded parts may hold spaces, CR/LF or non-ASCII: encode what can't go on a request line.</summary>
-    private static string EscapeQuery(string q)
+    internal static string EscapeQuery(string q)
     {
         bool clean = true;
         foreach (char c in q) if (c is <= ' ' or >= (char)0x7f or '#') { clean = false; break; }

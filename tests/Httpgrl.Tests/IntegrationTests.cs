@@ -199,6 +199,54 @@ internal static class IntegrationTests
             T.Eq("fine", Body(await s.Raw(Get($"/a/ok.txt?d={www}/r"))));
         });
 
+        T.Add("security: catastrophic regexes (backreferences force backtracking) cost bounded time and fail closed, quietly", async () =>
+        {
+            // A backreference can't run on the non-backtracking engine, so these fall back to backtracking with a match
+            // timeout. Input built to blow up (a long run that almost matches) must time out quietly: no 500, no
+            // error-level log line per request (an attacker could flood the log), and the server keeps serving.
+            const string evil = @"(a+)+\1b$";
+            await using var s = TestServer.Start($$"""
+                http {
+                  map $uri $m { "~{{evil}}" hit; default miss; }
+                  server { listen 127.0.0.1:0 default_server; server_name "~^(a+)+\1b$";
+                    location ~ {{evil}} { return 200 "loc"; }
+                    location /if/ { if ($uri ~ "{{evil}}") { return 200 "if"; } return 200 "m=$m"; }
+                    location /rw/ { rewrite "{{evil}}" /x; return 200 "rw"; }
+                    location / { return 200 "m=$m"; }
+                  }
+                }
+                """);
+            var payload = new string('a', 40) + "!";
+            foreach (var path in new[] { "/" + payload, "/if/" + payload, "/rw/" + payload })
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var r = await s.Raw($"GET {path} HTTP/1.1\r\nHost: {new string('a', 40)}c\r\nConnection: close\r\n\r\n", 10_000);
+                T.True(sw.ElapsedMilliseconds < 3000);
+                // Fails closed: a timed-out regex is neither a match nor a non-match (nginx answers 500 too).
+                if (Status(r) != 500) throw new Exception($"{path}: {r}\n{s.LogText()}");
+            }
+            T.Eq(200, Status(await s.Raw(Get("/fine"))));
+            var log = s.LogText();
+            T.Contains("regex match timed out", log);
+            T.NotContains("\"level\":\"error\"", log);
+            T.NotContains("\"stack\"", log);
+        });
+
+        T.Add("security: $request_uri is origin-form, so an absolute-form target can't pick a redirect's host", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0;
+                  location /go/ { return 302 $request_uri; }
+                  location / { return 200 "[$request_uri]"; }
+                } }
+                """);
+            var r = await s.Raw("GET http://evil.example/go/x?y=1 HTTP/1.1\r\nHost: good.test\r\nConnection: close\r\n\r\n");
+            T.Eq(302, Status(r));
+            T.Eq("/go/x?y=1", Header(r, "Location"));
+            T.Eq("[/]", Body(await s.Raw("GET http://evil.example HTTP/1.1\r\nHost: good.test\r\nConnection: close\r\n\r\n")));
+            T.Eq("[/a/../b?q]", Body(await s.Raw(Get("/a/../b?q")))); // origin form: as received (nginx keeps it unnormalized too)
+        });
+
         T.Add("security: FIFO in the web root neither hangs nor serves", async () =>
         {
             if (OperatingSystem.IsWindows()) return;

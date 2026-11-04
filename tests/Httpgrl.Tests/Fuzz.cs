@@ -31,12 +31,12 @@ internal static class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(),
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite" })
         {
             int iterations = name == "config" ? 3_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
@@ -439,6 +439,66 @@ internal static class Fuzz
                 return true;
             }, MaxLen: 512);
     }
+
+    /// <summary>Range header against files of a few sizes: a satisfiable range always lies inside the file.</summary>
+    private static Target RangeTarget() => new("range",
+        B("bytes=0-0", "bytes=-5", "bytes=5-", "bytes=1-2,3-4", "bytes=9223372036854775806-9223372036854775807", "BYTES = 3 - 9", "bytes=-0"),
+        B("bytes=", "-", ",", " ", "\t", "0", "1", "9", "9223372036854775807", "9223372036854775808", "99999999999999999999", "+", "x", "="),
+        data =>
+        {
+            var h = Encoding.Latin1.GetString(data);
+            bool any = false;
+            foreach (long len in new long[] { 0, 1, 10, 4096, long.MaxValue })
+            {
+                var r = Httpgrl.Modules.StaticFiles.StaticModule.ParseRange(h, len, out long off, out long count);
+                if (r != Httpgrl.Modules.StaticFiles.StaticModule.RangeResult.Satisfiable) continue;
+                any = true;
+                if (off < 0 || count < 1 || off >= len || count > len - off) throw new Finding($"range [{off}, +{count}) outside a {len}-byte file");
+            }
+            return any;
+        }, MaxLen: 256);
+
+    /// <summary>Host header / SNI normalization: what comes out is a valid, lower-case, port-free name, and stable.</summary>
+    private static Target HostTarget() => new("host",
+        B("a.test", "A.Test:8080", "[::1]:80", "a.test.", "xn--bcher-kva.example", "a_b.test", "[]", "a..", "1.2.3.4"),
+        B(".", "..", ":", "[", "]", "::", "-", "_", "A", "\0", " ", "/", "@", "%", "\xff", ":99999", ":", "0"),
+        data =>
+        {
+            var h = RequestParser.NormalizeHost(Encoding.Latin1.GetString(data));
+            if (h is null) return false;
+            if (h.Length == 0) throw new Finding("empty host accepted");
+            foreach (char c in h)
+                if (!(char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c is '-' or '_' or '.' or '[' or ']' or ':')) throw new Finding($"bad character in \"{h}\"");
+            if (h == "[]" ) throw new Finding("empty IPv6 literal accepted");
+            if (!h.StartsWith('[') && (h.Contains(':') || h.Contains("..") || h.StartsWith('.') || h.EndsWith('.'))) throw new Finding($"malformed name \"{h}\"");
+            if (RequestParser.NormalizeHost(h) != h) throw new Finding($"not stable: \"{h}\" -> \"{RequestParser.NormalizeHost(h)}\"");
+            return true;
+        }, MaxLen: 300);
+
+    /// <summary>
+    /// A rewrite result (literal text plus captures of the client's path) through to what the core keeps: a clean path,
+    /// a query that can sit on a request line, and a Location value that can't split the response. Input: the
+    /// replacement result, then optionally '\x01' and the original query.
+    /// </summary>
+    private static Target RewriteTarget() => new("rewrite",
+        B("/new/path", "/a?x=1", "/a?", "/a?b=2\x01c=3", "/../../etc", "/x/%2e%2e/y", "http://evil/\r\nSet-Cookie: x", "/caf\u00e9?q=\u00e9 \t#f"),
+        B("?", "&", "#", "/", "..", ".", "%", "%0d%0a", "\r", "\n", "\0", " ", "\t", "\x7f", "\xff", "\x01", "//", "\\"),
+        data =>
+        {
+            int sep = Array.IndexOf(data, (byte)1);
+            var target = Encoding.UTF8.GetString(sep < 0 ? data : data[..sep]);
+            var orig = sep < 0 ? "" : Encoding.Latin1.GetString(data, sep + 1, data.Length - sep - 1);
+            var loc = Httpgrl.Modules.Rewrite.RewriteModule.EscapeForHeader(target);
+            foreach (char c in loc) if (c is < (char)0x21 or > (char)0x7e) throw new Finding($"Location carries 0x{(int)c:x2}");
+            var (path, query) = Httpgrl.Modules.Rewrite.RewriteModule.SplitTarget(target, orig);
+            if (path.Contains('?')) throw new Finding($"'?' left in path \"{path}\"");
+            var q = HttpContextImpl.EscapeQuery(query);
+            foreach (char c in q) if (c is <= ' ' or >= (char)0x7f or '#') throw new Finding($"query carries 0x{(int)c:x2}");
+            var p = UriNormalizer.NormalizeDecoded(path);
+            if (p is null) return false;
+            CheckPath(p);
+            return true;
+        }, MaxLen: 1024);
 
     /// <summary>The remote's answer to a tunnel agent's Upgrade (what the agent reads before serving anything).</summary>
     private static Target TunnelHandshakeTarget() => new("tunnel-handshake",
