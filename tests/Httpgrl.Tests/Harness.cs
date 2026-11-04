@@ -119,6 +119,12 @@ internal sealed class TestServer : IAsyncDisposable
     public Task<bool> Reload(string config) =>
         Server.ReloadAsync(prev => ServerBuilder.BuildText(config.Replace("{DIR}", Dir, StringComparison.Ordinal), Dir, Modules(_extra, _dns), _log, prev));
 
+    /// <summary>The log so far, without waiting for stragglers (fuzzing checks it often).</summary>
+    public string LogNow()
+    {
+        lock (_logStream) return Encoding.UTF8.GetString(_logStream.ToArray());
+    }
+
     public string LogText()
     {
         Thread.Sleep(100);

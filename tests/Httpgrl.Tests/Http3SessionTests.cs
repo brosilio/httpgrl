@@ -101,6 +101,44 @@ internal static class Http3SessionTests
             T.Contains("\"proto\":\"HTTP/3.0\"", s.LogText());
         });
 
+        Case("WebSockets over HTTP/3 (RFC 9220) reach an HTTP/1.1 WebSocket backend through the proxy; other protocols are refused", async () =>
+        {
+            await using var ws = FakeUpstream.WebSocketEcho();
+            await using var s = TestServer.Start(Conf($"location /ws {{ proxy_pass http://127.0.0.1:{ws.Port}; proxy_read_timeout 5s; }}"), Populate);
+            using var c = Client(s);
+            long id = c.SendRaw(H3Client.Headers((":method", "CONNECT"), (":protocol", "websocket"), (":scheme", "https"), (":authority", "h3.test"),
+                (":path", "/ws"), ("sec-websocket-version", "13")), fin: false);
+            var r = c.Wait(id, 300); // the 200 arrives; the stream stays open
+            c.Udp.Run(() => { c.Pump(); return r.Status is not null; }, 5000);
+            T.Eq("200", r.Status);
+            // A masked text frame "hi" inside a DATA frame; the echo comes back unmasked.
+            byte[] mask = [1, 2, 3, 4];
+            byte[] frame = [0x81, 0x82, .. mask, (byte)('h' ^ 1), (byte)('i' ^ 2)];
+            c.C.StreamWrite(id, H3Client.Frame(H3FrameType.Data, frame), fin: false);
+            c.Udp.Run(() => { c.Pump(); return r.Body.Length >= 4; }, 5000);
+            T.Eq("8102" + Convert.ToHexStringLower("hi"u8), Convert.ToHexStringLower(r.Body.ToArray().AsSpan(0, 4)));
+            // Extended CONNECT for anything but websocket: 501. Plain CONNECT: 405.
+            var other = c.Wait(c.SendRaw(H3Client.Headers((":method", "CONNECT"), (":protocol", "webtransport"), (":scheme", "https"), (":authority", "h3.test"), (":path", "/ws")), fin: false), 3000);
+            T.Eq("501", other.Status);
+            var plain = c.Wait(c.SendRaw(H3Client.Headers((":method", "CONNECT"), (":authority", "h3.test:443"))), 3000);
+            T.Eq("405", plain.Status);
+        });
+
+        Case("a stalled upload is cut at client_body_timeout (the stream, not the connection); the stream limit holds", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($"client_body_timeout 1s; http3_max_concurrent_streams 4; location /echo/ {{ proxy_pass http://127.0.0.1:{up.Port}; }}"), Populate);
+            using var c = Client(s);
+            // Headers promising 100 bytes, then 10, then nothing.
+            long stalled = c.SendRaw([.. H3Client.Headers((":method", "POST"), (":scheme", "https"), (":authority", "h3.test"), (":path", "/echo/x"), ("content-length", "100")),
+                .. H3Client.Frame(H3FrameType.Data, new byte[10])], fin: false);
+            var r = c.Wait(stalled, 5000);
+            T.True(r.Reset is not null || r.Status is "408" or "400");
+            T.Eq("hello", c.Get("/index.html").Text); // the connection lives on
+            // The client may open only as many request streams as we allow at once.
+            T.Eq(4L, (long)c.C.PeerParameters!.InitialMaxStreamsBidi);
+        });
+
         Case("opt-in: a quic listener without http3 on is a config error; Alt-Svc only where HTTP/3 is served", async () =>
         {
             T.Throws<Httpgrl.ConfigException>(() => TestServer.Start(Conf().Replace("http3 on;", ""), Populate));

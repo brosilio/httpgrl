@@ -1,6 +1,6 @@
 # HTTP/2 and HTTP/3: implementation plan
 
-Status (2026-11-04): Phases 0 and 1 (HTTP/2) are done; Phase 2 (QUIC) is next.
+Status (2026-11-04): Phases 0 to 3 (HTTP/2, QUIC, HTTP/3) are done; Phase 4 (hardening) is ongoing; Phase 5 (datagrams, WebTransport) is next.
 
 ## Decisions
 
@@ -238,6 +238,26 @@ Not covered: chacha20 (AES-GCM only, see the decisions), zerortt (refused), resu
 - **Directives:** `http3 on|off`, `http3_max_concurrent_streams`, `quic_retry`, `quic_gso`, plus the shared header
   limits.
 - **Then:** WebSockets over HTTP/3 through extended CONNECT (RFC 9220), reusing HTTP/2's handling.
+
+**Status (2026-11-04): done.**
+- **QPACK:** static table only, generated from RFC 9204's text.
+- **HTTP/3 framing,** and the per-connection layer on the endpoint thread.
+- **Request plumbing:** streams bridged to the request pipeline with back-pressure both ways.
+- **Configuration:** `listen ... quic`, `http3 on` (required), `http3_max_concurrent_streams`, `quic_retry`, `quic_gso`, and
+  automatic Alt-Svc.
+- **Reload:** GOAWAY, drain, and connections pinned to their generation.
+- **Shutdown:** GOAWAY to every connection, then the sockets close.
+- **WebSockets over HTTP/3** (RFC 9220).
+- **Servers that require client certificates** are kept off HTTP/3 (421, no Alt-Svc) until client certificates over
+  QUIC land.
+- **Testing:**
+  - our HTTP/3 client covering behaviour and attacks (stream versus connection errors, codes, QPACK, control-stream
+    rules, reload, body timeouts);
+  - fuzz targets `qpack`, `h3-frames` and `h3-session`;
+  - interop with curl's ngtcp2/nghttp3 in the suite where available.
+
+Bringing it up found a real bug in the transport: the endpoint's microsecond clock overflowed after hours of uptime
+and went negative, which silently dropped pacing deadlines. Fixed, with a test.
 
 ## Phase 4: hardening and release
 
