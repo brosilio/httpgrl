@@ -1,3 +1,4 @@
+using System.Net;
 using System.Security.Cryptography;
 using Httpgrl.Core.Quic;
 
@@ -19,8 +20,14 @@ internal sealed class QuicNet : IDisposable
     public Func<bool, byte[], bool>? DropIf;
     public long Delivered, Dropped;
 
+    /// <summary>Where the client's datagrams come from (change it to simulate a NAT rebinding or a migration).</summary>
+    public EndPoint ClientAddress = new IPEndPoint(IPAddress.Parse("192.0.2.1"), 40000);
+    public readonly EndPoint ServerAddress = new IPEndPoint(IPAddress.Parse("198.51.100.1"), 443);
+    /// <summary>Where the server sent each datagram, for tests of paths.</summary>
+    public readonly List<EndPoint> ServerSentTo = new();
+
     private readonly Random _rng;
-    private readonly PriorityQueue<(byte[] Data, bool ToServer), (long, long)> _wire = new();
+    private readonly PriorityQueue<(byte[] Data, bool ToServer, EndPoint From), (long, long)> _wire = new();
     private long _seq;
     private readonly long[] _linkFree = new long[2];
 
@@ -43,10 +50,10 @@ internal sealed class QuicNet : IDisposable
         ClientTls = QuicTlsContext.Client(Path.Combine(_dir, "q.crt"));
         ServerOptions = server ?? new QuicOptions();
         ClientOptions = client ?? new QuicOptions();
-        Client = QuicConnection.Client(ClientTls, "quic.test", alpn ?? ["test"], ClientOptions, Cids, Now);
+        Client = QuicConnection.Client(ClientTls, "quic.test", alpn ?? ["test"], ClientOptions, Cids, ServerAddress, Now);
     }
 
-    private void Put(byte[] data, bool toServer)
+    private void Put(byte[] data, bool toServer, EndPoint from)
     {
         if (_rng.NextDouble() < Loss || DropIf?.Invoke(toServer, data) == true) { Dropped++; return; }
         long at = Now;
@@ -58,31 +65,40 @@ internal sealed class QuicNet : IDisposable
             at = _linkFree[dir];
         }
         at += DelayUs + (JitterUs > 0 ? _rng.NextInt64(JitterUs) : 0);
-        _wire.Enqueue((data, toServer), (at, _seq++));
-        if (_rng.NextDouble() < Duplicate) _wire.Enqueue(((byte[])data.Clone(), toServer), (at + 1000, _seq++));
+        _wire.Enqueue((data, toServer, from), (at, _seq++));
+        if (_rng.NextDouble() < Duplicate) _wire.Enqueue(((byte[])data.Clone(), toServer, from), (at + 1000, _seq++));
     }
 
     private void Flush()
     {
         var buf = new byte[1500];
         int n;
-        while ((n = Client.Send(buf, Now)) > 0) Put(buf[..n], toServer: true);
+        while ((n = Client.Send(buf, Now, out _)) > 0)
+        {
+            ClientSent?.Invoke(buf[..n]);
+            Put(buf[..n], toServer: true, RewriteClientFrom?.Invoke(ClientAddress) ?? ClientAddress);
+        }
         if (Server is null) return;
-        while ((n = Server.Send(buf, Now)) > 0) Put(buf[..n], toServer: false);
+        while ((n = Server.Send(buf, Now, out var to)) > 0)
+        {
+            ServerSentTo.Add(to);
+            if (to.Equals(ClientAddress)) Put(buf[..n], toServer: false, ServerAddress); // only the client's current address is reachable
+            else Dropped++;
+        }
     }
 
-    private void Deliver(byte[] data, bool toServer)
+    private void Deliver(byte[] data, bool toServer, EndPoint from)
     {
         Delivered++;
-        if (!toServer) { Client.Receive(data, Now); return; }
+        if (!toServer) { Client.Receive(data, from, Now); return; }
         if (Server is null)
         {
             if (!Packets.TryParse(data, 8, out var h) || h.Type != PacketType.Initial || data.Length < 1200) return;
             var dcid = h.Dcid(data).ToArray();
             var (scid, token) = Cids();
-            Server = QuicConnection.Server(ServerTls, _ => ServerTls, ServerOptions, dcid, h.Scid(data).ToArray(), dcid, null, false, scid, token, Cids, Now);
+            Server = QuicConnection.Server(ServerTls, _ => ServerTls, ServerOptions, dcid, h.Scid(data).ToArray(), dcid, null, false, scid, token, Cids, from, Now);
         }
-        Server.Receive(data, Now);
+        Server.Receive(data, from, Now);
     }
 
     /// <summary>Run until <paramref name="done"/> holds, nothing more can happen, or <paramref name="maxUs"/> of virtual time passes. True if done.</summary>
@@ -102,7 +118,7 @@ internal sealed class QuicNet : IDisposable
             while (_wire.TryPeek(out var item, out pri) && pri.Item1 <= Now)
             {
                 _wire.Dequeue();
-                Deliver(item.Data, item.ToServer);
+                Deliver(item.Data, item.ToServer, item.From);
             }
             foreach (var c in new[] { Client, Server })
                 if (c is not null && c.Deadline != 0 && c.Deadline <= Now) c.OnTimeout(Now);
@@ -119,6 +135,14 @@ internal sealed class QuicNet : IDisposable
         while (c.TryGetEvent(out var e)) l.Add(e);
         return l;
     }
+
+    /// <summary>Hand the server a copy of a datagram as if from <paramref name="from"/> (spoofing and replay tests).</summary>
+    public void Inject(byte[] data, EndPoint from) => _wire.Enqueue((data, true, from), (Now + DelayUs, _seq++));
+
+    /// <summary>Called with each datagram the client sends (to capture one for replay).</summary>
+    public Action<byte[]>? ClientSent;
+    /// <summary>Rewrite the source of the client's datagrams in flight (an on-path attacker); null keeps it.</summary>
+    public Func<EndPoint, EndPoint?>? RewriteClientFrom;
 
     public void Dispose()
     {

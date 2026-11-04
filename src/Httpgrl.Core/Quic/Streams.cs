@@ -59,6 +59,8 @@ internal enum QuicEventKind : byte
     /// <summary>A new connection ID of ours, to route to this connection; or one retired, to stop routing.</summary>
     CidIssued,
     CidRetired,
+    /// <summary>The peer's new address (<see cref="QuicConnection.Path"/>) passed validation.</summary>
+    PathValidated,
     /// <summary>The connection is finished and can be forgotten.</summary>
     Closed,
 }

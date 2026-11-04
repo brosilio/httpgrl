@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Net;
 using System.Security.Cryptography;
 
 namespace Httpgrl.Core.Quic;
@@ -92,8 +93,26 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
 
     // Handshake progress.
     private bool _handshakeDonePending, _handshakeConfirmed, _connectedRaised;
-    private bool _addressValidated;
     private long _bytesReceived, _bytesSent;
+
+    // Paths (RFC 9000 9). Where we send; whether that address is validated, and (until it is) what it sent and we
+    // sent, for the 3x anti-amplification limit; a validated path to fall back on during a migration; our challenge.
+    private EndPoint _path;
+    private bool _addressValidated;
+    private long _pathRecv, _pathSent;
+    private EndPoint? _prevPath;
+    private byte[]? _challenge;
+    private bool _challengePending;
+    private long _challengeDeadline;
+    private (byte[] Data, EndPoint To, int Budget)? _pathResponse;
+    private EndPoint _from;              // where the datagram being processed came from
+    private int _datagramLen;
+    private bool _nonProbing;            // the packet being processed carried more than probing frames
+    private long _dcidSeq;               // the sequence number of the peer's connection ID we use
+    public int Migrations { get; private set; }
+    public EndPoint Path => _path;
+    /// <summary>The peer's connection ID we send to.</summary>
+    public byte[] DestinationCid => _dcid;
     private bool _retried;
 
     // Timers and closing.
@@ -145,9 +164,10 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     public long BytesSent => _bytesSent;
 
     private QuicConnection(bool server, QuicOptions o, Func<string?, QuicTlsContext?>? select, QuicTlsContext ctx, string? sni, string[]? alpn,
-        byte[] dcid, byte[] scid, byte[] originalDcid, byte[]? scidResetToken, Func<(byte[], byte[])> newCid, long now)
+        byte[] dcid, byte[] scid, byte[] originalDcid, byte[]? scidResetToken, Func<(byte[], byte[])> newCid, EndPoint path, long now)
     {
         IsServer = server;
+        _path = _from = path;
         _o = o;
         _dcid = dcid;
         _scid = scid;
@@ -177,9 +197,9 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     /// </summary>
     public static QuicConnection Server(QuicTlsContext ctx, Func<string?, QuicTlsContext?> select, QuicOptions o,
         byte[] clientDcid, byte[] clientScid, byte[] originalDcid, byte[]? retryScid, bool validated,
-        byte[] scid, byte[] resetToken, Func<(byte[], byte[])> newCid, long now)
+        byte[] scid, byte[] resetToken, Func<(byte[], byte[])> newCid, EndPoint client, long now)
     {
-        var c = new QuicConnection(true, o, select, ctx, null, null, clientScid, scid, originalDcid, resetToken, newCid, now)
+        var c = new QuicConnection(true, o, select, ctx, null, null, clientScid, scid, originalDcid, resetToken, newCid, client, now)
         {
             _retryScid = retryScid,
             _addressValidated = validated,
@@ -192,11 +212,11 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     }
 
     /// <summary>A client connection (tests and tools): random connection IDs; the first <see cref="Send"/> carries the ClientHello.</summary>
-    public static QuicConnection Client(QuicTlsContext ctx, string sni, string[] alpn, QuicOptions o, Func<(byte[], byte[])> newCid, long now)
+    public static QuicConnection Client(QuicTlsContext ctx, string sni, string[] alpn, QuicOptions o, Func<(byte[], byte[])> newCid, EndPoint server, long now)
     {
         var dcid = RandomNumberGenerator.GetBytes(8);
         var scid = RandomNumberGenerator.GetBytes(8);
-        var c = new QuicConnection(false, o, null, ctx, sni, alpn, dcid, scid, dcid, null, newCid, now) { _addressValidated = true };
+        var c = new QuicConnection(false, o, null, ctx, sni, alpn, dcid, scid, dcid, null, newCid, server, now) { _addressValidated = true };
         c._tls.Advance();
         return c;
     }
@@ -219,7 +239,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         MaxAckDelayMs = (ulong)_o.MaxAckDelayMs,
         ActiveConnectionIdLimit = (ulong)_o.ActiveConnectionIdLimit,
         MaxDatagramFrameSize = (ulong)_o.MaxDatagramFrameSize,
-        DisableActiveMigration = true, // until path validation and migration land
+        DisableActiveMigration = false,
     };
 
     private void InstallInitialKeys(ReadOnlySpan<byte> dcid)
@@ -278,11 +298,14 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
 
     // ------------------------------------------------------------------ receiving
 
-    /// <summary>Process one datagram from the peer.</summary>
-    public void Receive(Span<byte> datagram, long now)
+    /// <summary>Process one datagram, from <paramref name="from"/> (compared with <see cref="EndPoint.Equals(object)"/>).</summary>
+    public void Receive(Span<byte> datagram, EndPoint from, long now)
     {
         if (_state is State.Closed) return;
         _bytesReceived += datagram.Length;
+        if (from.Equals(_path)) _pathRecv += datagram.Length;
+        _from = from;
+        _datagramLen = datagram.Length;
         int at = 0;
         while (at < datagram.Length && _state != State.Closed)
         {
@@ -362,7 +385,11 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         }
         // Reserved bits must be zero once protection is off (RFC 9000 17.2, 17.3.1).
         if ((packet[0] & (h.Type == PacketType.OneRtt ? 0x18 : 0x0C)) != 0) throw new QuicException(QuicError.ProtocolViolation, "reserved bits set");
-        if (p.Received.Contains(pn)) return; // duplicate
+        if (p.Received.Contains(pn)) return; // duplicate (a replayed datagram moves nothing)
+        bool fromNewPath = !_from.Equals(_path);
+        // Only a confirmed connection's 1-RTT packets may come from another address, and only to a server: a client
+        // talks to the address it connected to (RFC 9000 9, 9.6).
+        if (fromNewPath && (!IsServer || space != 2 || !_handshakeConfirmed)) return;
         if (newPhase) OnPeerKeyUpdate(pn, now);
 
         if (!IsServer && space == 0 && !_peerCidSet)
@@ -383,6 +410,8 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         if (_state is State.Draining) return;
 
         bool ackEliciting = ProcessFrames(packet[headerLen..^PacketKeys.TagLength], h.Type, space, now);
+        // The newest packet, with more than probing frames, from a new address: the peer moved (9.3).
+        if (fromNewPath && _nonProbing && pn > p.LargestReceived && _state == State.Active) Migrate(now);
         p.Received.Add(pn, pn + 1);
         p.Received.KeepHighest(32);
         p.AckNew = true;
@@ -438,6 +467,46 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         _handshakeConfirmed && _appSendSecret is not null && _sendPhase == _recvPhase
         && (_keyUpdatePn < 0 || Recovery.Spaces[2].LargestAcked >= _keyUpdatePn);
 
+    /// <summary>
+    /// The peer moved to the address of the packet being processed (RFC 9000 9.3): send there, validate it with a
+    /// challenge (anti-amplification applies until it answers), start congestion control afresh unless only the port
+    /// changed (NAT rebinding, 9.4), and use a fresh connection ID if the peer gave us one (9.5).
+    /// </summary>
+    private void Migrate(long now)
+    {
+        var old = _path;
+        bool portOnly = old is IPEndPoint a && _from is IPEndPoint b && a.Address.Equals(b.Address);
+        if (_addressValidated) _prevPath = old;
+        _path = _from;
+        _addressValidated = false;
+        _pathRecv = _datagramLen;
+        _pathSent = 0;
+        if (!portOnly) Recovery.ResetForNewPath();
+        _challenge = RandomNumberGenerator.GetBytes(8);
+        _challengePending = true;
+        // Three times the larger of the current PTO and a new path's (from the initial RTT) (8.2.4).
+        _challengeDeadline = now + 3 * Math.Max(Recovery.Pto, Recovery.InitialRtt + 4 * (Recovery.InitialRtt / 2));
+        if (_peerCids.Count > 0)
+        {
+            var next = _peerCids[0];
+            foreach (var c in _peerCids) if (c.Seq < next.Seq) next = c;
+            _peerCids.Remove(next);
+            _retireCidPending.Enqueue(_dcidSeq);
+            _dcid = next.Cid;
+            _dcidSeq = next.Seq;
+        }
+        Migrations++;
+    }
+
+    private void PathValidated()
+    {
+        _addressValidated = true;
+        _challenge = null;
+        _challengePending = false;
+        _prevPath = null;
+        Raise(QuicEventKind.PathValidated);
+    }
+
     private bool IsStatelessReset(ReadOnlySpan<byte> tail)
     {
         bool match = false;
@@ -481,9 +550,11 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         if (payload.IsEmpty) throw new QuicException(QuicError.ProtocolViolation, "packet with no frames");
         var r = new QuicFrameReader(payload, type, fromClient: IsServer);
         bool ackEliciting = false;
+        _nonProbing = false;
         while (r.TryNext(out var f))
         {
             ackEliciting |= QuicFrameType.IsAckEliciting(f.Type);
+            _nonProbing |= f.Type is not (QuicFrameType.PathChallenge or QuicFrameType.PathResponse or QuicFrameType.NewConnectionId or QuicFrameType.Padding);
             switch (f.Type)
             {
                 case QuicFrameType.Padding:
@@ -553,10 +624,12 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
                     OnRetireConnectionId((long)f.Value, now);
                     break;
                 case QuicFrameType.PathChallenge:
-                    _pathResponse = f.Data.ToArray();
+                    // Answer on the path it came from, within 3x what that datagram brought (RFC 9000 8.2.2).
+                    _pathResponse = (f.Data.ToArray(), _from, 3 * _datagramLen);
                     break;
                 case QuicFrameType.PathResponse:
-                    break; // we don't probe paths yet
+                    if (_challenge is not null && f.Data.SequenceEqual(_challenge)) PathValidated();
+                    break;
                 case QuicFrameType.Datagram:
                 case QuicFrameType.DatagramLen:
                     if (_o.MaxDatagramFrameSize == 0 || f.Data.Length > _o.MaxDatagramFrameSize)
@@ -575,7 +648,6 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         return ackEliciting;
     }
 
-    private byte[]? _pathResponse;
 
     private void OnAckFrame(int space, AckFrame ack, long now)
     {
@@ -667,6 +739,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
                         if (_ourCids[i].Seq == f.A && !_ourCids[i].Acked) _ourCids[i] = _ourCids[i] with { Sent = false };
                     break;
                 case SentKind.RetireConnectionId: _retireCidPending.Enqueue(f.A); break;
+                case SentKind.PathChallenge: if (_challenge is not null) _challengePending = true; break;
                 case SentKind.DataBlocked: _dataBlockedAt = -1; break;
                 case SentKind.StreamDataBlocked:
                     if (_streams.TryGetValue(f.Id, out var bs)) bs.BlockedSentAt = -1;
@@ -766,6 +839,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
                 return;
             }
         }
+        if (seq == _dcidSeq) return; // the one in use, again
         if (seq < _peerCidRetirePriorTo) { _retireCidPending.Enqueue(seq); return; }
         _peerCids.Add((seq, cid.ToArray(), token.ToArray()));
         if (retirePriorTo > _peerCidRetirePriorTo)
@@ -775,10 +849,18 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
                 if (_peerCids[i].Seq < retirePriorTo)
                 {
                     _retireCidPending.Enqueue(_peerCids[i].Seq);
-                    if (_peerCids[i].Cid.AsSpan().SequenceEqual(_dcid) && _peerCids.Count > 1)
-                        _dcid = _peerCids.Find(x => x.Seq >= retirePriorTo).Cid ?? _dcid;
                     _peerCids.RemoveAt(i);
                 }
+            // The ID in use is retired too: move to the lowest one still allowed (RFC 9000 5.1.2).
+            if (_dcidSeq < retirePriorTo && _peerCids.Count > 0)
+            {
+                var next = _peerCids[0];
+                foreach (var c in _peerCids) if (c.Seq < next.Seq) next = c;
+                _peerCids.Remove(next);
+                _retireCidPending.Enqueue(_dcidSeq);
+                _dcid = next.Cid;
+                _dcidSeq = next.Seq;
+            }
         }
         // Count the one in use (sequence 0, from the handshake) against our limit too.
         if (_peerCids.Count + 1 > _o.ActiveConnectionIdLimit)
@@ -1073,6 +1155,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
             if (_state is State.Closing or State.Draining) return _closeDeadline;
             long t = IdleDeadline;
             if (!_tls.HandshakeComplete) t = Math.Min(t, _created + _o.HandshakeTimeoutMs * 1000L);
+            if (_challenge is not null) t = Math.Min(t, _challengeDeadline);
             long loss = Recovery.Deadline(_handshakeConfirmed, AmplificationBlocked, IsServer || _handshakeConfirmed, out _, out _);
             if (loss != 0) t = Math.Min(t, loss);
             foreach (var p in _pns)
@@ -1104,6 +1187,25 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
             _closeReason = "handshake timeout";
             Finish();
             return;
+        }
+        if (_challenge is not null && now >= _challengeDeadline)
+        {
+            // The new path never answered: go back to the old one if it was validated, else give up (RFC 9000 9.3.2).
+            _challenge = null;
+            _challengePending = false;
+            if (_prevPath is not null)
+            {
+                _path = _prevPath;
+                _prevPath = null;
+                _addressValidated = true;
+            }
+            else
+            {
+                CloseCode = QuicError.NoViablePath;
+                _closeReason = "path validation failed";
+                Finish();
+                return;
+            }
         }
         long loss = Recovery.Deadline(_handshakeConfirmed, AmplificationBlocked, IsServer || _handshakeConfirmed, out int space, out bool pto);
         if (loss != 0 && now >= loss)
@@ -1138,7 +1240,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         }
     }
 
-    private bool AmplificationBlocked => IsServer && !_addressValidated && _bytesSent + _o.MaxDatagramSize > 3 * _bytesReceived;
+    private bool AmplificationBlocked => !_addressValidated && _pathSent + _o.MaxDatagramSize > 3 * _pathRecv;
 
     // ------------------------------------------------------------------ sending
 
@@ -1157,13 +1259,21 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     /// The next datagram to send, written to <paramref name="buf"/> (at least the max datagram size); its length, 0
     /// for nothing to send now.
     /// </summary>
-    public int Send(Span<byte> buf, long now)
+    public int Send(Span<byte> buf, long now, out EndPoint to)
     {
+        to = _path;
         if (_state is State.Closed or State.Draining) return 0;
-        int limit = Math.Min(buf.Length, _o.MaxDatagramSize);
-        if (IsServer && !_addressValidated)
+        // A PATH_RESPONSE for another path goes on its own, to that path (RFC 9000 8.2.2).
+        if (_pathResponse is { } pr && !pr.To.Equals(_path) && _state == State.Active && _pns[2].Send is not null)
         {
-            long allowance = 3 * _bytesReceived - _bytesSent;
+            _pathResponse = null;
+            to = pr.To;
+            return SendPathResponse(buf[..Math.Min(buf.Length, Math.Min(_o.MaxDatagramSize, pr.Budget))], pr.Data, now);
+        }
+        int limit = Math.Min(buf.Length, _o.MaxDatagramSize);
+        if (!_addressValidated)
+        {
+            long allowance = 3 * _pathRecv - _pathSent;
             if (allowance < limit) limit = (int)Math.Max(0, allowance);
             if (limit < 64) return 0;
         }
@@ -1171,7 +1281,9 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         {
             if (!_closeDue) return 0;
             _closeDue = false;
-            return SendClose(buf[..limit], now);
+            int c = SendClose(buf[..limit], now);
+            _pathSent += c;
+            return c;
         }
 
         int count = 0, pos = 0;
@@ -1192,8 +1304,10 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         }
         if (count == 0) return 0;
 
-        // Datagrams with an ack-eliciting Initial (all of a client's Initials) go out at 1200 bytes at least (14.1).
-        bool pad = false;
+        // Datagrams with an ack-eliciting Initial (all of a client's Initials) go out at 1200 bytes at least (14.1),
+        // and so do path probes (8.2.1), when the amplification limit allows.
+        bool pad = _padPathFrame;
+        _padPathFrame = false;
         for (int i = 0; i < count; i++)
             if (_building[i].Space == 0 && (!IsServer || _building[i].AckEliciting)) pad = true;
         if (pad && pos < 1200 && limit >= 1200)
@@ -1208,7 +1322,38 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         }
         for (int i = 0; i < count; i++) Seal(buf, ref _building[i], now);
         _bytesSent += pos;
+        _pathSent += pos;
         return pos;
+    }
+
+    private bool _padPathFrame;
+
+    /// <summary>A datagram with only a PATH_RESPONSE (and padding), for a path other than the current one.</summary>
+    private int SendPathResponse(Span<byte> buf, byte[] data, long now)
+    {
+        var p = _pns[2];
+        long pn = p.NextPn;
+        int pnLen = Packets.PacketNumberLength(pn, Recovery.Spaces[2].LargestAcked);
+        int w = 0;
+        buf[w++] = (byte)(0x40 | (_sendPhase << 2) | (pnLen - 1));
+        _dcid.CopyTo(buf[w..]);
+        w += _dcid.Length;
+        int pnOffset = w;
+        w += pnLen;
+        w += QuicFrameWriter.PathChallenge(buf[w..], data, response: true);
+        int end = Math.Max(w, Math.Min(buf.Length, 1200) - PacketKeys.TagLength);
+        if (end + PacketKeys.TagLength > buf.Length) return 0;
+        buf[w..end].Clear();
+        ref var b = ref _building[0];
+        b = new Building { Start = 0, Space = 2, Pn = pn, PnLen = pnLen, LengthOffset = -1, PnOffset = pnOffset, End = end + PacketKeys.TagLength, AckEliciting = true };
+        b.Sent = NewSent();
+        b.Sent.Pn = pn;
+        b.Sent.Frames.Add(new SentFrame { Kind = SentKind.Ping });
+        b.Sent.AckEliciting = b.Sent.InFlight = true;
+        p.NextPn++;
+        Seal(buf, ref b, now);
+        _bytesSent += b.End;
+        return b.End;
     }
 
     private bool Wants(int space, long now, bool ccOpen)
@@ -1220,7 +1365,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         if (!ccOpen) return false;
         if (p.CryptoSend.HasData(long.MaxValue)) return true;
         if (space != 2) return false;
-        return _handshakeDonePending || _maxDataPending || _maxStreamsBidiPending || _maxStreamsUniPending || _pathResponse is not null
+        return _handshakeDonePending || _maxDataPending || _maxStreamsBidiPending || _maxStreamsUniPending || _pathResponse is not null || _challengePending
             || _retireCidPending.Count > 0 || _ourCids.Exists(c => !c.Sent) || _dgOut.Count > 0 || HasStreamWork();
     }
 
@@ -1366,11 +1511,19 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
             sent.Frames.Add(new SentFrame { Kind = SentKind.HandshakeDone });
             _handshakeDonePending = false;
         }
-        if (_pathResponse is not null && end - w > 9)
+        if (_pathResponse is { } pr && pr.To.Equals(_path) && end - w > 9)
         {
-            w += QuicFrameWriter.PathChallenge(d[w..], _pathResponse, response: true);
+            w += QuicFrameWriter.PathChallenge(d[w..], pr.Data, response: true);
             _pathResponse = null;
+            _padPathFrame = true;
             sent.Frames.Add(new SentFrame { Kind = SentKind.Ping }); // ack-eliciting, not retransmitted
+        }
+        if (_challengePending && _challenge is not null && end - w > 9)
+        {
+            w += QuicFrameWriter.PathChallenge(d[w..], _challenge);
+            _challengePending = false;
+            _padPathFrame = true;
+            sent.Frames.Add(new SentFrame { Kind = SentKind.PathChallenge });
         }
         if (_maxDataPending && end - w > 9)
         {

@@ -36,11 +36,11 @@ internal sealed class QuicEndpoint : IDisposable
     public const int CidLength = 8;
     private const long RetryTokenLifetimeUs = 10_000_000;
 
-    private sealed class Conn(QuicConnection c, EndPoint remote, IpKey client)
+    private sealed class Conn(QuicConnection c, IpKey client)
     {
         public readonly QuicConnection C = c;
-        public readonly EndPoint Remote = remote;
-        public readonly IpKey Client = client;
+        /// <summary>Whose per-client allowance it counts against: the address it started from, then each validated one.</summary>
+        public IpKey Client = client;
         public readonly List<CidKey> Cids = new();
         public long Queued;
         public bool Handshaking = true;
@@ -178,9 +178,8 @@ internal sealed class QuicEndpoint : IDisposable
         if (!Packets.TryParse(d, CidLength, out var h)) return;
         if (_cids.TryGetValue(CidKey.From(h.Dcid(d)), out var conn))
         {
-            // No migration yet: a connection only talks to the address it started with.
-            if (!conn.Remote.Equals(from)) return;
-            conn.C.Receive(d, now);
+            // From anywhere: the connection decides whether a new address is a migration (RFC 9000 9).
+            conn.C.Receive(d, from, now);
             Service(conn, now);
             return;
         }
@@ -239,21 +238,21 @@ internal sealed class QuicEndpoint : IDisposable
         try
         {
             qc = QuicConnection.Server(_defaultTls, _selectTls, _o.Connection, dcid, h.Scid(d).ToArray(), originalDcid, retryScid, validated,
-                scid, ResetToken(scid), NewCid, now);
+                scid, ResetToken(scid), NewCid, from, now);
         }
         catch (Exception e) when (e is QuicException or InvalidOperationException)
         {
             _log.Warn("quic connection setup failed", new LogField("error", e.Message));
             return;
         }
-        var conn = new Conn(qc, from, client);
+        var conn = new Conn(qc, client);
         _conns.Add(conn);
         _handshaking++;
         _perClient[client] = mine + 1;
         Accepted++;
         Map(conn, scid);
         Map(conn, dcid); // the client keeps using its chosen DCID until it hears from us
-        qc.Receive(d, now);
+        qc.Receive(d, from, now);
         Service(conn, now);
     }
 
@@ -294,6 +293,18 @@ internal sealed class QuicEndpoint : IDisposable
                     break;
                 }
                 case QuicEventKind.Closed: break;
+                case QuicEventKind.PathValidated:
+                {
+                    // Per-client limits follow the validated address.
+                    var moved = IpKey.From(c.C.Path);
+                    if (moved != c.Client)
+                    {
+                        Release(c.Client);
+                        _perClient[moved] = (_perClient.TryGetValue(moved, out int m) ? m : 0) + 1;
+                        c.Client = moved;
+                    }
+                    break;
+                }
                 case QuicEventKind.Connected:
                     if (c.Handshaking) { c.Handshaking = false; _handshaking--; }
                     goto default;
@@ -308,7 +319,7 @@ internal sealed class QuicEndpoint : IDisposable
             }
         }
         int n;
-        while ((n = c.C.Send(_out, now)) > 0) SendTo(_out.AsSpan(0, n), c.Remote);
+        while ((n = c.C.Send(_out, now, out var to)) > 0) SendTo(_out.AsSpan(0, n), to);
         if (c.C.IsClosed)
         {
             Remove(c);
@@ -328,11 +339,16 @@ internal sealed class QuicEndpoint : IDisposable
         if (c.Handshaking) { c.Handshaking = false; _handshaking--; }
         foreach (var k in c.Cids)
             if (_cids.TryGetValue(k, out var x) && ReferenceEquals(x, c)) _cids.Remove(k);
-        if (_perClient.TryGetValue(c.Client, out int n))
-        {
-            if (n <= 1) _perClient.Remove(c.Client); else _perClient[c.Client] = n - 1;
-        }
+        Release(c.Client);
         c.C.Dispose();
+    }
+
+    private void Release(IpKey client)
+    {
+        if (_perClient.TryGetValue(client, out int n))
+        {
+            if (n <= 1) _perClient.Remove(client); else _perClient[client] = n - 1;
+        }
     }
 
     private void SendTo(ReadOnlySpan<byte> d, EndPoint to)

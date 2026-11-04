@@ -19,6 +19,7 @@ internal enum SentKind : byte
     StreamDataBlocked, // Id
     NewToken,
     Ping,
+    PathChallenge,
 }
 
 internal struct SentFrame
@@ -260,6 +261,19 @@ internal sealed class Recovery
         _recoveryStart = now;
         Ssthresh = Math.Max(Cwnd / 2, MinWindow);
         Cwnd = Ssthresh;
+    }
+
+    /// <summary>A new path (RFC 9000 9.4): congestion control and the RTT estimate start over; what's in flight stays counted.</summary>
+    public void ResetForNewPath()
+    {
+        Cwnd = Math.Min(10L * MaxDatagramSize, Math.Max(14720, 2L * MaxDatagramSize));
+        Ssthresh = long.MaxValue;
+        _recoveryStart = -1;
+        HasRttSample = false;
+        LatestRtt = MinRtt = 0;
+        SmoothedRtt = InitialRtt;
+        RttVar = InitialRtt / 2;
+        PtoCount = 0;
     }
 
     /// <summary>Forget a space whose keys are discarded (RFC 9002 6.4): its packets no longer count in flight.</summary>

@@ -36,7 +36,7 @@ internal static class QuicEndpointTests
         {
             _server = server;
             Socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-            C = QuicConnection.Client(tls, "quic.test", [alpn], o ?? new QuicOptions(), QuicNet.Cids, QuicEndpoint.Now());
+            C = QuicConnection.Client(tls, "quic.test", [alpn], o ?? new QuicOptions(), QuicNet.Cids, server, QuicEndpoint.Now());
         }
 
         public bool Run(Func<bool> done, int timeoutMs = 10_000)
@@ -47,7 +47,7 @@ internal static class QuicEndpointTests
             {
                 long now = QuicEndpoint.Now();
                 int n;
-                while ((n = C.Send(_buf, now)) > 0) Socket.SendTo(_buf.AsSpan(0, n), _server);
+                while ((n = C.Send(_buf, now, out _)) > 0) Socket.SendTo(_buf.AsSpan(0, n), _server);
                 if (done()) return true;
                 if (C.IsClosed) return done();
                 long d = C.Deadline;
@@ -55,7 +55,7 @@ internal static class QuicEndpointTests
                 if (Socket.Poll(waitUs, SelectMode.SelectRead))
                 {
                     n = Socket.ReceiveFrom(_buf, ref from);
-                    C.Receive(_buf.AsSpan(0, n), QuicEndpoint.Now());
+                    C.Receive(_buf.AsSpan(0, n), from, QuicEndpoint.Now());
                 }
                 now = QuicEndpoint.Now();
                 if (C.Deadline != 0 && C.Deadline <= now) C.OnTimeout(now);

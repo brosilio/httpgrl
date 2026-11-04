@@ -163,6 +163,100 @@ internal static class QuicConnectionTests
             }
         });
 
+        T.Add("quic migration: a NAT rebinding mid-transfer moves the server (congestion state kept); a new address resets it and changes connection ID", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            var a = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("192.0.2.1"), 40000);
+            var rebound = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("192.0.2.1"), 40001);
+            var moved = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("192.0.2.77"), 5000);
+            using (var net = new QuicNet())
+            {
+                T.True(net.Run(() => net.Connected && net.Client.HandshakeConfirmed));
+                long switchAt = net.Now + 100_000;
+                bool switched = false;
+                long cwndBefore = 0;
+                net.DropIf = (toServer, _) =>
+                {
+                    if (!switched && net.Now >= switchAt) { switched = true; cwndBefore = net.Server!.Recovery.Cwnd; net.ClientAddress = rebound; }
+                    return false;
+                };
+                T.True(Echo(net, 1 << 20));
+                T.Eq(1, net.Server!.Migrations);
+                T.Eq((System.Net.EndPoint)rebound, net.Server.Path);
+                T.True(net.Server.AddressValidated);
+                T.True(net.Server.Recovery.Cwnd >= cwndBefore / 2); // not reset to the initial window
+            }
+            using (var net = new QuicNet())
+            {
+                T.True(net.Run(() => net.Connected && net.Client.HandshakeConfirmed));
+                var cidBefore = net.Server!.DestinationCid;
+                long switchAt = net.Now + 100_000;
+                bool switched = false;
+                net.DropIf = (toServer, _) =>
+                {
+                    if (!switched && net.Now >= switchAt) { switched = true; net.ClientAddress = moved; }
+                    return false;
+                };
+                T.True(Echo(net, 500_000));
+                T.Eq(1, net.Server!.Migrations);
+                T.Eq((System.Net.EndPoint)moved, net.Server.Path);
+                T.True(net.Server.AddressValidated);
+                T.True(!net.Server.DestinationCid.AsSpan().SequenceEqual(cidBefore)); // a fresh connection ID for the new path
+            }
+        });
+
+        T.Add("quic migration: a replayed datagram from a spoofed address moves nothing; a rewritten source is undone by the next real packet", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            var attacker = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("203.0.113.66"), 6666);
+            using (var net = new QuicNet())
+            {
+                T.True(net.Run(() => net.Connected && net.Client.HandshakeConfirmed));
+                byte[]? captured = null;
+                net.ClientSent = d => captured ??= (d[0] & 0x80) == 0 ? d.ToArray() : null; // a 1-RTT datagram
+                T.True(Echo(net, 20_000));
+                T.True(captured is not null);
+                net.Inject(captured!, attacker);
+                net.Run(() => false, maxUs: 500_000);
+                T.Eq(0, net.Server!.Migrations);
+                T.Eq(net.ClientAddress, net.Server.Path);
+                T.True(!net.ServerSentTo.Exists(e => e.Equals(attacker)) || net.ServerSentTo.FindAll(e => e.Equals(attacker)).Count <= 1);
+            }
+            using (var net = new QuicNet())
+            {
+                T.True(net.Run(() => net.Connected && net.Client.HandshakeConfirmed));
+                var home = net.ClientAddress;
+                int rewrites = 1;
+                long at = net.Now + 50_000;
+                net.RewriteClientFrom = from => net.Now >= at && rewrites-- > 0 ? attacker : null;
+                T.True(Echo(net, 300_000));
+                T.Eq(home, net.Server!.Path); // moved to the attacker's address, then straight back
+                T.True(net.Server.Migrations >= 2);
+                T.True(net.Server.AddressValidated);
+            }
+        });
+
+        T.Add("quic migration: a new path that never answers its challenge falls back to the old, validated one", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            var attacker = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("203.0.113.66"), 6666);
+            using var net = new QuicNet();
+            T.True(net.Run(() => net.Connected && net.Client.HandshakeConfirmed));
+            var home = net.ClientAddress;
+            // One datagram's source rewritten, then the client silent for 5 s: the challenge to the bogus address times out.
+            long quietUntil = 0;
+            int rewrites = 1;
+            net.RewriteClientFrom = from => { if (rewrites-- > 0) { quietUntil = net.Now + 5_000_000; return attacker; } return null; };
+            net.DropIf = (toServer, _) => toServer && rewrites < 0 && net.Now < quietUntil;
+            long id = net.Client.OpenStream(true);
+            net.Client.StreamWrite(id, "hello"u8, false);
+            T.True(net.Run(() => net.Server is { Migrations: 1 }));
+            T.Eq((System.Net.EndPoint)attacker, net.Server!.Path);
+            T.True(net.Run(() => net.Server.Path.Equals(home) && net.Server.AddressValidated, maxUs: 10_000_000));
+            T.Eq(1, net.Server.Migrations);
+            T.True(!net.Server.IsClosed);
+        });
+
         T.Add("quic connection: small flow-control windows and a slow link still move 2 MiB (window updates, blocking)", () =>
         {
             if (QuicTls.Unavailable is not null) return;
