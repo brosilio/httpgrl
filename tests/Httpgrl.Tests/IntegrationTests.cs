@@ -247,6 +247,34 @@ internal static class IntegrationTests
             T.Eq("[/a/../b?q]", Body(await s.Raw(Get("/a/../b?q")))); // origin form: as received (nginx keeps it unnormalized too)
         });
 
+        T.Add("security: an unread request body is never parsed as the next request", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; client_max_body_size 100;
+                  location /evil { return 200 "EVIL"; }
+                  location / { return 200 "ok $uri"; }
+                } }
+                """);
+            const string hidden = "GET /evil HTTP/1.1\r\nHost: a\r\n\r\n";
+            const string next = "GET /next HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+            // Content-Length body the handler never reads: drained, then the real next request.
+            var r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: {hidden.Length}\r\n\r\n{hidden}{next}");
+            T.NotContains("EVIL", r);
+            T.Contains("ok /next", r);
+            // Chunked, same.
+            r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{hidden.Length:x}\r\n{hidden}\r\n0\r\n\r\n{next}");
+            T.NotContains("EVIL", r);
+            T.Contains("ok /next", r);
+            // Too big to accept (413): the server can't know where the body ends without reading it, so it closes.
+            var big = new string('x', 200);
+            r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: {big.Length + hidden.Length}\r\n\r\n{big}{hidden}{next}");
+            T.Eq(413, Status(r));
+            T.NotContains("EVIL", r);
+            // Expect: 100-continue that's never honored (answered early): the body may never come, so the connection closes.
+            r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: {hidden.Length}\r\nExpect: 100-continue\r\n\r\n{hidden}{next}");
+            T.NotContains("EVIL", r);
+        });
+
         T.Add("security: FIFO in the web root neither hangs nor serves", async () =>
         {
             if (OperatingSystem.IsWindows()) return;

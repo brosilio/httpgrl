@@ -67,6 +67,16 @@ internal static class ProxyTests
             T.Contains("\r\n\r\n3\r\nabc\r\n0\r\n\r\n", seen);
         });
 
+        T.Add("proxy: a declared body over client_max_body_size is refused before the upstream is contacted", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($"client_max_body_size 10; location / {{ proxy_pass http://127.0.0.1:{up.Port}; }}"));
+            var r = await s.Raw("POST /p HTTP/1.1\r\nHost: f\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world");
+            T.Eq(413, Status(r));
+            T.Eq(0, up.Accepted); // nothing half-sent upstream
+            T.Eq(200, Status(await s.Raw("POST /p HTTP/1.1\r\nHost: f\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhelloworld")));
+        });
+
         T.Add("proxy: underscored header names never reach the upstream (CGI header-folding spoof)", async () =>
         {
             await using var up = FakeUpstream.Echo();

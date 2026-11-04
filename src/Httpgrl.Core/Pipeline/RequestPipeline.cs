@@ -62,6 +62,16 @@ internal sealed class RequestPipeline(HttpHandler[] rewrite, HttpHandler[] acces
             {
                 var loc = ctx.ServerRt.Find(req.PathValue, out var m);
                 ctx.SelectLocation(loc, m);
+                // As nginx does once the location is known: a declared body over the limit is refused before any handler
+                // runs, rather than only when (or if) something reads it. Otherwise a handler that doesn't read the body
+                // answers it anyway, and the proxy would send the head upstream and then cut the request mid-body.
+                long max = loc.Core.MaxBodySize;
+                if (max > 0 && req.ContentLengthValue > max && !ctx.BodyReader.Started)
+                {
+                    ctx.SetKeepAlive(false);
+                    await RenderStatusAsync(ctx, 413).ConfigureAwait(false);
+                    return;
+                }
             }
             else
             {
