@@ -26,6 +26,8 @@ public sealed class HttpCoreConf : ScopeConfig<HttpCoreConf>
     public int? LargeHeaderCount, LargeHeaderSize;
     public bool? ServerTokens;
     public bool? UnderscoresInHeaders;
+    public bool? Http2;
+    public int? Http2MaxConcurrentStreams;
     /// <summary>disable_symlinks: null/off; "" = check from "/"; otherwise an absolute prefix, or "$document_root".</summary>
     public string? DisableSymlinksFrom;
     public bool? DisableSymlinks;
@@ -43,6 +45,9 @@ public sealed class HttpCoreConf : ScopeConfig<HttpCoreConf>
     public int HeaderTotalMax => (LargeHeaderCount ?? 4) * HeaderLineMax;
     /// <summary>Off by default: no Server header and no product name in core error pages.</summary>
     public bool Tokens => ServerTokens ?? false;
+    /// <summary>http2 on: offered by ALPN (never by default).</summary>
+    public bool Http2Enabled => Http2 ?? false;
+    public int Http2MaxStreams => Http2MaxConcurrentStreams ?? 128;
     public string DefaultContentType => DefaultType ?? "text/plain";
 
     protected override void Inherit(HttpCoreConf p)
@@ -68,6 +73,8 @@ public sealed class HttpCoreConf : ScopeConfig<HttpCoreConf>
         LargeHeaderSize ??= p.LargeHeaderSize;
         ServerTokens ??= p.ServerTokens;
         UnderscoresInHeaders ??= p.UnderscoresInHeaders;
+        Http2 ??= p.Http2;
+        Http2MaxConcurrentStreams ??= p.Http2MaxConcurrentStreams;
         if (DisableSymlinks is null) { DisableSymlinks = p.DisableSymlinks; DisableSymlinksFrom = p.DisableSymlinksFrom; }
     }
 }

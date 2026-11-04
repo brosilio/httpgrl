@@ -179,23 +179,12 @@ internal sealed class ConnectionManager : IDisposable
                 var c = Volatile.Read(ref slots[i]);
                 if (c is null) continue;
                 string? why = null;
-                long b = Volatile.Read(ref c.BaseDeadline);
-                long rd = Volatile.Read(ref c.ReadDeadline), wd = Volatile.Read(ref c.WriteDeadline);
                 if (stopping && c.Idle) why = "shutdown";
                 // Idle TLS connections close at reload; idle plaintext ones move to the new configuration on their next
                 // request. Anything still on a replaced configuration after reload_drain_timeout is closed.
                 else if (c.Generation is { Retired: true } g && ((c.Idle && c.Tls) || now > g.RetireDeadline))
                     why = c.Idle ? "configuration reloaded" : "reload drain timeout";
-                else if (b != 0 && now > b) why = c.Phase + " timeout";
-                else if ((rd != 0 && now > rd) || (wd != 0 && now > wd)) why = c.Phase + " i/o timeout";
-                else if (c.MinRate > 0)
-                {
-                    long busy = Volatile.Read(ref c.RateBusyMs);
-                    long rs = Volatile.Read(ref c.ReadStartedAt), ws = Volatile.Read(ref c.WriteStartedAt);
-                    if (rs != 0) busy += now - rs;
-                    if (ws != 0) busy += now - ws;
-                    if (busy > RateGraceMs && c.RateBytes * 1000 < (long)c.MinRate * busy) why = c.Phase + " below minimum rate";
-                }
+                else why = Expired(c, now);
                 if (why is not null) doomed.Add((c, why));
             }
             foreach (var (c, why) in doomed)
@@ -204,7 +193,48 @@ internal sealed class ConnectionManager : IDisposable
                 c.Abort(why, graceful: why is "shutdown" or "configuration reloaded" or "reload drain timeout");
             }
             doomed.Clear();
+
+            // Streams of multiplexed connections: their own deadlines; an expiry resets the stream, not its connection.
+            lock (_tracked) { _sweep.Clear(); _sweep.AddRange(_tracked); }
+            foreach (var d in _sweep)
+            {
+                if (Expired(d, now) is not { } why) continue;
+                _log.Info("stream aborted", new LogField("reason", why));
+                d.Abort(why);
+            }
         }
+    }
+
+    /// <summary>Whether a record's phase deadline, an operation's deadline or its minimum rate has been missed.</summary>
+    private static string? Expired(Deadlines c, long now)
+    {
+        long b = Volatile.Read(ref c.BaseDeadline);
+        long rd = Volatile.Read(ref c.ReadDeadline), wd = Volatile.Read(ref c.WriteDeadline);
+        if (b != 0 && now > b) return c.Phase + " timeout";
+        if ((rd != 0 && now > rd) || (wd != 0 && now > wd)) return c.Phase + " i/o timeout";
+        if (c.MinRate > 0)
+        {
+            long busy = Volatile.Read(ref c.RateBusyMs);
+            long rs = Volatile.Read(ref c.ReadStartedAt), ws = Volatile.Read(ref c.WriteStartedAt);
+            if (rs != 0) busy += now - rs;
+            if (ws != 0) busy += now - ws;
+            if (busy > RateGraceMs && c.RateBytes * 1000 < (long)c.MinRate * busy) return c.Phase + " below minimum rate";
+        }
+        return null;
+    }
+
+    private readonly HashSet<Deadlines> _tracked = new();
+    private readonly List<Deadlines> _sweep = new();
+
+    /// <summary>Have the sweeper enforce <paramref name="d"/>'s deadlines (a stream); <see cref="Untrack"/> when it ends.</summary>
+    public void Track(Deadlines d)
+    {
+        lock (_tracked) _tracked.Add(d);
+    }
+
+    public void Untrack(Deadlines d)
+    {
+        lock (_tracked) _tracked.Remove(d);
     }
 
     public void Dispose() => _disposed = true;

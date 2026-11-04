@@ -108,6 +108,13 @@ internal sealed class Http1Session
                     }
                 }
                 info.SetTls(TlsHost(ssl.TargetHostName), ssl.SslProtocol.ToString(), clientCert, verdict);
+                if (ssl.NegotiatedApplicationProtocol == SslApplicationProtocol.Http2)
+                {
+                    // ALPN chose HTTP/2 (offered only with "http2 on"): the connection belongs to an HTTP/2 session.
+                    _transport = transport;
+                    await new Http2.Http2Session(_conn, transport, _rt, _mgr, _hosts, _tlsServer!, info, _tlsServer!.Root.Core).RunAsync().ConfigureAwait(false);
+                    return;
+                }
             }
             _transport = transport;
 

@@ -1,0 +1,330 @@
+using System.Buffers.Binary;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Text;
+using Httpgrl.Core.Http2;
+
+namespace Httpgrl.Tests;
+
+/// <summary>HTTP/2 end to end: a real client for behaviour, a raw frame client for the attacks.</summary>
+internal static class Http2SessionTests
+{
+    private static string Conf(string server = "", string http = "") => $$"""
+        http { {{http}}
+          server { listen 127.0.0.1:0 ssl; server_name h2.test; http2 on;
+            ssl_certificate {DIR}/h2.crt; ssl_certificate_key {DIR}/h2.key; root {DIR}/www;
+            {{server}} } }
+        """;
+
+    private static void Populate(string d)
+    {
+        ProxyTests.MakeCert("h2.test", d, "h2");
+        Directory.CreateDirectory(Path.Combine(d, "www"));
+        File.WriteAllText(Path.Combine(d, "www", "index.html"), "hello");
+        var big = new byte[1 << 20];
+        new Random(3).NextBytes(big);
+        File.WriteAllBytes(Path.Combine(d, "www", "big"), big);
+    }
+
+    private static HttpClient Client(bool exact = true)
+    {
+        var h = new SocketsHttpHandler { SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true, TargetHost = "h2.test" } };
+        return new HttpClient(h)
+        {
+            DefaultRequestVersion = exact ? System.Net.HttpVersion.Version20 : System.Net.HttpVersion.Version11,
+            DefaultVersionPolicy = exact ? HttpVersionPolicy.RequestVersionExact : HttpVersionPolicy.RequestVersionOrHigher,
+            Timeout = TimeSpan.FromSeconds(20),
+        };
+    }
+
+    public static void Register()
+    {
+        T.Add("http2: files, HEAD, errors and many concurrent streams on one connection", async () =>
+        {
+            await using var s = TestServer.Start(Conf(), Populate);
+            using var c = Client();
+            var u = $"https://127.0.0.1:{s.Port}";
+            var r = await c.GetAsync(u + "/index.html");
+            T.Eq(System.Net.HttpVersion.Version20, r.Version);
+            T.Eq("hello", await r.Content.ReadAsStringAsync());
+            var big = await c.GetByteArrayAsync(u + "/big"); // well past every flow-control window
+            T.True(big.AsSpan().SequenceEqual(File.ReadAllBytes(Path.Combine(s.Dir, "www", "big"))));
+            T.Eq(404, (int)(await c.GetAsync(u + "/nope")).StatusCode);
+            var head = await c.SendAsync(new HttpRequestMessage(HttpMethod.Head, u + "/big"));
+            T.Eq(1L << 20, head.Content.Headers.ContentLength ?? -1);
+            var all = await Task.WhenAll(Enumerable.Range(0, 300).Select(_ => c.GetStringAsync(u + "/index.html")));
+            T.True(all.All(x => x == "hello"));
+            var log = s.LogText();
+            T.Contains("\"proto\":\"HTTP/2.0\"", log);
+            T.NotContains("\"level\":\"error\"", log);
+        });
+
+        T.Add("http2: off unless asked for (ALPN offers only http/1.1)", async () =>
+        {
+            await using var s = TestServer.Start(Conf().Replace("http2 on;", ""), Populate);
+            using var c = Client(exact: false);
+            var r = await c.GetAsync($"https://127.0.0.1:{s.Port}/index.html");
+            T.Eq(System.Net.HttpVersion.Version11, r.Version);
+        });
+
+        T.Add("http2: request bodies reach an upstream, and upstream responses stream back", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($"location /up/ {{ proxy_pass http://127.0.0.1:{up.Port}; }}"), Populate);
+            using var c = Client();
+            var body = new byte[300_000]; // more than a stream window: the upload must wait for WINDOW_UPDATEs
+            new Random(5).NextBytes(body);
+            var r = await c.PostAsync($"https://127.0.0.1:{s.Port}/up/x", new ByteArrayContent(body));
+            var echo = await r.Content.ReadAsByteArrayAsync();
+            T.Eq(200, (int)r.StatusCode);
+            T.True(echo.AsSpan().EndsWith(body));
+            T.Contains("Host: 127.0.0.1", Encoding.Latin1.GetString(echo, 0, 400));
+        });
+
+        T.Add("http2: malformed requests reset their stream, the connection carries on", async () =>
+        {
+            await using var s = TestServer.Start(Conf(), Populate);
+            await using var h = await RawH2.ConnectAsync(s.Port);
+            await h.SendHeadersAsync(1, true, (":method", "GET"), (":scheme", "https"), (":path", "/"), (":authority", "h2.test"), ("Upper", "x"));
+            var (rst, code) = await h.ReadResetOrHeadersAsync(1);
+            T.True(rst);
+            T.Eq(H2Error.ProtocolError, code);
+            await h.SendHeadersAsync(3, true, (":method", "GET"), (":scheme", "https"), (":path", "/index.html"), (":authority", "h2.test"));
+            T.Eq("200", await h.ReadStatusAsync(3));
+        });
+
+        T.Add("http2: an HPACK bomb gets a 431, not the connection's memory", async () =>
+        {
+            await using var s = TestServer.Start(Conf(), Populate);
+            await using var h = await RawH2.ConnectAsync(s.Port);
+            // One 4000-byte entry into the table, then 200 one-byte references to it: about 800 KB decoded.
+            var block = new List<byte>();
+            byte[] baseBlock = H(("" + ":method", "GET"), (":scheme", "https"), (":path", "/"), (":authority", "h2.test"));
+            block.AddRange(baseBlock);
+            block.AddRange([0x40, 0x01, (byte)'x', 0x7F, 0xA1, 0x1E]);
+            block.AddRange(Enumerable.Repeat((byte)'a', 4000));
+            block.AddRange(Enumerable.Repeat((byte)0xBE, 200));
+            await h.SendRawHeadersAsync(1, true, [.. block]);
+            T.Eq("431", await h.ReadStatusAsync(1));
+            await h.SendHeadersAsync(3, true, (":method", "GET"), (":scheme", "https"), (":path", "/index.html"), (":authority", "h2.test"));
+            T.Eq("200", await h.ReadStatusAsync(3)); // the table stayed in step
+        });
+
+        T.Add("http2: rapid reset is cut off (CVE-2023-44487)", async () =>
+        {
+            await using var s = TestServer.Start(Conf(), Populate);
+            await using var h = await RawH2.ConnectAsync(s.Port);
+            for (int id = 1; id < 4000; id += 2)
+            {
+                await h.SendHeadersAsync(id, true, (":method", "GET"), (":scheme", "https"), (":path", "/big"), (":authority", "h2.test"));
+                await h.SendAsync(FrameWriter.RstStream(id, H2Error.Cancel));
+                if (h.Closed) break;
+            }
+            T.Eq(H2Error.EnhanceYourCalm, await h.ReadGoAwayAsync());
+            T.Contains("too many streams reset, refused or malformed", s.LogText()); // this defence, not the control-frame budget
+        });
+
+        T.Add("http2: CONTINUATION floods and control-frame floods end the connection", async () =>
+        {
+            await using var s = TestServer.Start(Conf(), Populate);
+            await using (var h = await RawH2.ConnectAsync(s.Port))
+            {
+                await h.SendRawHeadersAsync(1, true, H((":method", "GET")), endHeaders: false);
+                for (int k = 0; k < 100 && !h.Closed; k++) await h.SendAsync(RawH2.Frame(FrameType.Continuation, 0, 1));
+                T.Eq(H2Error.EnhanceYourCalm, await h.ReadGoAwayAsync());
+                T.Contains("header block in too many fragments", s.LogText());
+            }
+            await using (var h = await RawH2.ConnectAsync(s.Port))
+            {
+                for (int k = 0; k < 3000 && !h.Closed; k++) await h.SendAsync(FrameWriter.Ping(new byte[8], ack: false));
+                T.Eq(H2Error.EnhanceYourCalm, await h.ReadGoAwayAsync());
+                T.Contains("too many control frames", s.LogText());
+            }
+        });
+
+        T.Add("http2: streams past max_concurrent_streams are refused while the others run", async () =>
+        {
+            await using var up = new FakeUpstream(async (st, rd) => { await rd.ReadRequestAsync(); await Task.Delay(5000); });
+            await using var s = TestServer.Start(Conf($"http2_max_concurrent_streams 4; location /slow/ {{ proxy_pass http://127.0.0.1:{up.Port}; }}"), Populate);
+            await using var h = await RawH2.ConnectAsync(s.Port);
+            for (int id = 1; id <= 9; id += 2)
+                await h.SendHeadersAsync(id, true, (":method", "GET"), (":scheme", "https"), (":path", "/slow/x"), (":authority", "h2.test"));
+            var (rst, code) = await h.ReadResetOrHeadersAsync(9);
+            T.True(rst);
+            T.Eq(H2Error.RefusedStream, code);
+        });
+
+        T.Add("http2: a stalled stream is cut at its own deadline; the connection survives", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($"client_body_timeout 1s; location /up/ {{ proxy_pass http://127.0.0.1:{up.Port}; }}"), Populate);
+            await using var h = await RawH2.ConnectAsync(s.Port);
+            // A POST that never sends its body: the handler waits on it until client_body_timeout, then the stream is reset.
+            await h.SendHeadersAsync(1, false, (":method", "POST"), (":scheme", "https"), (":path", "/up/x"), (":authority", "h2.test"), ("content-length", "10"));
+            var (rst, _) = await h.ReadResetOrHeadersAsync(1, timeoutMs: 6000);
+            T.True(rst);
+            await h.SendHeadersAsync(3, true, (":method", "GET"), (":scheme", "https"), (":path", "/index.html"), (":authority", "h2.test"));
+            T.Eq("200", await h.ReadStatusAsync(3));
+            T.Contains("request body i/o timeout", s.LogText());
+        });
+
+        T.Add("http2: a client that never opens its window is cut at send_timeout", async () =>
+        {
+            await using var s = TestServer.Start(Conf("send_timeout 1s;"), Populate);
+            await using var h = await RawH2.ConnectAsync(s.Port, initialWindow: 0);
+            await h.SendHeadersAsync(1, true, (":method", "GET"), (":scheme", "https"), (":path", "/big"), (":authority", "h2.test"));
+            T.Eq("200", await h.ReadStatusAsync(1));
+            var (rst, _) = await h.ReadResetOrHeadersAsync(1, timeoutMs: 6000);
+            T.True(rst);
+        });
+
+        T.Add("http2: garbage instead of the preface, and frames before SETTINGS, close the connection", async () =>
+        {
+            await using var s = TestServer.Start(Conf(), Populate);
+            await using (var h = await RawH2.ConnectAsync(s.Port, preface: false))
+            {
+                await h.SendAsync("GET / HTTP/1.1\r\nHost: h2.test\r\n\r\n"u8.ToArray());
+                T.True(await h.WaitClosedAsync());
+            }
+            await using (var h = await RawH2.ConnectAsync(s.Port, preface: false))
+            {
+                await h.SendAsync([.. FrameReader.Preface, .. FrameWriter.Ping(new byte[8], ack: false)]);
+                T.Eq(H2Error.ProtocolError, await h.ReadGoAwayAsync());
+            }
+        });
+    }
+
+    private static byte[] H(params (string, string)[] fields)
+    {
+        var buf = new byte[64];
+        int len = 0;
+        foreach (var (n, v) in fields) HpackEncoder.Encode(ref buf, ref len, n, v);
+        return buf[..len];
+    }
+}
+
+/// <summary>A deliberately naive HTTP/2 client: frames by hand, for sending what a real client never would.</summary>
+internal sealed class RawH2 : IAsyncDisposable
+{
+    private readonly TcpClient _tcp;
+    private readonly SslStream _ssl;
+    private readonly byte[] _buf = new byte[1 << 20];
+    private int _start, _end;
+    private readonly HpackDecoder _hpack = new(4096, 1 << 20);
+    public bool Closed { get; private set; }
+
+    private RawH2(TcpClient tcp, SslStream ssl) { _tcp = tcp; _ssl = ssl; }
+
+    public static async Task<RawH2> ConnectAsync(int port, bool preface = true, int initialWindow = 65535)
+    {
+        var tcp = new TcpClient();
+        await tcp.ConnectAsync(IPAddress.Loopback, port);
+        var ssl = new SslStream(tcp.GetStream(), false, (_, _, _, _) => true);
+        await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = "h2.test", ApplicationProtocols = [SslApplicationProtocol.Http2] });
+        if (ssl.NegotiatedApplicationProtocol != SslApplicationProtocol.Http2) throw new Exception("server didn't negotiate h2");
+        var h = new RawH2(tcp, ssl);
+        if (preface) await h.SendAsync([.. FrameReader.Preface, .. FrameWriter.Settings((SettingId.InitialWindowSize, (uint)initialWindow))]);
+        return h;
+    }
+
+    public static byte[] Frame(FrameType type, byte flags, int sid, params byte[] payload)
+    {
+        var f = new byte[9 + payload.Length];
+        FrameWriter.Header(f, payload.Length, type, flags, sid);
+        payload.CopyTo(f, 9);
+        return f;
+    }
+
+    public async Task SendAsync(byte[] data)
+    {
+        if (Closed) return;
+        try { await _ssl.WriteAsync(data); }
+        catch (Exception e) when (e is IOException or ObjectDisposedException) { Closed = true; }
+    }
+
+    public Task SendHeadersAsync(int sid, bool endStream, params (string, string)[] fields)
+    {
+        var buf = new byte[64];
+        int len = 0;
+        foreach (var (n, v) in fields) HpackEncoder.Encode(ref buf, ref len, n, v);
+        return SendRawHeadersAsync(sid, endStream, buf[..len]);
+    }
+
+    public Task SendRawHeadersAsync(int sid, bool endStream, byte[] block, bool endHeaders = true) =>
+        SendAsync(Frame(FrameType.Headers, (byte)((endHeaders ? FrameFlags.EndHeaders : 0) | (endStream ? FrameFlags.EndStream : 0)), sid, block));
+
+    /// <summary>The next frame, answering PINGs and SETTINGS as a client must; null when the connection closes.</summary>
+    private async Task<(Frame F, byte[] P)?> NextAsync(int timeoutMs)
+    {
+        using var cts = new CancellationTokenSource(timeoutMs);
+        while (true)
+        {
+            int n = FrameReader.TryRead(_buf.AsSpan(_start, _end - _start), 1 << 20, out var f, out var p);
+            if (n > 0)
+            {
+                var payload = p.ToArray();
+                _start += n;
+                if (f.Type == FrameType.Settings && !f.Has(FrameFlags.Ack)) { await SendAsync(FrameWriter.SettingsAck()); continue; }
+                return (f, payload);
+            }
+            if (_start > 0) { Buffer.BlockCopy(_buf, _start, _buf, 0, _end - _start); _end -= _start; _start = 0; }
+            int r;
+            try { r = await _ssl.ReadAsync(_buf.AsMemory(_end), cts.Token); }
+            catch (Exception e) when (e is IOException or OperationCanceledException or ObjectDisposedException) { Closed = true; return null; }
+            if (r == 0) { Closed = true; return null; }
+            _end += r;
+        }
+    }
+
+    public async Task<string?> ReadStatusAsync(int sid, int timeoutMs = 10_000)
+    {
+        while (await NextAsync(timeoutMs) is { } x)
+        {
+            if (x.F.Type == FrameType.Headers && x.F.StreamId == sid)
+            {
+                string? status = null;
+                _hpack.Decode(x.P, (n, v) => { if (n.SequenceEqual(":status"u8)) status = Encoding.ASCII.GetString(v); });
+                return status;
+            }
+            if (x.F.Type == FrameType.Headers) _hpack.Decode(x.P, (_, _) => { });
+            if (x.F.Type == FrameType.RstStream && x.F.StreamId == sid) return "RST " + (H2Error)BinaryPrimitives.ReadUInt32BigEndian(x.P);
+        }
+        return null;
+    }
+
+    /// <summary>Whether <paramref name="sid"/> is reset (and with what) before a response starts or finishes on it.</summary>
+    public async Task<(bool Reset, H2Error Code)> ReadResetOrHeadersAsync(int sid, int timeoutMs = 10_000)
+    {
+        while (await NextAsync(timeoutMs) is { } x)
+        {
+            if (x.F.Type == FrameType.Headers) _hpack.Decode(x.P, (_, _) => { });
+            if (x.F.StreamId != sid) continue;
+            if (x.F.Type == FrameType.RstStream) return (true, (H2Error)BinaryPrimitives.ReadUInt32BigEndian(x.P));
+            if (x.F.Has(FrameFlags.EndStream)) return (false, H2Error.NoError);
+        }
+        return (false, H2Error.NoError);
+    }
+
+    public async Task<H2Error?> ReadGoAwayAsync(int timeoutMs = 10_000)
+    {
+        while (await NextAsync(timeoutMs) is { } x)
+        {
+            if (x.F.Type == FrameType.Headers) { try { _hpack.Decode(x.P, (_, _) => { }); } catch (HpackException) { } }
+            if (x.F.Type == FrameType.GoAway) return (H2Error)BinaryPrimitives.ReadUInt32BigEndian(x.P.AsSpan(4));
+        }
+        return null;
+    }
+
+    public async Task<bool> WaitClosedAsync(int timeoutMs = 5000)
+    {
+        while (await NextAsync(timeoutMs) is not null) { }
+        return Closed;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try { await _ssl.DisposeAsync(); } catch (Exception) { }
+        _tcp.Dispose();
+    }
+}

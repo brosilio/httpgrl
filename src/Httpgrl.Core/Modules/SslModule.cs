@@ -310,7 +310,8 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
             {
                 ServerCertificateContext = context,
                 EnabledSslProtocols = ssl.Protocols ?? (SslProtocols.Tls12 | SslProtocols.Tls13),
-                ApplicationProtocols = [SslApplicationProtocol.Http11],
+                // HTTP/2 only when asked for (http2 on), offered first; otherwise HTTP/1.1 alone.
+                ApplicationProtocols = server.Get<HttpCoreConf>().Http2Enabled ? [SslApplicationProtocol.Http2, SslApplicationProtocol.Http11] : [SslApplicationProtocol.Http11],
                 ClientCertificateRequired = auth is not null,
                 CertificateChainPolicy = auth?.Policy,
                 // A resumed session carries only the client's leaf certificate, so intermediates can't be re-chained,

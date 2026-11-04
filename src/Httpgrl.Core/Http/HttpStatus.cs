@@ -51,6 +51,10 @@ internal static class HttpStatus
 
     public static bool HasNoBody(int code) => code < 200 || code == 204 || code == 304;
 
+    private static readonly string[] Codes = Enumerable.Range(0, 500).Select(i => (i + 100).ToString(System.Globalization.CultureInfo.InvariantCulture)).ToArray();
+    /// <summary>"200", "404", ...: the :status value (HTTP/2, HTTP/3).</summary>
+    public static string Code(int code) => Codes[code - 100];
+
     /// <summary>Errors after which the connection state is untrustworthy.</summary>
     public static bool ForcesClose(int code) => code is 400 or 408 or 413 or 414 or 431 or 500 or 501 or 505;
 }
@@ -59,10 +63,13 @@ internal static class HttpStatus
 internal static class HttpDate
 {
     private static byte[] s_header = Build(DateTime.UtcNow);
+    private static string s_value = DateTime.UtcNow.ToString("r");
     private static long s_second;
 
     /// <summary>"Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n"</summary>
     public static ReadOnlySpan<byte> Header => Volatile.Read(ref s_header);
+    /// <summary>"Sun, 06 Nov 1994 08:49:37 GMT"</summary>
+    public static string Value => Volatile.Read(ref s_value);
 
     public static void Tick()
     {
@@ -71,6 +78,7 @@ internal static class HttpDate
         if (sec == s_second) return;
         s_second = sec;
         Volatile.Write(ref s_header, Build(now));
+        Volatile.Write(ref s_value, now.ToString("r"));
     }
 
     private static byte[] Build(DateTime t) => Encoding.ASCII.GetBytes("Date: " + t.ToString("r") + "\r\n");
