@@ -80,22 +80,35 @@ internal sealed class PacketKeys : IDisposable
     /// <summary>AES-GCM's limits (RFC 9001 6.6): update keys before 2^23 packets; give up after 2^52 forgeries.</summary>
     public const long ConfidentialityLimit = 1L << 23, IntegrityLimit = 1L << 52;
 
-    public PacketKeys(QuicCipher cipher, ReadOnlySpan<byte> secret)
+    public PacketKeys(QuicCipher cipher, ReadOnlySpan<byte> secret) : this(cipher, secret, null) { }
+
+    private PacketKeys(QuicCipher cipher, ReadOnlySpan<byte> secret, byte[]? hpKey)
     {
         Cipher = cipher;
         var hash = QuicKeys.Hash(cipher);
         int keyLen = QuicKeys.KeyLength(cipher);
         Span<byte> key = stackalloc byte[keyLen];
-        Span<byte> hp = stackalloc byte[keyLen];
         QuicKeys.ExpandLabel(hash, secret, "quic key"u8, key);
         QuicKeys.ExpandLabel(hash, secret, "quic iv"u8, _iv);
-        QuicKeys.ExpandLabel(hash, secret, "quic hp"u8, hp);
+        if (hpKey is null)
+        {
+            hpKey = new byte[keyLen];
+            QuicKeys.ExpandLabel(hash, secret, "quic hp"u8, hpKey);
+        }
+        _hpKey = hpKey;
         _aead = new AesGcm(key, TagLength);
         _hp = Aes.Create();
-        _hp.Key = hp.ToArray();
+        _hp.Key = hpKey;
         CryptographicOperations.ZeroMemory(key);
-        CryptographicOperations.ZeroMemory(hp);
     }
+
+    private readonly byte[] _hpKey;
+
+    /// <summary>
+    /// The next generation's keys after a key update (RFC 9001 6): new AEAD key and IV from
+    /// <paramref name="nextSecret"/>, the same header-protection key (it never changes).
+    /// </summary>
+    public PacketKeys NextGeneration(ReadOnlySpan<byte> nextSecret) => new(Cipher, nextSecret, (byte[])_hpKey.Clone());
 
     /// <summary>For tests: the derived IV.</summary>
     internal ReadOnlySpan<byte> Iv => _iv;
@@ -185,6 +198,7 @@ internal sealed class PacketKeys : IDisposable
         _aead.Dispose();
         _hp.Dispose();
         CryptographicOperations.ZeroMemory(_iv);
+        CryptographicOperations.ZeroMemory(_hpKey);
     }
 }
 

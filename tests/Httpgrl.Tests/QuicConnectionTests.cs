@@ -145,6 +145,24 @@ internal static class QuicConnectionTests
             }
         });
 
+        T.Add("quic connection: 1-RTT key updates every 40 packets, both sides and one side, through loss and reordering", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            using (var net = new QuicNet(seed: 3, server: new QuicOptions { KeyUpdateAfter = 40 }, client: new QuicOptions { KeyUpdateAfter = 40 })
+                { Loss = 0.03, JitterUs = 20_000 })
+            {
+                T.True(Echo(net, 1 << 20));
+                T.True(net.Client.KeyUpdates > 5 && net.Server!.KeyUpdates > 5);
+            }
+            // Only the client initiates; the server follows each time (its own limit is never reached).
+            using (var net = new QuicNet(seed: 4, client: new QuicOptions { KeyUpdateAfter = 30 }) { JitterUs = 10_000 })
+            {
+                T.True(Echo(net, 300_000));
+                T.True(net.Client.KeyUpdates > 3);
+                T.True(net.Server!.KeyUpdates >= net.Client.KeyUpdates - 1);
+            }
+        });
+
         T.Add("quic connection: small flow-control windows and a slow link still move 2 MiB (window updates, blocking)", () =>
         {
             if (QuicTls.Unavailable is not null) return;

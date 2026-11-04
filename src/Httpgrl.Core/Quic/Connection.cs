@@ -24,6 +24,8 @@ internal sealed class QuicOptions
     public int MaxQueuedDatagrams = 64;
     /// <summary>The datagram size we send (QUIC's minimum path MTU; larger paths aren't probed yet).</summary>
     public int MaxDatagramSize = 1200;
+    /// <summary>Packets sent under one 1-RTT key before we update it (RFC 9001 6), well inside AES-GCM's 2^23 limit.</summary>
+    public long KeyUpdateAfter = PacketKeys.ConfidentialityLimit / 2;
 }
 
 /// <summary>
@@ -102,6 +104,17 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     private ulong _closeError, _closeFrameType;
     private bool _closeApp, _closeDue;
     private string _closeReason = "";
+
+    // 1-RTT key updates (RFC 9001 6): the secrets of the current generation, phase bits each way, the next receive
+    // keys (derived on demand), and the previous ones (kept briefly for reordered packets).
+    private byte[]? _appSendSecret, _appRecvSecret;
+    private QuicCipher _appCipher;
+    private int _sendPhase, _recvPhase;
+    private PacketKeys? _nextRecv, _prevRecv;
+    private byte[]? _nextRecvSecret;
+    private long _recvPhaseStartPn, _prevRecvUntil;
+    private long _keyUpdatePn = -1;   // the first packet sent under our latest send keys
+    public int KeyUpdates { get; private set; }
 
     // Datagrams.
     private readonly Queue<byte[]> _dgOut = new(), _dgIn = new();
@@ -231,6 +244,11 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         var keys = new PacketKeys(cipher, secret);
         if (write) { p.Send?.Dispose(); p.Send = keys; }
         else { p.Recv?.Dispose(); p.Recv = keys; }
+        if (level == QuicLevel.OneRtt)
+        {
+            _appCipher = cipher;
+            if (write) _appSendSecret = secret.ToArray(); else _appRecvSecret = secret.ToArray();
+        }
     }
 
     byte[]? IQuicTlsHost.OnPeerTransportParameters(ReadOnlySpan<byte> raw)
@@ -307,7 +325,28 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         int pnLen = p.Recv.Unmask(packet, h.PnOffset, out ulong truncated);
         long pn = Packets.DecodePacketNumber(p.LargestReceived, truncated, pnLen * 8);
         int headerLen = h.PnOffset + pnLen;
-        if (!p.Recv.Open(packet, headerLen, pn))
+        var keys = p.Recv;
+        bool newPhase = false;
+        if (h.Type == PacketType.OneRtt)
+        {
+            if (_prevRecv is not null && now > _prevRecvUntil) { _prevRecv.Dispose(); _prevRecv = null; }
+            int phase = (packet[0] >> 2) & 1;
+            if (phase != _recvPhase)
+            {
+                if (_prevRecv is not null && pn < _recvPhaseStartPn) keys = _prevRecv; // from before the last update
+                else if (_appRecvSecret is not null)
+                {
+                    if (_nextRecv is null)
+                    {
+                        _nextRecvSecret = QuicKeys.NextSecret(_appCipher, _appRecvSecret);
+                        _nextRecv = p.Recv.NextGeneration(_nextRecvSecret);
+                    }
+                    keys = _nextRecv;
+                    newPhase = true;
+                }
+            }
+        }
+        if (!keys.Open(packet, headerLen, pn))
         {
             // Undecryptable, and ending in a reset token the peer gave us: it lost our state (RFC 9000 10.3.1).
             if (h.Type == PacketType.OneRtt && packet.Length >= 21 && IsStatelessReset(packet[^16..]))
@@ -323,8 +362,8 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         }
         // Reserved bits must be zero once protection is off (RFC 9000 17.2, 17.3.1).
         if ((packet[0] & (h.Type == PacketType.OneRtt ? 0x18 : 0x0C)) != 0) throw new QuicException(QuicError.ProtocolViolation, "reserved bits set");
-        if (h.Type == PacketType.OneRtt && (packet[0] & 0x04) != 0) throw new QuicException(QuicError.KeyUpdateError, "key update not supported yet");
         if (p.Received.Contains(pn)) return; // duplicate
+        if (newPhase) OnPeerKeyUpdate(pn, now);
 
         if (!IsServer && space == 0 && !_peerCidSet)
         {
@@ -361,6 +400,43 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         if (IsServer && space == 1 && !_pns[0].Discarded) DiscardSpace(0);
         AfterTls(now);
     }
+
+    /// <summary>A packet authenticated under the next keys: the peer updated, or answered our update (RFC 9001 6.2, 6.3).</summary>
+    private void OnPeerKeyUpdate(long pn, long now)
+    {
+        if (!_handshakeConfirmed) throw new QuicException(QuicError.KeyUpdateError, "key update before the handshake was confirmed");
+        var p = _pns[2];
+        _prevRecv?.Dispose();
+        _prevRecv = p.Recv;
+        _prevRecvUntil = now + 3 * Recovery.Pto;
+        p.Recv = _nextRecv;
+        _appRecvSecret = _nextRecvSecret;
+        _nextRecv = null;
+        _nextRecvSecret = null;
+        _recvPhase ^= 1;
+        _recvPhaseStartPn = pn;
+        if (_sendPhase != _recvPhase) RotateSendKeys(); // the peer started it: follow
+    }
+
+    private void RotateSendKeys()
+    {
+        var p = _pns[2];
+        _appSendSecret = QuicKeys.NextSecret(_appCipher, _appSendSecret!);
+        var old = p.Send!;
+        p.Send = old.NextGeneration(_appSendSecret);
+        old.Dispose();
+        _sendPhase ^= 1;
+        _keyUpdatePn = p.NextPn;
+        KeyUpdates++;
+    }
+
+    /// <summary>
+    /// Whether we may start a key update: the handshake confirmed, the peer caught up with our last one, and our last
+    /// update's first packet acknowledged (RFC 9001 6.1).
+    /// </summary>
+    private bool CanInitiateKeyUpdate =>
+        _handshakeConfirmed && _appSendSecret is not null && _sendPhase == _recvPhase
+        && (_keyUpdatePn < 0 || Recovery.Spaces[2].LargestAcked >= _keyUpdatePn);
 
     private bool IsStatelessReset(ReadOnlySpan<byte> tail)
     {
@@ -1191,7 +1267,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         }
         else
         {
-            buf[w++] = (byte)(0x40 | (pnLen - 1)); // key phase 0 (no key updates yet)
+            buf[w++] = (byte)(0x40 | (_sendPhase << 2) | (pnLen - 1));
             _dcid.CopyTo(buf[w..]);
             w += _dcid.Length;
         }
@@ -1418,7 +1494,8 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         }
         // A client drops Initial keys once it sends a Handshake packet (RFC 9001 4.9.1).
         if (!IsServer && b.Space == 1 && !_pns[0].Discarded) DiscardSpace(0);
-        if (p.Send.Sealed >= PacketKeys.ConfidentialityLimit - 1000) CloseWithError(QuicError.AeadLimitReached, 0, "key update needed (not supported yet)", app: false, now);
+        if (b.Space == 2 && p.Send.Sealed >= _o.KeyUpdateAfter && CanInitiateKeyUpdate) RotateSendKeys();
+        else if (p.Send.Sealed >= PacketKeys.ConfidentialityLimit - 1000) CloseWithError(QuicError.AeadLimitReached, 0, "AEAD limit reached without a key update", app: false, now);
     }
 
     private int SendClose(Span<byte> buf, long now)
@@ -1448,7 +1525,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
             }
             else
             {
-                buf[w++] = (byte)(0x40 | (pnLen - 1));
+                buf[w++] = (byte)(0x40 | (_sendPhase << 2) | (pnLen - 1));
                 _dcid.CopyTo(buf[w..]); w += _dcid.Length;
             }
             b.PnOffset = w;
@@ -1519,6 +1596,10 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
             p.CryptoRecv.Release();
         }
         foreach (var s in _streams.Values) { s.Send?.Release(); s.Recv?.Release(); }
+        _nextRecv?.Dispose();
+        _prevRecv?.Dispose();
+        if (_appSendSecret is not null) CryptographicOperations.ZeroMemory(_appSendSecret);
+        if (_appRecvSecret is not null) CryptographicOperations.ZeroMemory(_appRecvSecret);
         _tls.Dispose();
     }
 }

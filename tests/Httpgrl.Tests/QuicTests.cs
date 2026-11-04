@@ -63,7 +63,7 @@ internal static class QuicTests
             T.Eq(0L, Packets.DecodePacketNumber(-1, 0, 8));
         });
 
-        T.Add("quic keys: Initial secrets, key, IV and header protection match RFC 9001 A.1", () =>
+        T.Add("quic keys: Initial secrets, key, IV, header protection (A.1) and the key-update secret (A.5) match RFC 9001", () =>
         {
             var (client, server) = QuicKeys.InitialSecrets(H("8394c8f03e515708"));
             T.Eq("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea", Convert.ToHexStringLower(client));
@@ -77,6 +77,9 @@ internal static class QuicTests
             T.Eq("437b9aec36", Convert.ToHexStringLower(mask));
             sk.Mask(H("2cd0991cd25b0aac406a5816b6394100"), mask);
             T.Eq("2ec0d8356a", Convert.ToHexStringLower(mask));
+            // The key-update secret: RFC 9001 A.5's "quic ku" (SHA-256, as for AES-128-GCM).
+            T.Eq("1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9",
+                Convert.ToHexStringLower(QuicKeys.NextSecret(QuicCipher.Aes128Gcm, H("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"))));
         });
 
         T.Add("quic protection: sealing the RFC 9001 client and server Initials gives the RFC's bytes", () =>
