@@ -181,6 +181,40 @@ reaching the pipeline that HTTP/1 would have refused.
 - **Interop with independent implementations:** curl's HTTP/3 (ngtcp2/quiche), Chrome, Firefox and the QUIC interop
   runner's test cases. These run as optional, scripted checks; they aren't build or runtime dependencies.
 
+**Status (2026-11-04): the transport works, and interoperates.** In `src/Httpgrl.Core/Quic/`:
+- **Packets, protection, frames and transport parameters.** RFC 9001's Appendix A is reproduced byte for byte, from
+  vectors generated from the RFC text.
+- **TLS through OpenSSL's QUIC TLS API** (`QuicTls.cs`, the one interop file). It covers SNI, ALPN (required), AES-GCM
+  only, and the level rules.
+- **The connection, as a state machine without I/O:**
+  - handshake, coalescing and padding, anti-amplification;
+  - RFC 9002 recovery (NewReno, PTO, persistent congestion);
+  - streams with flow control, resets and STOP_SENDING;
+  - DATAGRAM, connection IDs, closing and draining, idle and handshake timeouts;
+  - 1-RTT key updates;
+  - stateless-reset detection.
+- **The UDP endpoint:**
+  - routing by connection ID;
+  - Retry with stateless AEAD tokens (forced, or under load);
+  - Version Negotiation and rate-limited stateless resets;
+  - global and per-client caps;
+  - one thread per endpoint with a deadline queue.
+- **Testing:**
+  - a deterministic virtual network (loss, jitter, duplication, bandwidth), with 16 randomized networks in CI;
+  - real-UDP endpoint tests;
+  - fuzz targets `quic-varint`, `quic-packet`, `quic-frames`, `quic-tp` and `quic-connection` (a live server fed
+    arbitrary frames);
+  - interop with OpenSSL 3.6's independent QUIC client (`openssl s_client -quic` against `--quic-echo`): handshake,
+    AES-256-GCM, and 400 KB echoed intact with Retry on.
+
+Still to do in Phase 2:
+- path validation, NAT rebinding and migration (today `disable_active_migration`, and a connection answers only its
+  first address);
+- CUBIC and pacing;
+- GSO/GRO;
+- sockets owned by `HttpServer` across reloads (with `listen ... quic` in Phase 3);
+- the QUIC interop runner's cases.
+
 ## Phase 3: HTTP/3 (RFC 9114, QPACK RFC 9204)
 
 **Scope:**
