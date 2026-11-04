@@ -559,7 +559,7 @@ In priority order. Nothing here is implemented yet unless it's ticked.
 6. [x] **Operations**: status/metrics endpoint (`stub_status`), `$request_id`, `allow`/`deny`, gzip/brotli, a hardened systemd unit.
 7. [x] **Proxy**: `proxy_redirect`, runtime DNS re-resolution, active health checks, variables in `proxy_pass` (upstream names only), `proxy_buffering`.
 8. [ ] **HTTP/2.**
-9. [ ] **Release process**: ~~a first `v0.x` tag~~ (v0.1.0; semver, see `CHANGELOG.md`), CI on push, signed images.
+9. [ ] **Release process**: ~~a first `v0.x` tag~~ (v0.1.0; semver, see `CHANGELOG.md`), ~~CI on push~~ (`.github/workflows/ci.yml` runs `scripts/ci.sh`), signed images.
 10. [ ] **Windows and macOS**: make sure they work, with CI on both. Deferred until there's hardware to test on: Linux is the
     only platform actually exercised today, and Windows/macOS-specific code paths (path guards, socket options, SChannel /
     Secure Transport TLS) are untested.

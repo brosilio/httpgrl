@@ -1,0 +1,46 @@
+# The same verification as a local `./scripts/ci.sh`: module boundaries, warnings-as-errors build, the tests on the
+# JIT, the same tests as a native AOT binary, the AOT server publish and a config check. main only moves once this
+# passes on develop.
+name: ci
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+    steps:
+      # Third-party actions are pinned to the commit of a release tag, not the tag itself (tags can be moved).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: global.json
+      - name: Native AOT toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang zlib1g-dev
+      - name: Verify (scripts/ci.sh)
+        run: ./scripts/ci.sh
+      - name: Server binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: httpgrl-linux-x64
+          path: artifacts/linux-x64/httpgrl
+          if-no-files-found: error
+          retention-days: 14
