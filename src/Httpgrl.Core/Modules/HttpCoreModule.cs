@@ -16,6 +16,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
 
     private static readonly string[] Ignored = ["user", "worker_processes", "worker_rlimit_nofile", "pid", "daemon", "master_process", "use", "multi_accept", "sendfile", "tcp_nopush", "tcp_nodelay", "aio", "log_format"];
     private readonly List<(string, SourceLocation)> _ignoredSeen = new();
+    private readonly List<(IConfigScope Server, SourceLocation At)> _listenHttp2 = new();
     private static readonly ContextKind TypesKind = new("types");
 
     private static void DisableSymlinks(DirectiveInvocation i)
@@ -110,6 +111,10 @@ internal sealed class HttpCoreModule(string prefix) : IModule
                 setup.Log.Warn("error_log: logs go to stdout as JSON, not to this file (the level still applies)", new("path", name[10..]), new("at", src.ToString()));
             else setup.Log.Warn("directive ignored", new("directive", name), new("at", src.ToString()));
         }
+        // nginx's old "listen ... http2" turned HTTP/2 on; here it's opt-in with "http2 on;" (and the parameter is ignored).
+        foreach (var (server, at) in _listenHttp2)
+            if (!server.Get<HttpCoreConf>().Http2Enabled)
+                setup.Log.Warn("\"listen ... http2\" doesn't enable HTTP/2; add \"http2 on;\" to the server", new LogField("at", at.ToString()));
         foreach (var server in setup.ScopesOf(ContextKind.Server))
         {
             var sc = server.Get<ServerConf>();
@@ -198,7 +203,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
 
     // ---------------- listen / server_name ----------------
 
-    private static void Listen(DirectiveInvocation i)
+    private void Listen(DirectiveInvocation i)
     {
         var a = i.Args[0];
         EndPoint ep;
@@ -238,7 +243,8 @@ internal sealed class HttpCoreModule(string prefix) : IModule
                 reusePort = true;
             }
             else if (o == "proxy_protocol") proxyProtocol = true;
-            else if (o is "deferred" or "http2" or "fastopen" || o.StartsWith("so_keepalive", StringComparison.Ordinal) || o.StartsWith("ipv6only", StringComparison.Ordinal))
+            else if (o == "http2") _listenHttp2.Add((i.Scope, i.Source)); // warned about in Configure, unless "http2 on" is there too
+            else if (o is "deferred" or "fastopen" || o.StartsWith("so_keepalive", StringComparison.Ordinal) || o.StartsWith("ipv6only", StringComparison.Ordinal))
                 continue; // accepted for compatibility; no effect
             else throw i.Error($"invalid parameter \"{o}\"");
         }

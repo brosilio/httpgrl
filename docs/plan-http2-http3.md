@@ -100,6 +100,16 @@ Moved to Phase 1, where streams exist to test them against:
   existing `UpgradeAsync` handlers (proxy tunnels) get a duplex stream either way, so modules don't care which
   protocol carried the request. Done before Phase 2 starts.
 
+**Status (2026-11-04):** HPACK, frames, request heads and the session are done, behind `http2 on`:
+- **Behaviour,** tested end to end with `HttpClient`: files past every window, HEAD, 300 concurrent streams on one
+  connection, uploads through the proxy, and HTTP/2 off by default.
+- **Attacks,** tested with a raw frame client: malformed requests, an HPACK bomb (431, table stays in step), rapid
+  reset, CONTINUATION and control-frame floods, the concurrency cap, a stalled upload, and a closed window.
+- **Defences checked off one at a time:** each test fails with its defence switched off.
+
+Still to do: WebSockets over HTTP/2 (extended CONNECT); the session-level fuzz target; HTTP/2 in the soak test and
+benchmark.
+
 **Attacks to test, each with a test that fails without the defence:**
 - **Rapid reset (CVE-2023-44487):** streams opened and immediately reset still count, with a reset-rate limit.
 - **CONTINUATION flood (2024):** header blocks are bounded by total size and fragment count across CONTINUATION

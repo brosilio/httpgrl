@@ -68,6 +68,14 @@ internal static class Http2SessionTests
             T.Eq(System.Net.HttpVersion.Version11, r.Version);
         });
 
+        T.Add("http2: nginx's \"listen ... http2\" warns that it doesn't enable HTTP/2 (http2 on does)", async () =>
+        {
+            await using (var s = TestServer.Start(Conf().Replace("http2 on;", "").Replace("listen 127.0.0.1:0 ssl;", "listen 127.0.0.1:0 ssl http2;"), Populate))
+                T.Contains("enable HTTP/2; add", s.LogText());
+            await using (var s = TestServer.Start(Conf().Replace("listen 127.0.0.1:0 ssl;", "listen 127.0.0.1:0 ssl http2;"), Populate))
+                T.NotContains("enable HTTP/2; add", s.LogText());
+        });
+
         T.Add("http2: request bodies reach an upstream, and upstream responses stream back", async () =>
         {
             await using var up = FakeUpstream.Echo();
