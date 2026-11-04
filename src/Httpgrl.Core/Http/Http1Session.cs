@@ -181,16 +181,7 @@ internal sealed class Http1Session
                     input.Consume(headLen);
                 }
 
-                ctx.ServerRt = reject == 0 ? _hosts.Resolve(req.HostValue) : _hosts.Default;
-                // A client may complete the handshake for one name (SNI) and then ask for another (Host). Never let that
-                // carry it past a client-certificate policy it wasn't checked against (cf. nginx's 421).
-                if (reject == 0 && _tlsServer is not null && !ReferenceEquals(ctx.ServerRt.ClientAuth, _tlsServer.ClientAuth))
-                    reject = 421;
-                // A server that refuses every handshake presents nothing over TLS, so it serves nothing over TLS either:
-                // a Host naming it (e.g. the IP, after a handshake for a real name) is misdirected. error_page 421 =444 drops it.
-                if (reject == 0 && _tlsServer is not null && ctx.ServerRt.RejectHandshake)
-                    reject = 421;
-                ctx.SelectLocation(ctx.ServerRt.Root, null);
+                reject = RequestLifecycle.Route(ctx, _hosts, _tlsServer, reject);
                 _body!.Reset(transport, reject == 0 ? req.ContentLengthValue : -1, reject == 0 && req.ChunkedValue);
                 if (req.ExpectContinue) ctx.BodyReader.SendContinue = SendContinueAsync;
 
@@ -198,12 +189,8 @@ internal sealed class Http1Session
                 ctx.SetKeepAlive(reject == 0 && wantsKeepAlive && info.Requests < core0.KeepaliveRequestsMax && !_mgr.Stopping && !(_rt.Retired && _binding.Ssl));
                 _conn.Phase = "processing";
 
-                if (reject != 0) await RequestPipeline.RejectAsync(ctx, reject).ConfigureAwait(false);
-                else await _rt.Pipeline.RunAsync(ctx).ConfigureAwait(false);
-
-                // Dropped (444): nothing was written and nothing will be; fall through to close without lingering.
-                bool clean = !ctx.Broken && !ctx.Dropped && await ctx.Resp.CompleteAsync().ConfigureAwait(false);
-                ctx.Resp.ReturnBuffer();
+                // Not clean (broken, or dropped with 444): fall through to close without lingering.
+                bool clean = await RequestLifecycle.RunAsync(ctx, reject).ConfigureAwait(false);
                 bool reusable = clean && ctx.KeepAlive && !ctx.Upgraded;
                 if (reusable && !ctx.BodyReader.IsComplete)
                 {
@@ -212,9 +199,7 @@ internal sealed class Http1Session
                 }
                 keepaliveMs = ctx.Loc.Core.KeepaliveTimeoutMs;
 
-                await _rt.Pipeline.RunLogAsync(ctx).ConfigureAwait(false);
-                ctx.EndRequest();
-                _mgr.CountResponse(ctx.Resp.Status);
+                await RequestLifecycle.FinishAsync(ctx, _mgr).ConfigureAwait(false);
 
                 // A tunnel connection stays open between requests whatever keepalive_timeout says: the remote decides when
                 // it's done with it (closing it from here races a request the remote may be sending).
