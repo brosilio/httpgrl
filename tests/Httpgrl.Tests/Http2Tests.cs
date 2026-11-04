@@ -241,6 +241,21 @@ internal static class Http2Tests
             T.True(d.TableSize <= 256);
         });
 
+        T.Add("hpack: a block over a limit still keeps the dynamic table in step for the next one", () =>
+        {
+            // Only that request is refused (431); the connection's compression state must stay exact.
+            var d = new HpackDecoder(4096, 100);
+            byte[] first = [0x40, 0x01, (byte)'x', 0x03, (byte)'a', (byte)'a', (byte)'a', 0x82, 0x82, 0x82]; // insert x: aaa, then go over 100 bytes
+            var e = T.Throws<HpackException>(() => d.Decode(first, (_, _) => { }));
+            T.True(e.Limit);
+            T.Eq("x: aaa", string.Join("|", Decode(d, [0xBE]).Select(f => f.Item1 + ": " + f.Item2)));
+            // An oversized literal that asked to be indexed empties the table, exactly as the encoder's side would see it.
+            var big = new List<byte> { 0x40, 0x01, (byte)'y', 0x7F, 0x81, 0x01 }; // value of 127 + 1 + 128 = 256 bytes
+            big.AddRange(Enumerable.Repeat((byte)'b', 256));
+            T.True(T.Throws<HpackException>(() => d.Decode([.. big], (_, _) => { })).Limit);
+            T.Eq(0, d.TableSize);
+        });
+
         T.Add("hpack: Huffman round-trips every byte value", () =>
         {
             var all = new byte[256];

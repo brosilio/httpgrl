@@ -124,6 +124,10 @@ internal sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int 
         int pos = 0, fields = 0;
         long listSize = 0;
         bool sawField = false;
+        // A limit breach must not stop decoding halfway: the dynamic table would be left half-updated and every later
+        // block on the connection misread. So the block is decoded to the end (table kept exact, nothing more emitted)
+        // and the breach reported afterwards, for the caller to refuse just this request.
+        _overLimit = null;
         while (pos < block.Length)
         {
             byte b = block[pos];
@@ -149,21 +153,28 @@ internal sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int 
                 int prefix = index ? 6 : 4;
                 int nameIndex = ReadInt(block, ref pos, prefix);
                 byte[] name;
-                if (nameIndex == 0) name = ReadString(block, ref pos, maxHeaderListSize).ToArray();
+                bool huge = false;
+                if (nameIndex == 0) name = ReadString(block, ref pos, maxHeaderListSize, ref huge).ToArray();
                 else name = Lookup(nameIndex).Name;
-                var value = ReadString(block, ref pos, maxHeaderListSize);
-                Emit(name, value, ref listSize, ref fields, onField);
-                if (index) Insert(name, value.ToArray());
+                var value = ReadString(block, ref pos, maxHeaderListSize, ref huge);
+                if (huge) _overLimit ??= "header field too large";
+                else Emit(name, value, ref listSize, ref fields, onField);
+                // An oversized entry is larger than any table we allow, so inserting it empties the table (RFC 7541 4.4).
+                if (index) { if (huge) { _table.Clear(); _tableSize = 0; } else Insert(name, value.ToArray()); }
                 sawField = true;
             }
         }
+        if (_overLimit is { } why) throw new HpackException(why, limit: true);
     }
+
+    private string? _overLimit;
 
     private void Emit(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value, ref long listSize, ref int fields, HpackFieldHandler onField)
     {
+        if (_overLimit is not null) return;
         listSize += name.Length + value.Length + 32; // RFC 9113 SETTINGS_MAX_HEADER_LIST_SIZE accounting
-        if (listSize > maxHeaderListSize) throw new HpackException("header list too large", limit: true);
-        if (++fields > maxFields) throw new HpackException("too many header fields", limit: true);
+        if (listSize > maxHeaderListSize) { _overLimit = "header list too large"; return; }
+        if (++fields > maxFields) { _overLimit = "too many header fields"; return; }
         onField(name, value);
     }
 
@@ -220,8 +231,11 @@ internal sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int 
         }
     }
 
-    /// <summary>A string literal (RFC 7541 5.2). The span is valid until the next read.</summary>
-    private ReadOnlySpan<byte> ReadString(ReadOnlySpan<byte> s, ref int pos, int limit)
+    /// <summary>
+    /// A string literal (RFC 7541 5.2). The span is valid until the next read. Longer than <paramref name="limit"/>: empty,
+    /// with <paramref name="huge"/> set (its bytes are skipped; it's too big for any table we allow).
+    /// </summary>
+    private ReadOnlySpan<byte> ReadString(ReadOnlySpan<byte> s, ref int pos, int limit, ref bool huge)
     {
         if (pos >= s.Length) throw new HpackException("truncated string");
         bool huffman = (s[pos] & 0x80) != 0;
@@ -231,13 +245,15 @@ internal sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int 
         pos += len;
         if (!huffman)
         {
-            if (len > limit) throw new HpackException("string too large", limit: true);
+            if (len > limit) { huge = true; return default; }
             return raw;
         }
-        // A Huffman code is at least 5 bits, so the output is at most len * 8 / 5 bytes.
-        int most = Math.Min(limit, (int)Math.Min(int.MaxValue, (long)len * 8 / 5 + 1));
+        // A Huffman code is at least 5 bits, so the output is at most len * 8 / 5 bytes (bounded by the block, which the
+        // session bounds).
+        int most = (int)Math.Min(int.MaxValue, (long)len * 8 / 5 + 1);
         if (_scratch.Length < most) _scratch = new byte[Math.Max(most, _scratch.Length * 2)];
         int n = Huffman.Decode(raw, _scratch.AsSpan(0, most));
+        if (n > limit) { huge = true; return default; }
         return _scratch.AsSpan(0, n);
     }
 }
