@@ -204,4 +204,4 @@ Each phase is merged only with its fuzz targets, attack tests and AOT runs, as e
 - **OpenSSL 3.5's QUIC TLS API is new.** Pin behaviour with tests; on systems without it, HTTP/3 is reported
   unavailable, never half-working.
 - **Attack surface.** HTTP/2 and QUIC are where recent server CVEs cluster. That's why each phase lands with fuzz
-  targets and attack tests, and why both ship off by default at first.
+  targets and attack tests, and why both are opt-in.
