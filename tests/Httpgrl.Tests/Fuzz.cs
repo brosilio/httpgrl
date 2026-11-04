@@ -31,12 +31,12 @@ internal static class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(),
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames" })
         {
             int iterations = name == "config" ? 3_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
@@ -549,6 +549,52 @@ internal static class Fuzz
             if (!back.AsSpan(0, m).SequenceEqual(dec.AsSpan(0, n))) throw new Finding("encode/decode round trip differs");
             return true;
         }, MaxLen: 512);
+
+    /// <summary>
+    /// A stream of HTTP/2 frames: each read consumes exactly its header and declared length, stays within the frame size
+    /// limit, and yields a payload inside the frame; anything else is a classified protocol error.
+    /// </summary>
+    private static Target H2FramesTarget()
+    {
+        static byte[] Fr(int type, int flags, int sid, params byte[] p)
+        {
+            var f = new byte[9 + p.Length];
+            Httpgrl.Core.Http2.FrameWriter.Header(f, p.Length, (Httpgrl.Core.Http2.FrameType)type, (byte)flags, sid);
+            p.CopyTo(f, 9);
+            return f;
+        }
+        byte[][] seeds =
+        [
+            [.. Fr(4, 0, 0, 0, 3, 0, 0, 0, 100), .. Fr(8, 0, 0, 0, 1, 0, 0), .. Fr(1, 5, 1, 0x82, 0x86, 0x84), .. Fr(0, 1, 1, (byte)'x')],
+            [.. Fr(0, 8, 3, 2, 1, 2, 0, 0), .. Fr(1, 0x24, 5, 0, 0, 0, 1, 16, 0x82), .. Fr(9, 4, 5, 0x84)],
+            [.. Fr(6, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8), .. Fr(7, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0), .. Fr(3, 0, 1, 0, 0, 0, 8), .. Fr(2, 0, 3, 0, 0, 0, 1, 16)],
+        ];
+        return new Target("h2-frames", seeds,
+            B("\x00\x00\x00", "\x00\x40\x01", "\xff\xff\xff", "\x00", "\x01", "\x04", "\x08", "\x09", "\x20", "\x25", "\x80\x00\x00\x01", "\x7f\xff\xff\xff", "\xff"),
+            data =>
+            {
+                const int max = 16384;
+                var buf = data.AsSpan();
+                int frames = 0;
+                while (buf.Length > 0)
+                {
+                    int n;
+                    Httpgrl.Core.Http2.Frame f;
+                    ReadOnlySpan<byte> p;
+                    try { n = Httpgrl.Core.Http2.FrameReader.TryRead(buf, max, out f, out p); }
+                    catch (Httpgrl.Core.Http2.H2Exception) { return frames > 0; }
+                    if (n == 0) return frames > 0;
+                    if (n != 9 + f.Length || n > buf.Length) throw new Finding($"consumed {n} for a {f.Length}-byte frame with {buf.Length} left");
+                    if (f.Length > max) throw new Finding("frame over the size limit accepted");
+                    if (p.Length > f.Length) throw new Finding("payload longer than its frame");
+                    if (p.Length > 0 && !buf.Slice(9, f.Length).Overlaps(p)) throw new Finding("payload outside its frame");
+                    if (f.StreamId < 0) throw new Finding("negative stream id");
+                    frames++;
+                    buf = buf[n..];
+                }
+                return true;
+            }, MaxLen: 4096);
+    }
 
     /// <summary>The remote's answer to a tunnel agent's Upgrade (what the agent reads before serving anything).</summary>
     private static Target TunnelHandshakeTarget() => new("tunnel-handshake",
