@@ -9,10 +9,39 @@ internal sealed class HttpBodyException(int status, string message) : IOExceptio
 }
 
 /// <summary>
-/// Request body decoder (Content-Length or chunked). Consumes pipelined bytes from the shared input buffer
+/// A request body as the core sees it, whatever carried it (HTTP/1.1 framing here; later, a stream's DATA frames).
+/// Limits are set per request once the location is known.
+/// </summary>
+internal abstract class RequestBody : Stream
+{
+    public long MaxSize;
+    public int ReadTimeoutMs;
+    public int MinRate;
+    /// <summary>HTTP/1.1 only: sent before the first read when the client asked for 100-continue.</summary>
+    public Func<ValueTask>? SendContinue;
+
+    /// <summary>True when the whole body has been consumed (or there was none).</summary>
+    public abstract bool IsComplete { get; }
+    public abstract bool Started { get; }
+    /// <summary>Read and discard the rest, up to <paramref name="limit"/> bytes. False if that wasn't possible.</summary>
+    public abstract ValueTask<bool> DrainAsync(long limit);
+
+    public override bool CanRead => true;
+    public override bool CanWrite => false;
+    public override bool CanSeek => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+}
+
+/// <summary>
+/// HTTP/1.1 request body decoder (Content-Length or chunked). Consumes pipelined bytes from the shared input buffer
 /// first. Enforces client_max_body_size, client_body_timeout (per read) and client_body_min_rate.
 /// </summary>
-internal sealed class BodyStream : Stream
+internal sealed class BodyStream : RequestBody
 {
     private enum Mode : byte { None, Length, Chunked }
     private enum Chunk : byte { Size, Data, DataEnd, Trailer, Done }
@@ -20,7 +49,7 @@ internal sealed class BodyStream : Stream
     private const int MaxChunkLine = 4096;
     private const int MaxTrailer = 8192;
 
-    private readonly Connection _conn;
+    private readonly Deadlines _conn;
     private readonly InputBuffer _in;
     private Stream _transport = Null;
     private Mode _mode;
@@ -30,13 +59,7 @@ internal sealed class BodyStream : Stream
     private int _trailerBytes;
     private bool _started;
 
-    // Set per request by the session once the location is known.
-    public long MaxSize;
-    public int ReadTimeoutMs;
-    public int MinRate;
-    public Func<ValueTask>? SendContinue;
-
-    public BodyStream(Connection conn, InputBuffer input)
+    public BodyStream(Deadlines conn, InputBuffer input)
     {
         _conn = conn;
         _in = input;
@@ -55,22 +78,15 @@ internal sealed class BodyStream : Stream
         SendContinue = null;
     }
 
-    /// <summary>True when the whole body has been consumed (or there was none).</summary>
-    public bool IsComplete => _mode switch
+    public override bool IsComplete => _mode switch
     {
         Mode.None => true,
         Mode.Length => _remaining == 0,
         _ => _chunk == Chunk.Done,
     };
 
-    public bool Started => _started;
+    public override bool Started => _started;
     public long Remaining => _mode == Mode.Length ? _remaining : -1;
-
-    public override bool CanRead => true;
-    public override bool CanWrite => false;
-    public override bool CanSeek => false;
-    public override long Length => throw new NotSupportedException();
-    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
     {
@@ -239,7 +255,7 @@ internal sealed class BodyStream : Stream
     }
 
     /// <summary>Discard up to <paramref name="limit"/> remaining body bytes. False if the body is larger or broken.</summary>
-    public async ValueTask<bool> DrainAsync(long limit)
+    public override async ValueTask<bool> DrainAsync(long limit)
     {
         if (IsComplete) return true;
         if (_broken || (_mode == Mode.Length && _remaining > limit)) return false;
@@ -267,8 +283,4 @@ internal sealed class BodyStream : Stream
 
     public override int Read(byte[] buffer, int offset, int count) => ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
     public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
-    public override void Flush() { }
-    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }

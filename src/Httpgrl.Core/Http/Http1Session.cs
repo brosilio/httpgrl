@@ -111,7 +111,7 @@ internal sealed class Http1Session
             }
             _transport = transport;
 
-            ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport, Mgr = _mgr };
+            ctx = NewContext(info, input, transport);
             var lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders, core0.UnderscoresInHeaders == true);
             int keepaliveMs = core0.KeepaliveTimeoutMs;
             bool first = true;
@@ -148,7 +148,7 @@ internal sealed class Http1Session
                     if (_binding.Ssl || !Migrate()) return;
                     core0 = _hosts.Default.Root.Core;
                     lim = new HeadLimits(core0.HeaderLineMax, core0.HeaderTotalMax, MaxHeaders, core0.UnderscoresInHeaders == true);
-                    ctx = new HttpContextImpl(_rt, _conn, info, input) { Transport = transport, Mgr = _mgr };
+                    ctx = NewContext(info, input, transport);
                 }
                 if (!first || _link is not null)
                 {
@@ -191,7 +191,7 @@ internal sealed class Http1Session
                 if (reject == 0 && _tlsServer is not null && ctx.ServerRt.RejectHandshake)
                     reject = 421;
                 ctx.SelectLocation(ctx.ServerRt.Root, null);
-                ctx.BodyReader.Reset(transport, reject == 0 ? req.ContentLengthValue : -1, reject == 0 && req.ChunkedValue);
+                _body!.Reset(transport, reject == 0 ? req.ContentLengthValue : -1, reject == 0 && req.ChunkedValue);
                 if (req.ExpectContinue) ctx.BodyReader.SendContinue = SendContinueAsync;
 
                 bool wantsKeepAlive = req.VersionValue == HttpVersion.Http11 ? !req.ConnClose : req.ConnKeepAlive && !req.ConnClose;
@@ -249,6 +249,19 @@ internal sealed class Http1Session
             try { await _transport.DisposeAsync().ConfigureAwait(false); } catch (Exception) { /* already torn down */ }
             _conn.Dispose();
         }
+    }
+
+    private BodyStream? _body;
+
+    /// <summary>The exchange for this connection's requests: the connection's timing, HTTP/1.1 body and wire, raw upgrades.</summary>
+    private HttpContextImpl NewContext(ConnectionInfo info, InputBuffer input, Stream transport)
+    {
+        _body = new BodyStream(_conn, input);
+        return new HttpContextImpl(_rt, info, _conn, _body, new Http1ResponseWire(transport))
+        {
+            Upgrader = () => new UpgradedStream(input, transport),
+            Mgr = _mgr,
+        };
     }
 
     /// <summary>

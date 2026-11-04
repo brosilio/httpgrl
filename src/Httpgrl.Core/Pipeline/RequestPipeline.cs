@@ -41,7 +41,7 @@ internal sealed class RequestPipeline(HttpHandler[] rewrite, HttpHandler[] acces
     }
 
     internal static bool IsTransportFault(HttpContextImpl ctx, Exception e) =>
-        ctx.Conn.IsAborted || e is System.Net.Sockets.SocketException || e is ObjectDisposedException
+        ctx.Timing.IsAborted || e is System.Net.Sockets.SocketException || e is ObjectDisposedException
         || (e is IOException && e.InnerException is System.Net.Sockets.SocketException);
 
     private async ValueTask ProcessAsync(HttpContextImpl ctx)

@@ -19,7 +19,7 @@ internal sealed class RequestImpl : HttpRequest
     public bool ChunkedValue;
     public bool ExpectContinue, ConnClose, ConnKeepAlive, ConnUpgrade;
     public readonly HeaderCollection HeaderList = new();
-    public BodyStream BodyValue = null!;
+    public RequestBody BodyValue = null!;
 
     public override string Method => MethodValue;
     public override string RawTarget => RawTargetValue;
@@ -58,17 +58,21 @@ internal sealed class RequestImpl : HttpRequest
     }
 }
 
-/// <summary>One per connection, reset between requests.</summary>
+/// <summary>
+/// One request exchange, reset between requests. Protocol-neutral: what's specific to how the request arrived comes
+/// from its exchange: the timing record the sweeper enforces (the connection, for HTTP/1.1), the body, the response
+/// wire, and (HTTP/1.1 only) how an upgrade takes over the transport.
+/// </summary>
 internal sealed class HttpContextImpl : HttpContext
 {
     public readonly RequestImpl Req = new();
     public readonly ResponseImpl Resp;
-    public readonly Connection Conn;
+    public readonly Deadlines Timing;
     public readonly ConnectionInfo Info;
     public readonly HttpRuntime Rt;
-    public readonly InputBuffer Input;
-    public readonly BodyStream BodyReader;
-    public Stream Transport = Stream.Null;
+    public readonly RequestBody BodyReader;
+    /// <summary>The raw duplex stream after a 101, or null where the protocol can't upgrade this way.</summary>
+    public Func<Stream>? Upgrader;
 
     public ServerRt ServerRt = null!;
     public LocationRt Loc = null!;
@@ -78,15 +82,14 @@ internal sealed class HttpContextImpl : HttpContext
     private bool _keepAlive;
     private long _start;
 
-    public HttpContextImpl(HttpRuntime rt, Connection conn, ConnectionInfo info, InputBuffer input)
+    public HttpContextImpl(HttpRuntime rt, ConnectionInfo info, Deadlines timing, RequestBody body, ResponseWire wire)
     {
         Rt = rt;
-        Conn = conn;
         Info = info;
-        Input = input;
-        BodyReader = new BodyStream(conn, input);
-        Req.BodyValue = BodyReader;
-        Resp = new ResponseImpl(this);
+        Timing = timing;
+        BodyReader = body;
+        Req.BodyValue = body;
+        Resp = new ResponseImpl(this, wire);
     }
 
     public override HttpRequest Request => Req;
@@ -96,7 +99,7 @@ internal sealed class HttpContextImpl : HttpContext
     public override IConfigScope Server => ServerRt.Scope;
     public override IConfigScope Location => Loc.Scope;
     public override bool IsInternal => Internal;
-    public override CancellationToken Aborted => Conn.AbortToken;
+    public override CancellationToken Aborted => Timing.AbortToken;
     public override CancellationToken ConfigurationRetired => Rt.RetiredToken;
     /// <summary>Modules may only turn keep-alive off; the core decides whether it was allowed at all.</summary>
     public override bool KeepAlive { get => _keepAlive; set { if (!value) _keepAlive = false; } }
@@ -297,18 +300,20 @@ internal sealed class HttpContextImpl : HttpContext
         if (Resp.HasStarted) throw new InvalidOperationException("response already started");
         if (Resp.Status != 101) throw new InvalidOperationException("upgrade requires status 101");
         if (idleTimeoutMs <= 0) throw new ArgumentOutOfRangeException(nameof(idleTimeoutMs));
+        var upgrader = Upgrader ?? throw new NotSupportedException("this protocol can't hand over its connection");
         Upgraded = true;
         _keepAlive = false;
         await Resp.StartAsync().ConfigureAwait(false);
-        Conn.StopRate();
-        Conn.Phase = "upgraded";
+        var t = Timing;
+        t.StopRate();
+        t.Phase = "upgraded";
         // Bidirectional idle: every completed op on this socket (client reads AND writes carrying the other
         // direction's traffic) pushes the deadline out; a stalled write still dies on its own op deadline.
-        Conn.ReadOpTimeout = 0;
-        Conn.WriteOpTimeout = idleTimeoutMs;
-        Conn.IdleRefreshMs = idleTimeoutMs;
-        Conn.BaseDeadline = Environment.TickCount64 + idleTimeoutMs;
-        return new UpgradedStream(Input, Transport);
+        t.ReadOpTimeout = 0;
+        t.WriteOpTimeout = idleTimeoutMs;
+        t.IdleRefreshMs = idleTimeoutMs;
+        t.BaseDeadline = Environment.TickCount64 + idleTimeoutMs;
+        return upgrader();
     }
 }
 
