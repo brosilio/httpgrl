@@ -31,12 +31,12 @@ internal static class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(),
+        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman" })
         {
             int iterations = name == "config" ? 3_000 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
@@ -499,6 +499,56 @@ internal static class Fuzz
             CheckPath(p);
             return true;
         }, MaxLen: 1024);
+
+    /// <summary>
+    /// HPACK header blocks (HTTP/2's compressed headers, straight from the client). Whatever is accepted stays within the
+    /// limits, and survives a round trip through our encoder unchanged.
+    /// </summary>
+    private static Target HpackTarget()
+    {
+        var seeds = Httpgrl.Tests.HpackVectors.All.Select(v => Convert.FromHexString(v.Hex)).ToArray();
+        return new Target("hpack", seeds,
+            B("\x80", "\x82", "\xbe", "\x40", "\x00", "\x10", "\x20", "\x3f\xe1\x1f", "\x7f", "\xff\xff\xff\xff\x0f", "\x81", "\x8f", "\x01a", "\x00\x00"),
+            data =>
+            {
+                const int listMax = 16 << 10, tableMax = 4096;
+                var d = new Httpgrl.Core.Http2.HpackDecoder(tableMax, listMax);
+                var got = new List<(byte[], byte[])>();
+                long size = 0;
+                try { d.Decode(data, (n, v) => { got.Add((n.ToArray(), v.ToArray())); size += n.Length + v.Length + 32; }); }
+                catch (Httpgrl.Core.Http2.HpackException) { return false; }
+                if (d.TableSize > tableMax) throw new Finding($"dynamic table at {d.TableSize} bytes");
+                if (size > listMax) throw new Finding($"emitted {size} bytes of fields");
+                if (got.Count > 128) throw new Finding($"emitted {got.Count} fields");
+                var buf = new byte[64];
+                int len = 0;
+                foreach (var (n, v) in got) Httpgrl.Core.Http2.HpackEncoder.Encode(ref buf, ref len, Encoding.Latin1.GetString(n), Encoding.Latin1.GetString(v));
+                var again = new List<(byte[], byte[])>();
+                new Httpgrl.Core.Http2.HpackDecoder(tableMax, 1 << 30, 1 << 20).Decode(buf.AsSpan(0, len), (n, v) => again.Add((n.ToArray(), v.ToArray())));
+                if (again.Count != got.Count) throw new Finding("round trip changed the field count");
+                for (int k = 0; k < got.Count; k++)
+                    if (!again[k].Item1.AsSpan().SequenceEqual(got[k].Item1) || !again[k].Item2.AsSpan().SequenceEqual(got[k].Item2)) throw new Finding($"round trip changed field {k}");
+                return true;
+            }, MaxLen: 8192);
+    }
+
+    /// <summary>Huffman-coded strings: a decoded string re-encodes and decodes to itself; the output never outgrows its bound.</summary>
+    private static Target HuffmanTarget() => new("huffman",
+        [Convert.FromHexString("f1e3c2e5f23a6ba0ab90f4ff"), Convert.FromHexString("a8eb10649cbf"), Convert.FromHexString("25a849e95ba97d7f")],
+        B("\xff", "\x00", "\xfe", "\x1f", "\xf8"),
+        data =>
+        {
+            var dec = new byte[data.Length * 8 / 5 + 1];
+            int n;
+            try { n = Httpgrl.Core.Http2.Huffman.Decode(data, dec); }
+            catch (Httpgrl.Core.Http2.HpackException) { return false; }
+            var enc = new byte[Httpgrl.Core.Http2.Huffman.EncodedLength(dec.AsSpan(0, n))];
+            int e = Httpgrl.Core.Http2.Huffman.Encode(dec.AsSpan(0, n), enc);
+            var back = new byte[e * 8 / 5 + 1];
+            int m = Httpgrl.Core.Http2.Huffman.Decode(enc.AsSpan(0, e), back);
+            if (!back.AsSpan(0, m).SequenceEqual(dec.AsSpan(0, n))) throw new Finding("encode/decode round trip differs");
+            return true;
+        }, MaxLen: 512);
 
     /// <summary>The remote's answer to a tunnel agent's Upgrade (what the agent reads before serving anything).</summary>
     private static Target TunnelHandshakeTarget() => new("tunnel-handshake",
