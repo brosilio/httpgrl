@@ -30,8 +30,84 @@ internal static class Http2Tests
             throw new Exception($"{what}: expected {code} ({(connection ? "connection" : "stream")}), got {e.Code} ({(e.IsConnectionError ? "connection" : "stream")}): {e.Message}");
     }
 
+    /// <summary>Run fields through RequestHead: the result code, the request, and why if malformed.</summary>
+    private static (int Code, Httpgrl.Core.Http.RequestImpl Req, string? Why) Head(bool endStream, params (string, string)[] fields)
+    {
+        var req = new Httpgrl.Core.Http.RequestImpl();
+        var h = new RequestHead(underscores: false);
+        h.Begin(req);
+        foreach (var (n, v) in fields) h.OnField(Encoding.Latin1.GetBytes(n), Encoding.Latin1.GetBytes(v));
+        int code = h.Finish(endStream);
+        return (code, req, h.Why);
+    }
+
+    private static readonly (string, string)[] Base = [(":method", "GET"), (":scheme", "https"), (":path", "/a/../b?x=1"), (":authority", "Example.TEST:443")];
+
     public static void Register()
     {
+        T.Add("h2 request head: a valid request maps onto HTTP/1.1 semantics", () =>
+        {
+            var (code, req, _) = Head(true, [.. Base, ("accept", "*/*"), ("cookie", "a=1"), ("cookie", "b=2"), ("x_hidden", "1")]);
+            T.Eq(0, code);
+            T.Eq(HttpMethods.Get, req.MethodValue);
+            T.Eq("/b", req.PathValue);
+            T.Eq("x=1", req.QueryValue);
+            T.Eq("example.test", req.HostValue);
+            T.Eq("a=1; b=2", req.Headers.Get("Cookie"));       // crumbs rejoined (RFC 9113 8.2.3)
+            T.Eq("Example.TEST:443", req.Headers.Get("Host"));  // a Host for modules and upstreams
+            T.Eq(null, req.Headers.Get("x_hidden"));            // underscores ignored, as on HTTP/1.1
+            T.Eq(HttpVersion.Http20, req.VersionValue);
+            T.True(!req.HasBody);
+            // A body without content-length is "unknown length" (chunked, to HTTP/1.1 eyes); with one, that length.
+            T.True(Head(false, Base).Req.ChunkedValue);
+            var withLen = Head(false, [.. Base, ("content-length", "5")]).Req;
+            T.Eq(5L, withLen.ContentLengthValue);
+            T.True(!withLen.ChunkedValue);
+        });
+
+        T.Add("h2 request head: malformed requests are stream errors, refusals are statuses", () =>
+        {
+            void Bad(string what, bool end, params (string, string)[] f)
+            {
+                var (code, _, why) = Head(end, f);
+                if (code != -1) throw new Exception($"{what}: expected malformed, got {code}");
+                if (why is null) throw new Exception($"{what}: no reason");
+            }
+            Bad("upper-case name", true, [.. Base, ("Accept", "x")]);
+            Bad("pseudo after regular", true, [(":method", "GET"), ("accept", "x"), (":scheme", "https"), (":path", "/"), (":authority", "a")]);
+            Bad("duplicate :path", true, [.. Base, (":path", "/x")]);
+            Bad("unknown pseudo", true, [.. Base, (":nonsense", "1")]);
+            Bad("response pseudo", true, [.. Base, (":status", "200")]);
+            Bad("no :method", true, [(":scheme", "https"), (":path", "/"), (":authority", "a")]);
+            Bad("no :path", true, [(":method", "GET"), (":scheme", "https"), (":authority", "a")]);
+            Bad("http scheme", true, [(":method", "GET"), (":scheme", "http"), (":path", "/"), (":authority", "a")]);
+            Bad("connection", true, [.. Base, ("connection", "close")]);
+            Bad("transfer-encoding", true, [.. Base, ("transfer-encoding", "chunked")]);
+            Bad("upgrade", true, [.. Base, ("upgrade", "websocket")]);
+            Bad("keep-alive", true, [.. Base, ("keep-alive", "1")]);
+            Bad("te gzip", true, [.. Base, ("te", "gzip")]);
+            Bad("CR in value", true, [.. Base, ("x", "a\rb")]);
+            Bad("NUL in value", true, [.. Base, ("x", "a\0b")]);
+            Bad("leading space", true, [.. Base, ("x", " a")]);
+            Bad("authority disagrees with host", true, [.. Base, ("host", "other.test")]);
+            Bad("two hosts", true, [(":method", "GET"), (":scheme", "https"), (":path", "/"), ("host", "a"), ("host", "b")]);
+            Bad("userinfo", true, [(":method", "GET"), (":scheme", "https"), (":path", "/"), (":authority", "u@a")]);
+            Bad("no host at all", true, [(":method", "GET"), (":scheme", "https"), (":path", "/")]);
+            Bad("two content-lengths", false, [.. Base, ("content-length", "1"), ("content-length", "1")]);
+            Bad("content-length +1", false, [.. Base, ("content-length", "+1")]);
+            Bad("content-length with END_STREAM", true, [.. Base, ("content-length", "3")]);
+            Bad("path escaping root", true, [(":method", "GET"), (":scheme", "https"), (":path", "/../x"), (":authority", "a")]);
+            Bad("path with NUL", true, [(":method", "GET"), (":scheme", "https"), (":path", "/%00"), (":authority", "a")]);
+            Bad("asterisk outside OPTIONS", true, [(":method", "GET"), (":scheme", "https"), (":path", "*"), (":authority", "a")]);
+            Bad("absolute :path", true, [(":method", "GET"), (":scheme", "https"), (":path", "http://evil/x"), (":authority", "a")]);
+            Bad(":protocol outside CONNECT", true, [.. Base, (":protocol", "websocket")]);
+            T.Eq(405, Head(true, [(":method", "CONNECT"), (":authority", "a:443")]).Code);
+            T.Eq(417, Head(true, [.. Base, ("expect", "nonsense")]).Code);
+            T.Eq(0, Head(true, [(":method", "OPTIONS"), (":scheme", "https"), (":path", "*"), (":authority", "a")]).Code);
+            T.Eq(0, Head(true, [.. Base, ("te", "trailers")]).Code);
+        });
+
+
         T.Add("h2 frames: framing, padding and priority fields", () =>
         {
             var data = F(FrameType.Data, FrameFlags.Padded, 1, 2, (byte)'h', (byte)'i', 0, 0);

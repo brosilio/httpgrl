@@ -45,7 +45,7 @@ internal sealed class AccessLogModule : IModule
             new("remote", ctx.Connection.RemoteAddress),
             new("method", req.Method),
             new("uri", req.RawTarget),
-            new("proto", req.Version == HttpVersion.Http11 ? "HTTP/1.1" : "HTTP/1.0"),
+            new("proto", HttpVersions.Name(req.Version)),
             new("host", req.Host),
             new("status", (long)ctx.Response.Status),
             new("bytes", ctx.Response.BodyBytesSent),

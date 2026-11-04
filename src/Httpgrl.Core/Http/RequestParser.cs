@@ -272,7 +272,7 @@ internal static class RequestParser
         return true;
     }
 
-    private static string InternMethod(ReadOnlySpan<byte> m)
+    internal static string InternMethod(ReadOnlySpan<byte> m)
     {
         switch (m.Length)
         {
@@ -311,7 +311,7 @@ internal static class RequestParser
     ];
     private static readonly byte[][] KnownHeaderBytes = Array.ConvertAll(KnownHeaders, Encoding.ASCII.GetBytes);
 
-    private static string InternHeaderName(ReadOnlySpan<byte> name)
+    internal static string InternHeaderName(ReadOnlySpan<byte> name)
     {
         var known = KnownHeaderBytes;
         for (int i = 0; i < known.Length; i++)

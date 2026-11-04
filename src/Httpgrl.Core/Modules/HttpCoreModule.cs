@@ -403,7 +403,7 @@ internal sealed class HttpCoreModule(string prefix) : IModule
         r.AddVariable("query_string", c => c.Request.Query);
         r.AddVariable("is_args", c => c.Request.Query.Length > 0 ? "?" : "");
         r.AddVariable("request_method", c => c.Request.Method);
-        r.AddVariable("server_protocol", c => c.Request.Version == HttpVersion.Http11 ? "HTTP/1.1" : "HTTP/1.0");
+        r.AddVariable("server_protocol", c => HttpVersions.Name(c.Request.Version));
         r.AddVariable("scheme", c => c.Connection.IsTls ? "https" : "http");
         r.AddVariable("https", c => c.Connection.IsTls ? "on" : "");
         r.AddVariable("host", c => c.Request.Host.Length > 0 ? c.Request.Host : ((HttpContextImpl)c).ServerRt.PrimaryName);

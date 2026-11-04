@@ -5,7 +5,13 @@ using System.Text.RegularExpressions;
 
 namespace Httpgrl;
 
-public enum HttpVersion : byte { Http10 = 10, Http11 = 11 }
+public enum HttpVersion : byte { Http10 = 10, Http11 = 11, Http20 = 20 }
+
+public static class HttpVersions
+{
+    /// <summary>"HTTP/1.0", "HTTP/1.1" or "HTTP/2.0", as on a request line (and in $server_protocol).</summary>
+    public static string Name(HttpVersion v) => v switch { HttpVersion.Http10 => "HTTP/1.0", HttpVersion.Http20 => "HTTP/2.0", _ => "HTTP/1.1" };
+}
 
 public static class HttpMethods
 {
