@@ -19,6 +19,12 @@ internal sealed class Connection : Deadlines
     public Pipeline.HttpRuntime? Generation;
     /// <summary>Accepted on a TLS listener (its handshake ties it to the configuration it was made under).</summary>
     public bool Tls;
+    /// <summary>
+    /// A multiplexed session (HTTP/2) that winds itself down on reload and shutdown. "Idle" there means no stream is
+    /// running, not that the client isn't sending one: closing it as an idle keep-alive would lose requests in flight.
+    /// The drain deadline still bounds it.
+    /// </summary>
+    public volatile bool DrainsItself;
 
     private int _aborted;
     private CancellationTokenSource? _cts;

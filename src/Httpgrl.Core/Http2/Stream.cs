@@ -38,6 +38,8 @@ internal sealed class H2Stream : Deadlines
         Wire = new H2ResponseWire(this);
     }
 
+    public override bool MeasuresSendRate => false; // the connection measures it (its writes), see Http2Session
+
     public override CancellationToken AbortToken => _cts.Token;
     public override bool IsAborted => Volatile.Read(ref _aborted) != 0;
     public override string? AbortReason => _reason;
@@ -153,6 +155,7 @@ internal sealed class H2RequestBody(H2Stream stream) : RequestBody
                     c.Len -= n;
                     if (c.Len == 0) { _queue.Dequeue(); ArrayPool<byte>.Shared.Return(c.Buf); }
                     _read += n;
+                    stream.CountBytes(n); // the minimum rate is bytes over time spent waiting for them
                     if (MaxSize > 0 && _read > MaxSize) throw new HttpBodyException(413, "request body too large");
                     stream.Session.Consumed(stream, n);
                     if (_ended && _queue.Count == 0) stream.StopRate();

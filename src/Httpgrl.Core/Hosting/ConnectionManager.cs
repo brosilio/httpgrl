@@ -143,7 +143,7 @@ internal sealed class ConnectionManager : IDisposable
     public void RetireIdle()
     {
         foreach (var c in Snapshot())
-            if (c.Idle && c.Tls && c.Generation is { Retired: true }) c.Abort("configuration reloaded", graceful: true);
+            if (c.Idle && c.Tls && !c.DrainsItself && c.Generation is { Retired: true }) c.Abort("configuration reloaded", graceful: true);
     }
 
     /// <summary>Stop admitting; idle connections are closed on the next sweep.</summary>
@@ -179,10 +179,10 @@ internal sealed class ConnectionManager : IDisposable
                 var c = Volatile.Read(ref slots[i]);
                 if (c is null) continue;
                 string? why = null;
-                if (stopping && c.Idle) why = "shutdown";
+                if (stopping && c.Idle && !c.DrainsItself) why = "shutdown";
                 // Idle TLS connections close at reload; idle plaintext ones move to the new configuration on their next
                 // request. Anything still on a replaced configuration after reload_drain_timeout is closed.
-                else if (c.Generation is { Retired: true } g && ((c.Idle && c.Tls) || now > g.RetireDeadline))
+                else if (c.Generation is { Retired: true } g && ((c.Idle && c.Tls && !c.DrainsItself) || now > g.RetireDeadline))
                     why = c.Idle ? "configuration reloaded" : "reload drain timeout";
                 else why = Expired(c, now);
                 if (why is not null) doomed.Add((c, why));
@@ -199,7 +199,8 @@ internal sealed class ConnectionManager : IDisposable
             foreach (var d in _sweep)
             {
                 if (Expired(d, now) is not { } why) continue;
-                _log.Info("stream aborted", new LogField("reason", why));
+                _log.Info("stream aborted", new("reason", why), new("bytes", Volatile.Read(ref d.RateBytes)), new("busy_ms", Volatile.Read(ref d.RateBusyMs)),
+                    new("reading", Volatile.Read(ref d.ReadStartedAt) != 0), new("writing", Volatile.Read(ref d.WriteStartedAt) != 0));
                 d.Abort(why);
             }
         }
@@ -216,7 +217,7 @@ internal sealed class ConnectionManager : IDisposable
         {
             long busy = Volatile.Read(ref c.RateBusyMs);
             long rs = Volatile.Read(ref c.ReadStartedAt), ws = Volatile.Read(ref c.WriteStartedAt);
-            if (rs != 0) busy += now - rs;
+            if (rs != 0 && !c.RateWritesOnly) busy += now - rs;
             if (ws != 0) busy += now - ws;
             if (busy > RateGraceMs && c.RateBytes * 1000 < (long)c.MinRate * busy) return c.Phase + " below minimum rate";
         }

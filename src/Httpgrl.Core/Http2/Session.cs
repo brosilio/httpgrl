@@ -21,7 +21,10 @@ namespace Httpgrl.Core.Http2;
 ///   handler has actually stopped (so rapid reset can't outrun real work); streams the client resets, and ones refused
 ///   or malformed, also draw on a budget (legitimate bursts of completed requests don't);
 /// - header blocks: bounded compressed size and fragment count (CONTINUATION floods);
-/// - control frames: SETTINGS, PING, PRIORITY, RST_STREAM, WINDOW_UPDATE and empty frames share one budget.
+/// - control frames that make us answer or carry nothing (SETTINGS, PING, RST_STREAM, unknown and empty frames) share
+///   one budget, which refills with time and with every DATA frame we send: a client doing real work earns more.
+///   WINDOW_UPDATE and PRIORITY are free: they never make us reply or allocate, and a client receiving data sends
+///   WINDOW_UPDATEs in proportion to it.
 /// </summary>
 internal sealed class Http2Session
 {
@@ -55,9 +58,13 @@ internal sealed class Http2Session
     private long _connRecv = ConnectionWindow; // what the peer may still send us; under _lock
     private long _connUnacked;                // read by handlers, not yet credited back; under _lock
     private int _peerInitialWindow = 65535, _peerMaxFrame = 16384;
-    private volatile bool _goingAway;
-    private int _goAwaySent;
+    private volatile bool _goingAway;        // the final GOAWAY is out: no new streams
+    private int _goAwaySent;                  // 0 none, 1 the drain's first GOAWAY (awaiting its PING), 2 the final one
+    private int _closing;                     // the graceful close has begun (close_notify, FIN, then read to EOF)
+    private bool _writeClosed;                // under _write: nothing more may be written
     private bool _peerGoAway;
+    private int _goAwayLast = int.MaxValue;   // the final GOAWAY's last stream; under _lock
+    private static readonly byte[] DrainPing = "h2drain!"u8.ToArray();
 
     // Budgets (token buckets, reader thread).
     private double _control = ControlBurst, _wasted;
@@ -94,7 +101,7 @@ internal sealed class Http2Session
 
     public async Task RunAsync()
     {
-        using var retired = _rt.RetiredToken.Register(static s => ((Http2Session)s!).GoAwayLater(H2Error.NoError), this);
+        CancellationTokenRegistration retired = default;
         try
         {
             _conn.Phase = "h2 preface";
@@ -105,22 +112,29 @@ internal sealed class Http2Session
                     (SettingId.InitialWindowSize, StreamWindow), (SettingId.MaxFrameSize, OurMaxFrame), (SettingId.MaxHeaderListSize, (uint)_maxHeaderList),
                     (SettingId.EnableConnectProtocol, 1)), // WebSockets over HTTP/2 (RFC 8441)
                 FrameWriter.WindowUpdate(0, ConnectionWindow - 65535)).ConfigureAwait(false);
+            // Reload and shutdown wind the session down, once our SETTINGS are out (the first frame must be SETTINGS).
+            retired = _rt.RetiredToken.Register(static s => ((Http2Session)s!).GoAwayLater(H2Error.NoError), this);
 
+            // The slow-read defence, for the whole connection: its writes must keep up the minimum rate (send_min_rate).
+            _conn.RateWritesOnly = true;
+            _conn.DrainsItself = true; // reload and shutdown: GOAWAY, not the sweeper's close of an "idle" connection
+            _conn.StartRate(_core.SendMinRateBps);
             bool first = true;
             while (true)
             {
                 bool idle;
                 lock (_lock) idle = _active == 0 && !_inBlock;
-                if (idle)
+                if (Volatile.Read(ref _closing) != 0) { } // lingering: read (and ignore) until the client closes, or the deadline
+                else if (idle)
                 {
-                    if (_goingAway || _peerGoAway) break; // nothing left to finish
+                    if (_goingAway || _peerGoAway) { CloseGracefully(); continue; } // nothing left to finish
                     _conn.SetIdle(_core.KeepaliveTimeoutMs);
                 }
                 else if (!_inBlock) { _conn.SetActive(); _conn.Phase = "h2"; _conn.BaseDeadline = 0; }
 
                 var (ok, frame, off, len) = await ReadFrameAsync().ConfigureAwait(false);
                 if (!ok) break;
-                _conn.SetActive();
+                if (Volatile.Read(ref _closing) == 0) _conn.SetActive();
                 if (first && (frame.Type != FrameType.Settings || frame.Has(FrameFlags.Ack)))
                     throw new H2Exception(H2Error.ProtocolError, 0, "the preface must be followed by SETTINGS");
                 first = false;
@@ -137,6 +151,7 @@ internal sealed class Http2Session
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or OperationCanceledException) { }
         finally
         {
+            retired.Dispose();
             Task[] handlers;
             H2Stream[] open;
             lock (_lock)
@@ -224,12 +239,12 @@ internal sealed class Http2Session
             case FrameType.Ping:
                 Control();
                 if (!f.Has(FrameFlags.Ack)) await WriteAsync(FrameWriter.Ping(payload.Span, ack: true)).ConfigureAwait(false);
+                else if (payload.Span.SequenceEqual(DrainPing)) FinalGoAway(); // a round trip after the first GOAWAY: nothing is in flight
                 return;
             case FrameType.GoAway:
                 _peerGoAway = true;
                 return;
             case FrameType.WindowUpdate:
-                Control();
                 WindowUpdate(f.StreamId, (int)(BinaryPrimitives.ReadUInt32BigEndian(payload.Span) & 0x7FFFFFFF));
                 return;
             case FrameType.RstStream:
@@ -237,7 +252,6 @@ internal sealed class Http2Session
                 PeerReset(f.StreamId, (H2Error)BinaryPrimitives.ReadUInt32BigEndian(payload.Span));
                 return;
             case FrameType.Priority:
-                Control();
                 return;
             case FrameType.Headers:
                 await HeadersAsync(f, payload).ConfigureAwait(false);
@@ -270,10 +284,13 @@ internal sealed class Http2Session
     private void Control()
     {
         long now = Environment.TickCount64;
-        _control = Math.Min(ControlBurst, _control + (now - _controlAt) * ControlPerSecond / 1000.0);
+        long earned = Interlocked.Exchange(ref _earned, 0); // DATA frames we've sent since: real work buys allowance
+        _control = Math.Min(ControlBurst, _control + (now - _controlAt) * ControlPerSecond / 1000.0 + earned);
         _controlAt = now;
         if (--_control < 0) throw new H2Exception(H2Error.EnhanceYourCalm, 0, "too many control frames");
     }
+
+    private long _earned;
 
     private void ApplySettings(ReadOnlySpan<byte> p)
     {
@@ -445,6 +462,8 @@ internal sealed class Http2Session
         }
         if (refuse)
         {
+            // Past our final GOAWAY the client knows the stream wasn't processed and retries it (6.8): just ignore it.
+            if (_goingAway) return;
             Wasted();
             ResetLater(sid, H2Error.RefusedStream);
             return;
@@ -483,12 +502,14 @@ internal sealed class Http2Session
         }
         bool end = f.Has(FrameFlags.EndStream);
         if (payload.Length == 0 && !end) Control();
-        if (s is null || s.RemoteClosed || WeReset(sid))
+        bool ignored;
+        lock (_lock) ignored = sid > _goAwayLast; // never admitted: the client retries it elsewhere
+        if (s is null || s.RemoteClosed || WeReset(sid) || ignored)
         {
             // A stream that's closed (or never got a handler): give the window back. If we reset it, frames still in
             // flight are expected and must be ignored (RFC 9113 5.1); otherwise tell the client to stop.
             await CreditAsync(null, f.Length).ConfigureAwait(false);
-            if (WeReset(sid)) return;
+            if (WeReset(sid) || ignored) return;
             if (s is null) ResetLater(sid, H2Error.StreamClosed);
             else throw new H2Exception(H2Error.StreamClosed, sid, "DATA after END_STREAM");
             return;
@@ -540,7 +561,7 @@ internal sealed class Http2Session
             }
             if (unread > 0) await CreditAsync(null, (int)Math.Min(unread, int.MaxValue)).ConfigureAwait(false);
             s.Dispose();
-            if (_active == 0 && (_goingAway || _peerGoAway)) _conn.Abort("http/2 connection done", graceful: true);
+            if (_active == 0 && (_goingAway || _peerGoAway)) CloseGracefully();
         }
     }
 
@@ -618,23 +639,25 @@ internal sealed class Http2Session
         if (s.IdleRefreshMs == 0) s.WriteOpTimeout = _core.SendTimeoutMs;
         do
         {
+            // One measured write: waiting for window (send_timeout applies) plus putting the frame on the wire.
             int n = 0;
-            if (!data.IsEmpty)
-            {
-                s.BeginWrite();
-                try { n = await ReserveAsync(s, Math.Min(data.Length, _peerMaxFrame)).ConfigureAwait(false); }
-                finally { s.EndWrite(0); }
-            }
-            bool last = endStream && n == data.Length;
-            var frame = ArrayPool<byte>.Shared.Rent(FrameReader.HeaderSize + n);
+            bool last;
+            s.BeginWrite();
             try
             {
-                FrameWriter.Header(frame, n, FrameType.Data, last ? FrameFlags.EndStream : (byte)0, s.Id);
-                data.Span[..n].CopyTo(frame.AsSpan(FrameReader.HeaderSize));
-                await WriteStreamAsync(s, frame.AsMemory(0, FrameReader.HeaderSize + n), last).ConfigureAwait(false);
+                if (!data.IsEmpty) n = await ReserveAsync(s, Math.Min(data.Length, _peerMaxFrame)).ConfigureAwait(false);
+                last = endStream && n == data.Length;
+                var frame = ArrayPool<byte>.Shared.Rent(FrameReader.HeaderSize + n);
+                try
+                {
+                    FrameWriter.Header(frame, n, FrameType.Data, last ? FrameFlags.EndStream : (byte)0, s.Id);
+                    data.Span[..n].CopyTo(frame.AsSpan(FrameReader.HeaderSize));
+                    await WriteStreamAsync(s, frame.AsMemory(0, FrameReader.HeaderSize + n), last).ConfigureAwait(false);
+                }
+                finally { ArrayPool<byte>.Shared.Return(frame); }
             }
-            finally { ArrayPool<byte>.Shared.Return(frame); }
-            s.EndWrite(n);
+            finally { s.EndWrite(n); }
+            Interlocked.Increment(ref _earned);
             data = data[n..];
             if (last) return;
         }
@@ -668,7 +691,7 @@ internal sealed class Http2Session
         await _write.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (s.LocalClosed) throw new OperationCanceledException("stream reset");
+            if (s.LocalClosed || _writeClosed) throw new OperationCanceledException("stream reset");
             if (ends) s.LocalClosed = true;
             _conn.WriteOpTimeout = _core.SendTimeoutMs;
             await _transport.WriteAsync(frames).ConfigureAwait(false);
@@ -681,6 +704,7 @@ internal sealed class Http2Session
         await _write.WaitAsync().ConfigureAwait(false);
         try
         {
+            if (_writeClosed) return;
             _conn.WriteOpTimeout = _core.SendTimeoutMs;
             await _transport.WriteAsync(a).ConfigureAwait(false);
             if (b is not null) await _transport.WriteAsync(b).ConfigureAwait(false);
@@ -716,23 +740,67 @@ internal sealed class Http2Session
         lock (_resetIds) return _resetIds.Contains(sid);
     }
 
-    private async Task SafeWrite(byte[] frame)
+    private async Task SafeWrite(byte[] frame, byte[]? then = null)
     {
-        try { await WriteAsync(frame).ConfigureAwait(false); }
+        try { await WriteAsync(frame, then).ConfigureAwait(false); }
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException) { }
     }
 
-    /// <summary>Stop taking new streams (reload, shutdown, keepalive_requests); the ones running finish.</summary>
+    /// <summary>
+    /// Stop taking new streams (reload, shutdown, keepalive_requests); the ones running finish. In two steps (RFC 9113
+    /// 6.8): a GOAWAY that refuses nothing yet, and a PING; when the PING comes back, requests the client sent before
+    /// it saw the GOAWAY have arrived, and the final GOAWAY names the last of them. A single GOAWAY would drop the
+    /// requests already on the wire, and the client couldn't tell whether they were processed.
+    /// </summary>
     private void GoAwayLater(H2Error code)
     {
-        _goingAway = true;
-        if (Interlocked.Exchange(ref _goAwaySent, 1) != 0) return;
+        if (Interlocked.CompareExchange(ref _goAwaySent, 1, 0) != 0) return;
+        _ = SafeWrite(FrameWriter.GoAway(int.MaxValue, code), FrameWriter.Ping(DrainPing, ack: false));
+        // A client that never answers the PING doesn't get to keep the connection: the final GOAWAY goes out anyway.
+        _ = Task.Delay(1000).ContinueWith(static (_, s) => ((Http2Session)s!).FinalGoAway(), this, TaskScheduler.Default);
+    }
+
+    private void FinalGoAway()
+    {
+        if (Interlocked.Exchange(ref _goAwaySent, 2) == 2) return;
         int last;
-        lock (_lock) last = _lastStreamId;
-        _ = SafeWrite(FrameWriter.GoAway(last, code));
         bool idle;
-        lock (_lock) idle = _active == 0;
-        if (idle) _conn.Abort("http/2 connection done", graceful: true);
+        lock (_lock)
+        {
+            _goingAway = true; // under the lock streams are admitted under: none gets in past "last"
+            last = _goAwayLast = _lastStreamId;
+            idle = _active == 0;
+        }
+        _ = SafeWrite(FrameWriter.GoAway(last, H2Error.NoError));
+        if (idle) CloseGracefully();
+    }
+
+    /// <summary>
+    /// Nothing left to do: FIN after everything queued, then read until the client closes (bounded). Closing with the
+    /// client's frames unread would reset the connection, and a reset loses our last frames.
+    /// </summary>
+    private void CloseGracefully()
+    {
+        if (Interlocked.Exchange(ref _closing, 1) != 0) return;
+        _conn.Phase = "lingering close";
+        _conn.BaseDeadline = Environment.TickCount64 + 2000;
+        _ = CloseWriteAsync();
+    }
+
+    private async Task CloseWriteAsync()
+    {
+        await _write.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_writeClosed) return;
+            _writeClosed = true;
+            // A TCP FIN, no TLS close_notify: the reader still has a read pending on the SslStream, and OpenSSL's
+            // SSL_shutdown racing SSL_read on one SSL corrupts its memory (seen as crashes in later handshakes).
+            // HTTP/2 needs no close_notify: after GOAWAY, framing says the connection is complete.
+            _conn.Socket.Shutdown(SocketShutdown.Send);
+        }
+        catch (Exception e) when (e is SocketException or ObjectDisposedException) { }
+        finally { _write.Release(); }
     }
 
     /// <summary>
@@ -745,7 +813,18 @@ internal sealed class Http2Session
         _conn.BaseDeadline = Environment.TickCount64 + 2000;
         try
         {
-            if (_transport is SslStream ssl) await ssl.ShutdownAsync().ConfigureAwait(false);
+            // The reader has stopped (we're on it), and the write lock keeps handlers off the SslStream: only then may
+            // TLS be shut down (OpenSSL doesn't tolerate SSL_shutdown racing another operation on the same SSL).
+            await _write.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (!_writeClosed)
+                {
+                    _writeClosed = true;
+                    if (_transport is SslStream ssl) await ssl.ShutdownAsync().ConfigureAwait(false);
+                }
+            }
+            finally { _write.Release(); }
             _conn.Socket.Shutdown(SocketShutdown.Send);
             var buf = ArrayPool<byte>.Shared.Rent(16 << 10);
             try
@@ -760,15 +839,20 @@ internal sealed class Http2Session
             }
             finally { ArrayPool<byte>.Shared.Return(buf); }
         }
-        catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or InvalidOperationException) { }
+        // Best-effort teardown: the client may already be gone, and close_notify then fails in ways of its own (an
+        // exception type internal to .NET among them). Nothing here may escape as a connection failure.
+        catch (Exception e) when (e is not OutOfMemoryException) { }
     }
 
     private async ValueTask GoAwayAsync(H2Error code)
     {
-        _goingAway = true;
-        if (Interlocked.Exchange(ref _goAwaySent, 1) != 0) return;
         int last;
-        lock (_lock) last = _lastStreamId;
+        lock (_lock)
+        {
+            _goingAway = true;
+            last = _goAwayLast = Math.Min(_goAwayLast, _lastStreamId);
+        }
+        if (Interlocked.Exchange(ref _goAwaySent, 2) == 2) return;
         try { await WriteAsync(FrameWriter.GoAway(last, code)).ConfigureAwait(false); }
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException) { }
     }

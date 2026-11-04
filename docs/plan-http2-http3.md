@@ -1,6 +1,6 @@
 # HTTP/2 and HTTP/3: implementation plan
 
-Status: plan, 2026-11-04. Nothing here is implemented yet.
+Status (2026-11-04): Phases 0 and 1 (HTTP/2) are done; Phase 2 (QUIC) is next.
 
 ## Decisions
 
@@ -93,7 +93,8 @@ Moved to Phase 1, where streams exist to test them against:
   - no connection-specific fields (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`);
   - field names are lower-case and contain no CR, LF or NUL;
   - `content-length` must match the DATA frames received.
-- **Reload and shutdown:** GOAWAY with the last stream ID; in-flight streams finish within `reload_drain_timeout`.
+- **Reload and shutdown:** a two-step GOAWAY (2^31-1 plus a PING, then the last stream ID); in-flight streams finish
+  within `reload_drain_timeout`.
 - **Directives:** nginx's `http2 on|off` (server level), plus limits: `http2_max_concurrent_streams`,
   `http2_max_field_size`, `http2_max_header_size`, `http2_recv_buffer_size`.
 - **Then:** WebSockets over HTTP/2 through extended CONNECT (RFC 8441, `SETTINGS_ENABLE_CONNECT_PROTOCOL`). The
@@ -111,7 +112,17 @@ WebSockets over HTTP/2 (extended CONNECT, RFC 8441) are done too. They're presen
 requests, so the proxy tunnels them unchanged; tested with `ClientWebSocket` in HTTP/2-only mode, plus the refusals
 and the idle timeout. HTTP/2 is dogfooded on the production box with `http2 on`.
 
-Still to do: the session-level fuzz target; HTTP/2 in the soak test and benchmark.
+The session-level fuzz target (`h2-session`) is done, and HTTP/2 is in the soak test and the benchmark
+(`--bench-h2`). Running them found and fixed:
+- reloads dropping requests already on the wire: now a two-step GOAWAY, and sessions drain themselves rather than
+  being closed as idle keep-alives;
+- TLS shutdown racing a pending read on the same SslStream, which crashed OpenSSL in later handshakes: the drain now
+  closes with a FIN only, and the error path shuts TLS down only under the write lock with the reader stopped;
+- a busy client's WINDOW_UPDATEs exhausting the control-frame budget;
+- per-stream send rates that were meaningless under multiplexing: the slow-read rate is now the connection's;
+- a busy-time miscount that aborted healthy streams for "minimum rate".
+
+Phase 1 is complete.
 
 **Attacks to test, each with a test that fails without the defence:**
 - **Rapid reset (CVE-2023-44487):** streams opened and immediately reset still count, with a reset-rate limit.

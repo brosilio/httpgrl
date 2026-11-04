@@ -403,7 +403,11 @@ dotnet run -c Release --project tests/Httpgrl.Tests -- --soak artifacts/linux-x6
 
 **Benchmark.** There's no wrk dependency: `--bench url [seconds] [connections]` runs a keep-alive load generator. On one
 box, proxying to a second httpgrl with buffering on: about 54k req/s for 1 KiB responses and about 2 GiB/s for 1 MiB,
-level with buffering off.
+level with buffering off. `--bench-h2 url [seconds] [streams]` does the same over one HTTP/2 connection (TLS), with
+.NET's client: about 23k req/s for 1 KiB files, 400 MiB/s for 40 KB and 480 MiB/s for 1 MiB on 64 streams. The client
+is the limit there, so it measures regressions, not the server's ceiling.
+
+The soak mixes HTTP/2 in: requests, uploads through the proxy and WebSockets, across reloads.
 
 A finding prints the seed, iteration and input, which reproduce it exactly. It's dependency-free and not
 coverage-guided, so it's a complement to, not a replacement for, a coverage-guided fuzzer.
@@ -423,10 +427,10 @@ coverage-guided, so it's a complement to, not a replacement for, a coverage-guid
 - **HPACK stays bounded and in step.** Integers, strings, the dynamic table (capped at the size we advertise) and the decoded header list are all bounded. A list over the limit gets a 431 for that request only: the block is still decoded to the end, so compression state never desynchronizes. Every header block is decoded, even one about to be refused, for the same reason. The response encoder never uses the dynamic table: no state across responses, nothing to probe.
 - **Rapid reset (CVE-2023-44487).** `http2_max_concurrent_streams` counts handlers, not open streams, so a reset stream holds its slot until its handler has stopped. Streams the client resets, and ones that are refused or malformed, also draw on a budget: GOAWAY `ENHANCE_YOUR_CALM` when it runs out. Bursts of real, completed requests don't touch it.
 - **CONTINUATION floods** (2024): a header block is capped in compressed size and in fragments, and must arrive within `client_header_timeout`.
-- **Control-frame floods:** SETTINGS, PING, PRIORITY, RST_STREAM, WINDOW_UPDATE, unknown frames, and empty DATA and header fragments share one budget per connection.
-- **Each stream has its own deadlines,** enforced by the same sweeper: `client_body_timeout` and minimum rates on uploads, and `send_timeout` while a client keeps its window closed. A stalled stream is reset without its connection.
+- **Control-frame floods:** SETTINGS, PING, RST_STREAM, unknown frames, and empty DATA and header fragments share one budget per connection, and the DATA frames we send refill it. WINDOW_UPDATE and PRIORITY aren't charged: busy clients send thousands, and they cost us nothing to process.
+- **Each stream has its own deadlines,** enforced by the same sweeper: `client_body_timeout` and minimum rates on uploads, and `send_timeout` while a client keeps its window closed. A stalled stream is reset without its connection. The slow-read minimum rate is measured on the connection, over its writes: one stream's bytes wait behind its siblings', so a stream's own rate says nothing about the client.
 - **WebSockets** (extended CONNECT) are translated into the HTTP/1.1 upgrade request modules already handle, with a fresh `Sec-WebSocket-Key` for the backend. The tunnel is that one stream: idle timeout across both directions, as on HTTP/1.1, and a slot under `http2_max_concurrent_streams` for as long as it's open. Only `websocket` is tunnelled; a plain CONNECT is a 405.
-- **Ending connections:** errors end with a GOAWAY that the client gets to read, thanks to a lingering close. Reload, shutdown and `keepalive_requests` send GOAWAY and let running streams finish (within `reload_drain_timeout`).
+- **Ending connections:** errors end with a GOAWAY that the client gets to read, thanks to a lingering close. Reload, shutdown and `keepalive_requests` drain in two steps (RFC 9113 6.8): a GOAWAY that refuses nothing yet, plus a PING. When the PING comes back, the final GOAWAY names the last request the client sent before it saw the first one, and later streams are ignored, which the client retries elsewhere. Running streams finish (within `reload_drain_timeout`), then a FIN and a bounded read to the client's close. A session drains itself, so reload doesn't close an HTTP/2 connection as an "idle" keep-alive while a request is on the wire.
 
 **Strict parsing.**
 - Line endings must be CRLF. Bare LF or CR, obs-fold, and whitespace before `:` are rejected.

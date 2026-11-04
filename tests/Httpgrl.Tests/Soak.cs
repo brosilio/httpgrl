@@ -17,7 +17,7 @@ internal static class Soak
 {
     private sealed class Stats
     {
-        public long Ok, Limited, Failed, Ws, Abuse;
+        public long Ok, Limited, Failed, Ws, Abuse, H2, H2Ws;
         public readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> Errors = new();
         public void Fail(string what) { Interlocked.Increment(ref Failed); Errors.AddOrUpdate(what, 1, (_, n) => n + 1); }
     }
@@ -42,9 +42,11 @@ internal static class Soak
 
         await using var up = FakeUpstream.Echo();
         await using var wsUp = FakeUpstream.WebSocketEcho();
-        int port = FreePort();
+        int port = FreePort(), h2port = FreePort();
+        ProxyTests.MakeCert("soak.test", dir, "soak");
         var conf = Path.Combine(dir, "httpgrl.conf");
         File.WriteAllText(conf, $$"""
+            {{(Environment.GetEnvironmentVariable("SOAK_LOG") is { Length: > 0 } ? "error_log stderr debug;" : "")}}
             worker_shutdown_timeout 3s; reload_drain_timeout 4s;
             events { worker_connections 4096; connections_per_client 4096; }
             http {
@@ -65,6 +67,17 @@ internal static class Soak
                 location = /status.json { stub_status json; allow 127.0.0.1; deny all; }
                 location /set { set $v "$arg_x"; if ($v ~ "^(\d+)$") { return 200 "n=$1"; } return 200 "s=$v"; }
               }
+              server {
+                listen 127.0.0.1:{{h2port}} ssl; server_name soak.test; http2 on;
+                ssl_certificate {{dir}}/soak.crt; ssl_certificate_key {{dir}}/soak.key;
+                root {{dir}}/www;
+                client_header_timeout 3s; client_body_timeout 3s; send_timeout 5s;
+                location / { }
+                location /proxy/ { proxy_pass http://up/; }
+                location /ws { proxy_pass http://127.0.0.1:{{wsUp.Port}}; proxy_read_timeout 10s; }
+                location = /limited { limit_req zone=lim burst=20 nodelay; }
+                location /set { set $v "$arg_x"; if ($v ~ "^(\d+)$") { return 200 "n=$1"; } return 200 "s=$v"; }
+              }
             }
             """);
 
@@ -72,16 +85,24 @@ internal static class Soak
         using var server = Process.Start(psi)!;
         var log = new StringBuilder();
         long errorLines = 0;
+        // SOAK_LOG=file keeps every server line, for chasing a failure.
+        using var all = Environment.GetEnvironmentVariable("SOAK_LOG") is { Length: > 0 } f ? new StreamWriter(f) : null;
         server.OutputDataReceived += (_, e) =>
         {
             if (e.Data is null) return;
+            if (all is not null) lock (all) all.WriteLine(e.Data);
             if (e.Data.Contains("\"level\":\"error\"", StringComparison.Ordinal))
             {
                 Interlocked.Increment(ref errorLines);
                 lock (log) if (log.Length < 20_000) log.AppendLine(e.Data);
             }
         };
-        server.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (log) log.AppendLine("stderr: " + e.Data); };
+        server.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is null) return;
+            if (all is not null) lock (all) all.WriteLine(e.Data);
+            else lock (log) log.AppendLine("stderr: " + e.Data);
+        };
         server.BeginOutputReadLine();
         server.BeginErrorReadLine();
         int pid = server.Id;
@@ -95,6 +116,20 @@ internal static class Soak
         using var stop = new CancellationTokenSource();
         var workers = new List<Task>();
         for (int k = 0; k < 48; k++) workers.Add(Traffic(http, stats, k, stop.Token));
+        // HTTP/2: one multiplexed connection pool, its own traffic and WebSockets over HTTP/2.
+        var h2Handler = new SocketsHttpHandler
+        {
+            AutomaticDecompression = System.Net.DecompressionMethods.All,
+            SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true, TargetHost = "soak.test" },
+            EnableMultipleHttp2Connections = true,
+        };
+        using var h2 = new HttpClient(h2Handler)
+        {
+            BaseAddress = new Uri($"https://127.0.0.1:{h2port}/"), Timeout = TimeSpan.FromSeconds(15),
+            DefaultRequestVersion = System.Net.HttpVersion.Version20, DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+        };
+        for (int k = 0; k < 24; k++) workers.Add(Traffic(h2, stats, 100 + k, stop.Token, http2: true));
+        for (int k = 0; k < 2; k++) workers.Add(WebSockets(h2port, stats, stop.Token, http2: true));
         for (int k = 0; k < 4; k++) workers.Add(WebSockets(port, stats, stop.Token));
         for (int k = 0; k < 8; k++) workers.Add(Abuse(port, stats, k, stop.Token));
 
@@ -112,11 +147,12 @@ internal static class Soak
             var (rss, fd, th) = Sample(pid);
             peakRss = Math.Max(peakRss, rss);
             var mem = await Memory(http);
-            Console.WriteLine($"soak: t={sw.Elapsed.TotalSeconds:F0}s rss {rss / 1024} MB {mem} fds {fd} threads {th} ok {stats.Ok} limited {stats.Limited} ws {stats.Ws} abuse {stats.Abuse} failed {stats.Failed}");
+            Console.WriteLine($"soak: t={sw.Elapsed.TotalSeconds:F0}s rss {rss / 1024} MB {mem} fds {fd} threads {th} ok {stats.Ok} (h2 {stats.H2}) limited {stats.Limited} ws {stats.Ws} (h2 {stats.H2Ws}) abuse {stats.Abuse} failed {stats.Failed}");
         }
         stop.Cancel();
         try { await Task.WhenAll(workers); } catch (OperationCanceledException) { }
         http.Dispose();
+        h2.Dispose();
 
         // Let idle keep-alives, slow clients and old configurations drain.
         await Task.Delay(8000);
@@ -136,7 +172,8 @@ internal static class Soak
         long total = stats.Ok + stats.Limited + stats.Failed;
         if (stats.Failed > total / 1000 + 10) problems.Add($"{stats.Failed} of {total} requests failed");
 
-        Console.WriteLine($"soak: done. {total} requests ({stats.Ok} ok, {stats.Limited} rate-limited, {stats.Failed} failed), {stats.Ws} websocket sessions, {stats.Abuse} abusive connections, {reloads} reloads");
+        Console.WriteLine($"soak: done. {total} requests ({stats.Ok} ok, {stats.H2} of them over HTTP/2, {stats.Limited} rate-limited, {stats.Failed} failed), {stats.Ws} websocket sessions ({stats.H2Ws} over HTTP/2), {stats.Abuse} abusive connections, {reloads} reloads");
+        if (stats.H2 == 0) problems.Add("no HTTP/2 requests succeeded");
         Console.WriteLine($"soak: rss {rss0 / 1024} -> peak {peakRss / 1024} -> {rssEnd / 1024} MB; fds {fd0} -> {fdEnd}; threads {th0} -> {thEnd}");
         foreach (var (what, n) in stats.Errors.OrderByDescending(e => e.Value).Take(8)) Console.WriteLine($"  failure: {what} x{n}");
         lock (log) if (log.Length > 0) Console.WriteLine(log.ToString());
@@ -146,9 +183,10 @@ internal static class Soak
         return 1;
     }
 
-    private static async Task Traffic(HttpClient http, Stats s, int id, CancellationToken stop)
+    private static async Task Traffic(HttpClient http, Stats s, int id, CancellationToken stop, bool http2 = false)
     {
         var r = new Random(id);
+        string proto = http2 ? "h2 " : "";
         string[] paths = ["small.txt", "small.txt", "text.txt", "big.bin", "proxy/x?id=" + id, "proxy/y", "limited", "set?x=42", "set?x=abc", "missing"];
         while (!stop.IsCancellationRequested)
         {
@@ -156,28 +194,48 @@ internal static class Soak
             try
             {
                 using var req = new HttpRequestMessage(path.StartsWith("proxy/y", StringComparison.Ordinal) ? HttpMethod.Post : HttpMethod.Get, path);
+                // A hand-made request doesn't take the client's defaults: without these it's HTTP/1.1, whatever the client says.
+                req.Version = http.DefaultRequestVersion;
+                req.VersionPolicy = http.DefaultVersionPolicy;
                 if (req.Method == HttpMethod.Post) req.Content = new ByteArrayContent(new byte[r.Next(1, 200_000)]);
                 using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseContentRead, stop);
                 int code = (int)resp.StatusCode;
                 if (code == 429) Interlocked.Increment(ref s.Limited);
-                else if (code == 200 || (path == "missing" && code == 404)) Interlocked.Increment(ref s.Ok);
-                else s.Fail($"{path.Split('?')[0]} -> {code}");
+                else if (code == 200 || (path == "missing" && code == 404))
+                {
+                    Interlocked.Increment(ref s.Ok);
+                    if (resp.Version.Major == 2) Interlocked.Increment(ref s.H2);
+                }
+                else s.Fail($"{proto}{path.Split('?')[0]} -> {code}");
             }
             catch (OperationCanceledException) when (stop.IsCancellationRequested) { return; }
-            catch (HttpRequestException e) { s.Fail($"{path.Split('?')[0]}: {e.HttpRequestError}"); } // reload races are rare but possible
-            catch (TaskCanceledException) { s.Fail($"{path.Split('?')[0]}: timeout"); }
+            catch (HttpRequestException e) // reload races are rare but possible
+            {
+                s.Fail($"{proto}{path.Split('?')[0]}: {e.HttpRequestError}");
+                if (Environment.GetEnvironmentVariable("SOAK_LOG") is { Length: > 0 }) lock (s) Console.WriteLine($"soak: {DateTime.UtcNow:HH:mm:ss.fff} {proto}{path}: {e}");
+            }
+            catch (TaskCanceledException) { s.Fail($"{proto}{path.Split('?')[0]}: timeout"); }
         }
     }
 
-    private static async Task WebSockets(int port, Stats s, CancellationToken stop)
+    private static async Task WebSockets(int port, Stats s, CancellationToken stop, bool http2 = false)
     {
         var buf = new byte[256];
+        using var handler = new SocketsHttpHandler { SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true, TargetHost = "soak.test" } };
+        using var invoker = new HttpMessageInvoker(handler);
         while (!stop.IsCancellationRequested)
         {
             using var ws = new ClientWebSocket();
             try
             {
-                await ws.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), stop);
+                if (http2)
+                {
+                    ws.Options.HttpVersion = System.Net.HttpVersion.Version20;
+                    ws.Options.HttpVersionPolicy = HttpVersionPolicy.RequestVersionExact;
+                    await ws.ConnectAsync(new Uri($"wss://127.0.0.1:{port}/ws"), invoker, stop);
+                    Interlocked.Increment(ref s.H2Ws);
+                }
+                else await ws.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), stop);
                 for (int k = 0; k < 20 && !stop.IsCancellationRequested; k++)
                 {
                     await ws.SendAsync("ping"u8.ToArray(), WebSocketMessageType.Text, true, stop);

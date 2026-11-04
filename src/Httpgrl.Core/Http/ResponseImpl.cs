@@ -172,7 +172,7 @@ internal sealed class ResponseImpl(HttpContextImpl ctx, ResponseWire wire) : Htt
         var t = ctx.Timing;
         t.WriteOpTimeout = core.SendTimeoutMs;
         t.Phase = "response";
-        t.StartRate(core.SendMinRateBps);
+        if (t.MeasuresSendRate) t.StartRate(core.SendMinRateBps);
 
         wire.BeginHead(ctx, status, upgrade);
 

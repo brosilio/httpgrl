@@ -217,6 +217,107 @@ internal static class Http2SessionTests
             }
         });
 
+        T.Add("http2: flow-control and priority frames aren't charged as a flood (busy clients send thousands)", async () =>
+        {
+            await using var s = TestServer.Start(Conf(), Populate);
+            await using var h = await RawH2.ConnectAsync(s.Port);
+            for (int k = 0; k < 5000 && !h.Closed; k++)
+            {
+                await h.SendAsync(FrameWriter.WindowUpdate(0, 1));
+                await h.SendAsync(RawH2.Frame(FrameType.Priority, 0, 3, 0, 0, 0, 0, 16)); // on an idle stream: legal
+            }
+            await h.SendHeadersAsync(1, true, (":method", "GET"), (":scheme", "https"), (":path", "/index.html"), (":authority", "h2.test"));
+            T.Eq("200", await h.ReadStatusAsync(1));
+            T.NotContains("too many control frames", s.LogText());
+        });
+
+        T.Add("http2: a reload drains in two steps (GOAWAY, PING, final GOAWAY): requests already sent are answered, then a clean close", async () =>
+        {
+            await using var s = TestServer.Start(Conf(), Populate);
+            await using var h = await RawH2.ConnectAsync(s.Port);
+            (string, string)[] Get(string p) => [(":method", "GET"), (":scheme", "https"), (":path", p), (":authority", "h2.test")];
+            await h.SendHeadersAsync(1, true, Get("/index.html"));
+            T.Eq("200", await h.ReadStatusAsync(1));
+            T.True(await s.Reload(Conf()));
+
+            // Step one: a GOAWAY that refuses nothing yet, and a PING.
+            int? firstLast = null;
+            byte[]? ping = null;
+            while (ping is null && await h.NextFrameAsync() is { } x)
+            {
+                if (x.F.Type == FrameType.GoAway) firstLast = BinaryPrimitives.ReadInt32BigEndian(x.P) & int.MaxValue;
+                if (x.F.Type == FrameType.Ping && !x.F.Has(FrameFlags.Ack)) ping = x.P;
+            }
+            T.Eq(int.MaxValue, firstLast ?? 0);
+            T.True(ping is not null);
+            // A request the client sent before it saw the GOAWAY: still served.
+            await h.SendHeadersAsync(3, true, Get("/index.html"));
+            await h.SendAsync(FrameWriter.Ping(ping!, ack: true));
+
+            // Step two: the final GOAWAY names stream 3; 3 is answered; anything later is ignored (the client retries it).
+            int? finalLast = null;
+            string? status3 = null;
+            bool sent5 = false, any5 = false;
+            var trace = new StringBuilder();
+            while (await h.NextFrameAsync() is { } x)
+            {
+                trace.Append($"{x.F.Type}/{x.F.StreamId}/{x.F.Flags} ");
+                if (x.F.Type == FrameType.GoAway)
+                {
+                    finalLast = BinaryPrimitives.ReadInt32BigEndian(x.P) & int.MaxValue;
+                    T.Eq(H2Error.NoError, (H2Error)BinaryPrimitives.ReadUInt32BigEndian(x.P.AsSpan(4)));
+                    if (!sent5) { sent5 = true; await h.SendHeadersAsync(5, true, Get("/index.html")); }
+                }
+                if (x.F.Type == FrameType.Headers && x.F.StreamId == 3) status3 = h.LastStatus;
+                if (x.F.StreamId == 5) any5 = true;
+            }
+            if (finalLast != 3) throw new Exception($"final GOAWAY {finalLast?.ToString() ?? "missing"}; frames after the PING ack: {trace}closed={h.Closed} clean={h.ClosedCleanly}\n{s.LogText()}");
+            T.Eq("200", status3);
+            T.True(!any5);
+            T.True(h.ClosedCleanly);
+            T.NotContains("\"level\":\"error\"", s.LogText());
+        });
+
+        T.Add("http2: keepalive_requests winds connections down under load without failing a request (and without crashing TLS)", async () =>
+        {
+            // Every few requests a connection drains (GOAWAY, PING, final GOAWAY, FIN) while streams are in flight and
+            // the reader has a read pending: the close must not race the SslStream (it once corrupted OpenSSL's memory).
+            await using var s = TestServer.Start(Conf("keepalive_requests 7;"), Populate);
+            using var c = Client();
+            var u = $"https://127.0.0.1:{s.Port}";
+            int ok = 0;
+            await Task.WhenAll(Enumerable.Range(0, 16).Select(async k =>
+            {
+                for (int i = 0; i < 40; i++)
+                {
+                    var body = await c.GetByteArrayAsync(u + (i % 4 == 0 ? "/big" : "/index.html"));
+                    if (body.Length is 5 or 1 << 20) Interlocked.Increment(ref ok);
+                }
+            }));
+            T.Eq(640, ok);
+            T.NotContains("\"level\":\"error\"", s.LogText());
+        });
+
+        T.Add("deadlines: an End without its Begin never counts busy time (no spurious minimum-rate aborts)", () =>
+        {
+            var d = new TestDeadlines();
+            d.StartRate(1000);
+            d.EndWrite(500);
+            d.EndRead(500);
+            T.Eq(0L, d.RateBusyMs);
+            d.BeginWrite();
+            d.EndWrite(500);
+            T.True(d.RateBusyMs < 1000);
+            T.Eq(500L, d.RateBytes);
+            d.RateWritesOnly = true;
+            d.BeginRead();
+            d.EndRead(100); // a multiplexed connection's always-pending read isn't the client being slow
+            T.Eq(500L, d.RateBytes);
+            d.CountBytes(100);
+            T.Eq(600L, d.RateBytes);
+            return Task.CompletedTask;
+        });
+
         T.Add("http2: streams past max_concurrent_streams are refused while the others run", async () =>
         {
             await using var up = new FakeUpstream(async (st, rd) => { await rd.ReadRequestAsync(); await Task.Delay(5000); });
@@ -279,6 +380,14 @@ internal static class Http2SessionTests
 }
 
 /// <summary>A deliberately naive HTTP/2 client: frames by hand, for sending what a real client never would.</summary>
+internal sealed class TestDeadlines : Httpgrl.Core.Hosting.Deadlines
+{
+    public override CancellationToken AbortToken => CancellationToken.None;
+    public override bool IsAborted => false;
+    public override string? AbortReason => null;
+    public override void Abort(string reason, bool graceful = false) { }
+}
+
 internal sealed class RawH2 : IAsyncDisposable
 {
     private readonly TcpClient _tcp;
@@ -287,6 +396,8 @@ internal sealed class RawH2 : IAsyncDisposable
     private int _start, _end;
     private readonly HpackDecoder _hpack = new(4096, 1 << 20);
     public bool Closed { get; private set; }
+    /// <summary>The server closed cleanly (close_notify or FIN), not with a reset.</summary>
+    public bool ClosedCleanly { get; private set; }
 
     private RawH2(TcpClient tcp, SslStream ssl) { _tcp = tcp; _ssl = ssl; }
 
@@ -346,10 +457,24 @@ internal sealed class RawH2 : IAsyncDisposable
             int r;
             try { r = await _ssl.ReadAsync(_buf.AsMemory(_end), cts.Token); }
             catch (Exception e) when (e is IOException or OperationCanceledException or ObjectDisposedException) { Closed = true; return null; }
-            if (r == 0) { Closed = true; return null; }
+            if (r == 0) { Closed = ClosedCleanly = true; return null; }
             _end += r;
         }
     }
+
+    /// <summary>The next frame (HEADERS decoded, to keep HPACK in step: see <see cref="LastStatus"/>); null when the connection closes.</summary>
+    public async Task<(Frame F, byte[] P)?> NextFrameAsync(int timeoutMs = 10_000)
+    {
+        var x = await NextAsync(timeoutMs);
+        if (x is { } y && y.F.Type == FrameType.Headers)
+        {
+            LastStatus = null;
+            _hpack.Decode(y.P, (n, v) => { if (n.SequenceEqual(":status"u8)) LastStatus = Encoding.ASCII.GetString(v); });
+        }
+        return x;
+    }
+
+    public string? LastStatus { get; private set; }
 
     /// <summary>The value the server's first SETTINGS frame gives <paramref name="id"/>, or null if it doesn't.</summary>
     public async Task<uint?> ReadSettingAsync(ushort id, int timeoutMs = 5000)

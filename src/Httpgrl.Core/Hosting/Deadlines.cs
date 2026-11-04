@@ -23,6 +23,17 @@ internal abstract class Deadlines
     public long ReadStartedAt;
     public long WriteStartedAt;
 
+    /// <summary>
+    /// The minimum rate counts writes only. A multiplexed connection (HTTP/2) always has a read pending, idle or not;
+    /// counting that time would make every quiet connection look slow. Its slow-read defence is its writes' throughput.
+    /// </summary>
+    public bool RateWritesOnly;
+    /// <summary>
+    /// Whether a response's send rate is measured here. Not on a stream of a multiplexed connection: its bytes wait for
+    /// siblings sharing the pipe, so its own rate says nothing about the client (the connection's does).
+    /// </summary>
+    public virtual bool MeasuresSendRate => true;
+
     /// <summary>When set (upgraded tunnels), each completed I/O op moves <see cref="BaseDeadline"/> this far out.</summary>
     public int IdleRefreshMs;
 
@@ -50,12 +61,18 @@ internal abstract class Deadlines
 
     public void StopRate() => MinRate = 0;
 
+    /// <summary>Bytes that moved without their own Begin/End (taken from a buffer the reader filled while nobody waited).</summary>
+    public void CountBytes(int bytes)
+    {
+        if (MinRate > 0) Interlocked.Add(ref RateBytes, bytes);
+    }
+
     // Called by the transport around every socket operation. Reads and writes keep separate state, so a read
     // completing can never clear (or a read's start overwrite) the deadline of a write stalled at the same time.
     public void BeginRead() => Begin(ref ReadStartedAt, ref ReadDeadline, ReadOpTimeout);
-    public void EndRead(int bytes) => End(ref ReadStartedAt, ref ReadDeadline, bytes);
+    public void EndRead(int bytes) => End(ref ReadStartedAt, ref ReadDeadline, bytes, counts: !RateWritesOnly);
     public void BeginWrite() => Begin(ref WriteStartedAt, ref WriteDeadline, WriteOpTimeout);
-    public void EndWrite(int bytes) => End(ref WriteStartedAt, ref WriteDeadline, bytes);
+    public void EndWrite(int bytes) => End(ref WriteStartedAt, ref WriteDeadline, bytes, counts: true);
 
     private static void Begin(ref long startedAt, ref long deadline, int timeoutMs)
     {
@@ -64,14 +81,15 @@ internal abstract class Deadlines
         Volatile.Write(ref deadline, timeoutMs > 0 ? now + timeoutMs : 0);
     }
 
-    private void End(ref long startedAt, ref long deadline, int bytes)
+    private void End(ref long startedAt, ref long deadline, int bytes, bool counts)
     {
         long now = Environment.TickCount64;
         Volatile.Write(ref deadline, 0);
         if (IdleRefreshMs > 0) BaseDeadline = now + IdleRefreshMs;
-        if (MinRate > 0)
+        long started = Volatile.Read(ref startedAt);
+        if (MinRate > 0 && counts && started != 0) // an End without its Begin must never count "since the epoch"
         {
-            Interlocked.Add(ref RateBusyMs, now - startedAt);
+            Interlocked.Add(ref RateBusyMs, now - started);
             Interlocked.Add(ref RateBytes, bytes);
         }
         Volatile.Write(ref startedAt, 0);

@@ -31,7 +31,7 @@ internal static partial class OpenSslDefaults
     [LibraryImport(LibCrypto, EntryPoint = "NCONF_free")] private static partial void NconfFree(IntPtr conf);
     [LibraryImport(LibCrypto, EntryPoint = "NCONF_load_bio")] private static partial int NconfLoadBio(IntPtr conf, IntPtr bio, out nint errorLine);
     [LibraryImport(LibCrypto, EntryPoint = "CONF_modules_load")] private static partial int ConfModulesLoad(IntPtr conf, IntPtr appName, nuint flags);
-    [LibraryImport(LibCrypto, EntryPoint = "BIO_new_mem_buf")] private static partial IntPtr BioNewMemBuf(byte[] buf, int len);
+    [LibraryImport(LibCrypto, EntryPoint = "BIO_new_mem_buf")] private static partial IntPtr BioNewMemBuf(IntPtr buf, int len);
     [LibraryImport(LibCrypto, EntryPoint = "BIO_free")] private static partial int BioFree(IntPtr bio);
     [LibraryImport(LibCrypto, EntryPoint = "ERR_clear_error")] private static partial void ErrClearError();
 
@@ -59,7 +59,7 @@ internal static partial class OpenSslDefaults
         }
     }
 
-    private static string? Install()
+    private static unsafe string? Install()
     {
         if (!OperatingSystem.IsLinux()) return "only implemented for OpenSSL on Linux";
         try
@@ -73,7 +73,11 @@ internal static partial class OpenSslDefaults
             var text = $"openssl_conf = httpgrl_init\n[httpgrl_init]\nssl_conf = httpgrl_ssl\n[httpgrl_ssl]\nsystem_default = httpgrl_default\n"
                 + $"[httpgrl_default]\nCipherString = {_tls12}\nCiphersuites = {_tls13}\n";
             var bytes = System.Text.Encoding.ASCII.GetBytes(text);
-            IntPtr conf = NconfNew(IntPtr.Zero), bio = BioNewMemBuf(bytes, bytes.Length);
+            // A memory BIO reads its buffer in place, after the call that made it: native memory, not a managed array
+            // (pinned only for the duration of one call, then free to move).
+            var native = NativeMemory.Alloc((nuint)bytes.Length);
+            bytes.CopyTo(new Span<byte>(native, bytes.Length));
+            IntPtr conf = NconfNew(IntPtr.Zero), bio = BioNewMemBuf((IntPtr)native, bytes.Length);
             try
             {
                 if (conf == IntPtr.Zero || bio == IntPtr.Zero) return "OpenSSL couldn't allocate a configuration";
@@ -84,6 +88,7 @@ internal static partial class OpenSslDefaults
             {
                 if (bio != IntPtr.Zero) BioFree(bio);
                 if (conf != IntPtr.Zero) NconfFree(conf);
+                NativeMemory.Free(native);
                 ErrClearError();
             }
 

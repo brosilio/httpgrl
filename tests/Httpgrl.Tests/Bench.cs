@@ -11,6 +11,43 @@ namespace Httpgrl.Tests;
 /// </summary>
 internal static class Bench
 {
+    /// <summary>
+    /// HTTP/2: <paramref name="args"/> = --bench-h2 https://host:port/path [seconds=10] [streams=64]. One connection
+    /// (certificate not checked), that many concurrent streams. Measures the server with .NET's client, which has its own
+    /// costs: compare runs with each other, not with --bench's raw HTTP/1.1 numbers.
+    /// </summary>
+    public static int RunH2Cli(string[] args)
+    {
+        var uri = new Uri(args[1]);
+        int seconds = args.Length > 2 ? int.Parse(args[2]) : 10;
+        int streams = args.Length > 3 ? int.Parse(args[3]) : 64;
+        var handler = new SocketsHttpHandler { SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true }, EnableMultipleHttp2Connections = false };
+        using var http = new HttpClient(handler) { DefaultRequestVersion = System.Net.HttpVersion.Version20, DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact };
+        long done = 0, bytes = 0, errors = 0;
+        var stop = Stopwatch.StartNew();
+        var until = TimeSpan.FromSeconds(seconds);
+        var tasks = Enumerable.Range(0, streams).Select(_ => Task.Run(async () =>
+        {
+            var buf = new byte[256 << 10];
+            while (stop.Elapsed < until)
+            {
+                try
+                {
+                    using var resp = await http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+                    await using var body = await resp.Content.ReadAsStreamAsync();
+                    int n;
+                    while ((n = await body.ReadAsync(buf)) > 0) Interlocked.Add(ref bytes, n);
+                    Interlocked.Increment(ref done);
+                }
+                catch (HttpRequestException) { Interlocked.Increment(ref errors); }
+            }
+        })).ToArray();
+        Task.WaitAll(tasks);
+        double secs = stop.Elapsed.TotalSeconds;
+        Console.WriteLine($"bench-h2 {uri}: {done / secs:F0} req/s, {bytes / secs / (1 << 20):F1} MiB/s body, {errors} errors, {streams} streams on 1 connection, {secs:F1}s");
+        return errors > 0 ? 1 : 0;
+    }
+
     public static int RunCli(string[] args)
     {
         var uri = new Uri(args[1]);
