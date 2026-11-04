@@ -114,6 +114,7 @@ internal static class ReloadTests
             T.Eq(newPort, s.Port);
             T.Eq("b", Body(await Raw(newPort, Get())));
             T.Throws<SocketException>(() => Raw(oldPort, Get(), 1000).GetAwaiter().GetResult()); // refused
+            T.NotContains("accept failed", s.LogText()); // closing a listener is routine, not a warning
 
             using var squatter = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             squatter.Bind(new IPEndPoint(IPAddress.Loopback, 0));

@@ -273,7 +273,8 @@ public sealed class HttpServer : IAsyncDisposable
             catch (ObjectDisposedException) { return; }
             catch (SocketException e)
             {
-                if (_stopping || !listener.Socket.IsBound) return;
+                // A reload that drops this address closes the socket under the pending accept: that's the end, not an error.
+                if (_stopping || listener.Closed || !listener.Socket.IsBound || e.SocketErrorCode == SocketError.OperationAborted) return;
                 // EMFILE/ENFILE and friends: back off rather than spin.
                 _rt.Log.Warn("accept failed", new LogField("error", e.SocketErrorCode.ToString()));
                 await Task.Delay(100).ConfigureAwait(false);
