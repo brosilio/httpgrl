@@ -61,6 +61,20 @@ Today each connection owns one reusable `HttpContextImpl`, and requests run one 
 - **Exit criteria:** no behaviour change; the full suite passes on the JIT and under AOT, the soak test is clean, and
   benchmarks show no regression.
 
+**Status (2026-11-04): done.**
+- `Deadlines`: the timing record the sweeper enforces, with `Connection` as one implementation.
+- `RequestBody`: HTTP/1.1's `BodyStream` is one implementation.
+- `ResponseWire`: HTTP/1.1's `Http1ResponseWire` is one implementation; `ResponseImpl` is protocol-neutral.
+- `HttpContextImpl` takes its timing, body, wire and upgrade hook from its session.
+- `RequestLifecycle`: routing, the 421 rules, running and completing, logging.
+
+Results: no regression on the 1 KiB or 1 MiB benchmarks, the suite passes on the JIT and under AOT, and the soak
+test is clean.
+
+Moved to Phase 1, where streams exist to test them against:
+- registering stream `Deadlines` records with the sweeper (a slow stream is reset, not its connection);
+- pooling per-stream contexts.
+
 ## Phase 1: HTTP/2 (RFC 9113, HPACK RFC 7541)
 
 **Scope:**
