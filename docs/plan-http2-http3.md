@@ -207,13 +207,21 @@ reaching the pipeline that HTTP/1 would have refused.
   - interop with OpenSSL 3.6's independent QUIC client (`openssl s_client -quic` against `--quic-echo`): handshake,
     AES-256-GCM, and 400 KB echoed intact with Retry on.
 
-Still to do in Phase 2:
-- path validation, NAT rebinding and migration (today `disable_active_migration`, and a connection answers only its
-  first address);
-- CUBIC and pacing;
-- GSO/GRO;
-- sockets owned by `HttpServer` across reloads (with `listen ... quic` in Phase 3);
-- the QUIC interop runner's cases.
+Since then:
+- **Migration and NAT rebinding:** path validation, anti-amplification per path, fallback, fresh connection IDs.
+- **Congestion control:** CUBIC by default (NewReno optional) and pacing.
+- **Performance, measured** (`--bench-quic`) and profiled. GSO, a reusable header-protection transform and an
+  O(1) sent-packet ring took one loopback connection from 99 to about 240 MiB/s (2 Gb/s). GRO is left out: .NET can't
+  read UDP_GRO's segment size without P/Invoke, and a server mostly receives small ACKs.
+- **The QUIC interop runner's server-side cases,** reproduced deterministically in CI (`QuicInteropCases.cs`).
+  These, plus CI corruption testing, found two real bugs:
+  - an unauthenticated Initial created server state (now checked before anything is allocated);
+  - handshake probes resent only the oldest CRYPTO data, so a post-quantum ClientHello (two Initials) could stall
+    when ACKs were lost.
+
+Not covered: chacha20 (AES-GCM only, see the decisions), zerortt (refused), resumption over QUIC, v2 and ECN.
+
+**Phase 2 is done**, except keeping UDP sockets across reloads, which arrives with `listen ... quic` in Phase 3.
 
 ## Phase 3: HTTP/3 (RFC 9114, QPACK RFC 9204)
 

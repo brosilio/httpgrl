@@ -13,12 +13,18 @@ internal sealed class QuicNet : IDisposable
 {
     public long Now = 1_000_000;
     public double Loss, Duplicate;
+    /// <summary>Probability that a datagram arrives with one byte changed (the receiver must drop it, not choke on it).</summary>
+    public double Corrupt;
+    /// <summary>Apply loss and corruption only while this holds (null: always), e.g. only during the handshake.</summary>
+    public Func<bool>? Impair;
     public long DelayUs = 10_000, JitterUs;
     /// <summary>Bytes per second each way; 0: unlimited.</summary>
     public long Bandwidth;
     /// <summary>Drop datagrams in this direction while the predicate says so (targeted loss).</summary>
     public Func<bool, byte[], bool>? DropIf;
-    public long Delivered, Dropped;
+    public long Delivered, Dropped, Corrupted;
+    /// <summary>Print every datagram (QUICNET_TRACE=1), for chasing a failing scenario.</summary>
+    public bool Trace = Environment.GetEnvironmentVariable("QUICNET_TRACE") == "1";
 
     /// <summary>Where the client's datagrams come from (change it to simulate a NAT rebinding or a migration).</summary>
     public EndPoint ClientAddress = new IPEndPoint(IPAddress.Parse("192.0.2.1"), 40000);
@@ -57,7 +63,19 @@ internal sealed class QuicNet : IDisposable
 
     private void Put(byte[] data, bool toServer, EndPoint from)
     {
-        if (_rng.NextDouble() < Loss || DropIf?.Invoke(toServer, data) == true) { Dropped++; return; }
+        bool impair = Impair?.Invoke() ?? true;
+        string kinds = "";
+        if (Trace) { int at2 = 0; while (at2 < data.Length && Packets.TryParse(data.AsSpan(at2), 8, out var th)) { kinds += th.Type + "/" + th.Length + " "; at2 += th.Length; } }
+        int corruptedNow = -1;
+        if ((impair && _rng.NextDouble() < Loss) || DropIf?.Invoke(toServer, data) == true) { Dropped++; if (Trace) Console.WriteLine($"    TRACE t={(Now - 1_000_000) / 1000}ms {(toServer ? "C->S" : "S->C")} {data.Length}B [{kinds}] DROPPED"); return; }
+        if (impair && Corrupt > 0 && _rng.NextDouble() < Corrupt)
+        {
+            data = (byte[])data.Clone();
+            int where = _rng.Next(data.Length);
+            data[where] ^= (byte)(1 + _rng.Next(255));
+            Corrupted++;
+            corruptedNow = where;
+        }
         long at = Now;
         if (Bandwidth > 0)
         {
@@ -67,6 +85,7 @@ internal sealed class QuicNet : IDisposable
             at = _linkFree[dir];
         }
         at += DelayUs + (JitterUs > 0 ? _rng.NextInt64(JitterUs) : 0);
+        if (Trace) Console.WriteLine($"    TRACE t={(Now - 1_000_000) / 1000}ms {(toServer ? "C->S" : "S->C")} {data.Length}B [{kinds}] corrupted={corruptedNow}");
         _wire.Enqueue((data, toServer, from), (at, _seq++));
         if (_rng.NextDouble() < Duplicate) _wire.Enqueue(((byte[])data.Clone(), toServer, from), (at + 1000, _seq++));
     }
@@ -98,6 +117,7 @@ internal sealed class QuicNet : IDisposable
         if (Server is null)
         {
             if (!Packets.TryParse(data, 8, out var h) || h.Type != PacketType.Initial || data.Length < 1200) return;
+            if (!QuicConnection.IsAuthenticInitial(data, h)) return; // as the endpoint does: no state for garbage
             var dcid = h.Dcid(data).ToArray();
             var (scid, token) = Cids();
             Server = QuicConnection.Server(ServerTls, _ => ServerTls, ServerOptions, dcid, h.Scid(data).ToArray(), dcid, null, false, scid, token, Cids, from, Now);

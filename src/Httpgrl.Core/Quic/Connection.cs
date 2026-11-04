@@ -224,6 +224,29 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         return c;
     }
 
+    /// <summary>
+    /// Whether a client's Initial packet authenticates under the keys its DCID implies (RFC 9001 5.2), checked on a
+    /// copy. Servers create no state (no TLS, no connection) for one that doesn't: garbage costs a few AES blocks,
+    /// not a handshake.
+    /// </summary>
+    public static bool IsAuthenticInitial(ReadOnlySpan<byte> packet, PacketHeader h)
+    {
+        if (h.Type != PacketType.Initial || h.Length > packet.Length) return false;
+        var copy = System.Buffers.ArrayPool<byte>.Shared.Rent(h.Length);
+        try
+        {
+            var p = copy.AsSpan(0, h.Length);
+            packet[..h.Length].CopyTo(p);
+            var (client, server) = QuicKeys.InitialSecrets(h.Dcid(p));
+            CryptographicOperations.ZeroMemory(server);
+            using var keys = new PacketKeys(QuicCipher.Aes128Gcm, client);
+            CryptographicOperations.ZeroMemory(client);
+            int pnLen = keys.Unmask(p, h.PnOffset, out ulong truncated);
+            return keys.Open(p, h.PnOffset + pnLen, Packets.DecodePacketNumber(-1, truncated, pnLen * 8));
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(copy); }
+    }
+
     private TransportParameters OurParameters() => new()
     {
         OriginalDcid = IsServer ? _originalDcid : null,
@@ -1241,7 +1264,14 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
                 if (p.Discarded && space == 0 && !_pns[1].Discarded) { space = 1; p = _pns[1]; }
                 p.Probes = 2;
                 var s = Recovery.Spaces[space];
-                if (s.Sent.Oldest is { } oldest)
+                // During the handshake, probes resend all unacknowledged CRYPTO data (it's small): with the ACKs lost,
+                // loss detection never fires, and resending only the oldest would leave a later fragment of a
+                // two-packet (post-quantum) ClientHello missing forever.
+                if (space < 2)
+                    foreach (var sp in s.Sent.All())
+                        foreach (var f in sp.Frames)
+                            if (f.Kind == SentKind.Crypto) p.CryptoSend.OnLost(f.A, (int)f.B, false);
+                if (space == 2 && s.Sent.Oldest is { } oldest)
                     foreach (var f in oldest.Frames)
                     {
                         if (f.Kind == SentKind.Crypto) p.CryptoSend.OnLost(f.A, (int)f.B, false);

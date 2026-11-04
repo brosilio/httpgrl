@@ -230,6 +230,25 @@ internal static class QuicEndpointTests
             T.True(s.Endpoint.Refused >= 1);
         });
 
+        T.Add("quic endpoint: an Initial that doesn't authenticate creates no connection (garbage costs no TLS state)", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            using var s = new Server();
+            using var raw = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            raw.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            var junk = new byte[1200];
+            new Random(5).NextBytes(junk);
+            Convert.FromHexString("c3000000010801020304050607080000449e").CopyTo(junk, 0); // a well-formed Initial header, random payload
+            for (int i = 0; i < 50; i++) { junk[10] = (byte)i; raw.SendTo(junk, s.EndPoint); }
+            T.True(!raw.Poll(300_000, SelectMode.SelectRead));
+            T.Eq(0L, s.Endpoint.Accepted);
+            T.Eq(0, s.Endpoint.Connections);
+            T.True(s.Endpoint.Refused >= 50);
+            // And a real client still gets in.
+            using var client = new UdpClient(s.EndPoint, s.ClientTls);
+            T.True(Echo(client, 1000));
+        });
+
         T.Add("quic endpoint: unknown versions get Version Negotiation (v1); small or version-0 packets get nothing", () =>
         {
             if (QuicTls.Unavailable is not null) return;

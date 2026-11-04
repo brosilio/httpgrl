@@ -222,6 +222,8 @@ internal sealed class QuicEndpoint : IDisposable
             return;
         }
         if (h.Type != PacketType.Initial || d.Length < Packets.MinInitialDatagram || h.DcidLength < 8) return;
+        // No state for an Initial that doesn't authenticate (garbage, or corrupted in flight).
+        if (!QuicConnection.IsAuthenticInitial(d, h)) { Refused++; return; }
         NewConnection(d, h, from, now);
     }
 

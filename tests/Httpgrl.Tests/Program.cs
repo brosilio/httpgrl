@@ -26,5 +26,6 @@ QuicTlsTests.Register();
 QuicRecoveryTests.Register();
 QuicConnectionTests.Register();
 QuicEndpointTests.Register();
+QuicInteropCases.Register();
 Fuzz.Register();
 return await T.RunAsync(args.Length > 0 ? args[0] : null);
