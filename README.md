@@ -446,6 +446,18 @@ coverage-guided, so it's a complement to, not a replacement for, a coverage-guid
 - Upstream TLS is verified by default.
 - Pooled keep-alive connections are reused only under the exact TLS settings they were verified with.
 
+**Post-quantum key exchange.** TLS is the platform's (OpenSSL on Linux), and httpgrl doesn't override its choice of
+key exchange. With **OpenSSL 3.5 or later** (Debian 13, Ubuntu 25.04, Fedora 42 and newer), TLS 1.3 connections
+negotiate the hybrid **`X25519MLKEM768`** (X25519 plus ML-KEM-768, FIPS 203), the same group browsers use. That
+protects today's traffic against being recorded and decrypted later by a quantum computer. It applies to client
+connections and to our own outgoing ones (upstreams, tunnel agents) whenever the other end supports it too. On older
+OpenSSL (Debian 12 has 3.0) the same binary falls back to classical X25519, so scanners such as SSL Labs report no
+post-quantum support. Upgrading the OS turns it on; httpgrl needs no change. Not covered:
+- **Post-quantum certificates (ML-DSA).** Public CAs don't issue them and browsers don't accept them yet.
+- **Choosing groups.** .NET has no API for this, so `ssl_ecdh_curve` is accepted and ignored. Use the system
+  OpenSSL configuration (`Groups = ...`) to restrict them.
+- **Logging the negotiated group.** .NET doesn't report it, so there's no `$ssl_curve`.
+
 **Client certificates (mTLS).**
 - Chains are built only against `ssl_client_certificate`. There are no system roots, no AIA downloads (a client-supplied URL never makes the server connect out) and no revocation fetches. The leaf must allow TLS client authentication (EKU), be within its validity period and respect `ssl_verify_depth`.
 - SNI picks the TLS policy, and `Host` picks the server. If they land on servers with different client-certificate policies, the request gets a **421**. So a client can't do the handshake for an open name and then ask for a protected one (or the reverse, carrying a verified identity to a server that didn't ask for it).
