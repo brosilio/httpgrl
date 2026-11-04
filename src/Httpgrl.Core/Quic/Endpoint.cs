@@ -22,6 +22,8 @@ internal sealed class QuicEndpointOptions
     /// <summary>Retry anyway once this many connections are still handshaking (load shedding).</summary>
     public int RetryAboveHandshakes = 1_000;
     public int StatelessResetsPerSecond = 100;
+    /// <summary>Send runs of datagrams with one system call through UDP GSO (Linux UDP_SEGMENT), when the kernel has it.</summary>
+    public bool Gso = true;
     public QuicOptions Connection = new();
 }
 
@@ -73,6 +75,18 @@ internal sealed class QuicEndpoint : IDisposable
     private readonly AesGcm _tokenAead;
     private readonly byte[] _resetKey = RandomNumberGenerator.GetBytes(32);
     private readonly byte[] _out = new byte[1500];
+
+    // GSO (UDP_SEGMENT): consecutive datagrams for one address, all of the segment size but the last, go out in one
+    // send; the kernel cuts them apart. Off if the option isn't there (or a send with it fails).
+    private const int SolUdp = 17, UdpSegment = 103, MaxSegments = 64;
+    private bool _gso;
+    private readonly int _segment;
+    private readonly byte[] _batch = new byte[MaxSegments * 1500];
+    private int _batchLen, _batchCount;
+    private bool _batchClosed;
+    private EndPoint? _batchTo;
+    public bool GsoActive => _gso;
+    public long SendCalls;
     private Thread? _thread;
     private volatile bool _stop;
     private int _handshaking;
@@ -94,6 +108,14 @@ internal sealed class QuicEndpoint : IDisposable
         _o = options ?? new QuicEndpointOptions();
         _tokenAead = new AesGcm(RandomNumberGenerator.GetBytes(32), 16);
         _waker = new Socket(socket.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        _segment = _o.Connection.MaxDatagramSize;
+        if (_o.Gso && OperatingSystem.IsLinux())
+        {
+            Span<byte> v = stackalloc byte[4];
+            BinaryPrimitives.WriteInt32LittleEndian(v, _segment);
+            try { socket.SetRawSocketOption(SolUdp, UdpSegment, v); _gso = true; }
+            catch (SocketException) { }
+        }
     }
 
     /// <summary>Microseconds on the endpoint's monotonic clock.</summary>
@@ -319,7 +341,8 @@ internal sealed class QuicEndpoint : IDisposable
             }
         }
         int n;
-        while ((n = c.C.Send(_out, now, out var to)) > 0) SendTo(_out.AsSpan(0, n), to);
+        while ((n = c.C.Send(_out, now, out var to)) > 0) Queue(_out.AsSpan(0, n), to);
+        Flush();
         if (c.C.IsClosed)
         {
             Remove(c);
@@ -353,8 +376,41 @@ internal sealed class QuicEndpoint : IDisposable
 
     private void SendTo(ReadOnlySpan<byte> d, EndPoint to)
     {
+        SendCalls++;
         try { _socket.SendTo(d, SocketFlags.None, to); }
         catch (SocketException) { } // unreachable peers are QUIC's problem (loss), not ours
+    }
+
+    private void Queue(ReadOnlySpan<byte> d, EndPoint to)
+    {
+        if (!_gso) { SendTo(d, to); return; }
+        if (_batchCount > 0 && (_batchClosed || _batchCount >= MaxSegments || !to.Equals(_batchTo))) Flush();
+        d.CopyTo(_batch.AsSpan(_batchLen));
+        _batchLen += d.Length;
+        _batchCount++;
+        _batchTo = to;
+        _batchClosed = d.Length != _segment; // a shorter datagram can only be a batch's last
+    }
+
+    private void Flush()
+    {
+        if (_batchCount == 0) return;
+        var to = _batchTo!;
+        int len = _batchLen, count = _batchCount;
+        _batchLen = _batchCount = 0;
+        _batchClosed = false;
+        if (count == 1) { SendTo(_batch.AsSpan(0, len), to); return; }
+        SendCalls++;
+        try { _socket.SendTo(_batch.AsSpan(0, len), SocketFlags.None, to); }
+        catch (SocketException e) when (e.SocketErrorCode is not (SocketError.HostUnreachable or SocketError.NetworkUnreachable or SocketError.ConnectionRefused))
+        {
+            // The route or device won't segment (EIO and friends): stop using GSO, and send these one by one.
+            _gso = false;
+            try { _socket.SetRawSocketOption(SolUdp, UdpSegment, new byte[4]); } catch (SocketException) { }
+            _log.Warn("quic: UDP GSO failed, sending datagrams one at a time", new LogField("error", e.SocketErrorCode.ToString()));
+            for (int at = 0; at < len; at += _segment) SendTo(_batch.AsSpan(at, Math.Min(_segment, len - at)), to);
+        }
+        catch (SocketException) { }
     }
 
     /// <summary>

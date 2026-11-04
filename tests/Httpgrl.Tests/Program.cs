@@ -5,6 +5,7 @@ if (args is ["--soak", ..]) return Soak.RunCli(args);
 if (args is ["--bench", ..]) return Bench.RunCli(args);
 if (args is ["--bench-h2", ..]) return Bench.RunH2Cli(args);
 if (args is ["--quic-echo", ..]) return QuicEndpointTests.RunEchoCli(args);
+if (args is ["--bench-quic", ..]) return QuicBench.RunCli(args);
 
 UnitTests.Register();
 IntegrationTests.Register();

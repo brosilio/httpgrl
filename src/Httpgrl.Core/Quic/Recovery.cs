@@ -54,6 +54,82 @@ internal sealed class SentPacket
 }
 
 /// <summary>
+/// Unacknowledged packets of one space, indexed by packet number: packet numbers are consecutive, so a ring of
+/// slots from the oldest outstanding one makes acknowledging a packet O(1), however large the window.
+/// </summary>
+internal sealed class SentPackets
+{
+    private SentPacket?[] _ring = new SentPacket?[64];
+    private int _head;          // slot of _base
+    private long _base;         // packet number of the oldest slot
+    private int _span;          // slots in use, from _base to the newest packet sent
+    public int Count { get; private set; }
+
+    public void Add(SentPacket p)
+    {
+        if (_span == 0) { _base = p.Pn; _head = 0; }
+        long at = p.Pn - _base;
+        if (at < _span) throw new InvalidOperationException("packet numbers must increase");
+        while (at >= _ring.Length) Grow();
+        _ring[(_head + (int)at) & (_ring.Length - 1)] = p;
+        _span = (int)at + 1;
+        Count++;
+    }
+
+    private void Grow()
+    {
+        var n = new SentPacket?[_ring.Length * 2];
+        for (int i = 0; i < _span; i++) n[i] = _ring[(_head + i) & (_ring.Length - 1)];
+        _ring = n;
+        _head = 0;
+    }
+
+    public SentPacket? Get(long pn)
+    {
+        long at = pn - _base;
+        return at < 0 || at >= _span ? null : _ring[(_head + (int)at) & (_ring.Length - 1)];
+    }
+
+    public SentPacket? Remove(long pn)
+    {
+        long at = pn - _base;
+        if (at < 0 || at >= _span) return null;
+        ref var slot = ref _ring[(_head + (int)at) & (_ring.Length - 1)];
+        var p = slot;
+        if (p is null) return null;
+        slot = null;
+        Count--;
+        // Drop empty slots at the front, so the window starts at the oldest outstanding packet.
+        while (_span > 0 && _ring[_head] is null)
+        {
+            _head = (_head + 1) & (_ring.Length - 1);
+            _base++;
+            _span--;
+        }
+        return p;
+    }
+
+    /// <summary>The oldest outstanding packet, or null.</summary>
+    public SentPacket? Oldest => _span > 0 ? _ring[_head] : null;
+    /// <summary>The lowest and one past the highest packet number in the window (outstanding packets lie between).</summary>
+    public long First => _base;
+    public long End => _base + _span;
+
+    public void Clear()
+    {
+        Array.Clear(_ring);
+        _span = Count = 0;
+        _head = 0;
+    }
+
+    public IEnumerable<SentPacket> All()
+    {
+        for (int i = 0; i < _span; i++)
+            if (_ring[(_head + i) & (_ring.Length - 1)] is { } p) yield return p;
+    }
+}
+
+/// <summary>
 /// Loss detection and congestion control (RFC 9002), for one connection's three packet number spaces: RTT
 /// estimation, ACK processing, packet- and time-threshold loss, the probe timeout, and NewReno with persistent
 /// congestion. Times are microseconds on the connection's clock.
@@ -65,8 +141,8 @@ internal sealed class Recovery
 
     public sealed class Space
     {
-        /// <summary>Unacknowledged packets, ascending packet number.</summary>
-        public readonly List<SentPacket> Sent = new();
+        /// <summary>Unacknowledged packets, by packet number.</summary>
+        public readonly SentPackets Sent = new();
         public long LargestAcked = -1;
         public long LossTime;
         public long LastAckElicitingSent;
@@ -149,18 +225,13 @@ internal sealed class Recovery
         bool newLargest = largest > s.LargestAcked;
         if (newLargest) s.LargestAcked = largest;
 
-        // Collect newly acknowledged packets: walk both lists from the top.
+        // Collect newly acknowledged packets: each range, clipped to what's outstanding, slot by slot.
         int start = acked.Count;
-        int r = 0;
-        for (int i = s.Sent.Count - 1; i >= 0 && r < ranges.Count; i--)
+        foreach (var (lo, hi) in ranges)
         {
-            var p = s.Sent[i];
-            while (r < ranges.Count && p.Pn < ranges[r].Smallest) r++;
-            if (r < ranges.Count && p.Pn <= ranges[r].Largest)
-            {
-                acked.Add(p);
-                s.Sent.RemoveAt(i);
-            }
+            long from = Math.Max(lo, s.Sent.First), to = Math.Min(hi, s.Sent.End - 1);
+            for (long pn = to; pn >= from; pn--)
+                if (s.Sent.Remove(pn) is { } p) acked.Add(p);
         }
         if (acked.Count == start) return true;
 
@@ -245,15 +316,15 @@ internal sealed class Recovery
         long lossDelay = Math.Max(9 * Math.Max(LatestRtt, SmoothedRtt) / 8, Granularity);
         long lostSendTime = now - lossDelay;
         int start = lost.Count;
-        for (int i = 0; i < s.Sent.Count; i++)
+        long end = Math.Min(s.LargestAcked, s.Sent.End - 1);
+        for (long pn = s.Sent.First; pn <= end; pn++)
         {
-            var p = s.Sent[i];
-            if (p.Pn > s.LargestAcked) break;
+            var p = s.Sent.Get(pn);
+            if (p is null) continue;
             if (p.TimeSent <= lostSendTime || s.LargestAcked >= p.Pn + PacketThreshold)
             {
+                s.Sent.Remove(pn);
                 lost.Add(p);
-                s.Sent.RemoveAt(i);
-                i--;
             }
             else if (s.LossTime == 0 || p.TimeSent + lossDelay < s.LossTime) s.LossTime = p.TimeSent + lossDelay;
         }
@@ -337,7 +408,7 @@ internal sealed class Recovery
     public void Discard(int space)
     {
         var s = Spaces[space];
-        foreach (var p in s.Sent)
+        foreach (var p in s.Sent.All())
             if (p.InFlight) BytesInFlight -= p.Size;
         s.Sent.Clear();
         s.LossTime = 0;

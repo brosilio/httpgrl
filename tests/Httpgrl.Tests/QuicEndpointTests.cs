@@ -7,19 +7,45 @@ namespace Httpgrl.Tests;
 /// <summary>The QUIC endpoint on real UDP sockets: routing, Retry, Version Negotiation, stateless resets.</summary>
 internal static class QuicEndpointTests
 {
-    /// <summary>Echoes every stream back as it arrives, finishing when the client does.</summary>
+    /// <summary>
+    /// Echoes every stream back as it arrives, finishing when the client does. What a stream can't take yet waits in
+    /// a backlog (up to 16 MB), and reading goes on meanwhile: a client that writes without reading (openssl
+    /// s_client) would otherwise deadlock against our flow control.
+    /// </summary>
     internal sealed class EchoApp : IQuicApplication
     {
+        private const int MaxBacklog = 16 << 20;
         private readonly byte[] _buf = new byte[65536];
+        private sealed class Backlog { public readonly Queue<byte[]> Chunks = new(); public int Off, Bytes; public bool Fin; }
+        private readonly Dictionary<(QuicConnection, long), Backlog> _backlog = new();
+
         public void OnEvent(QuicConnection c, in QuicEvent e, long now)
         {
-            if (e.Kind != QuicEventKind.StreamReadable) return;
+            if (e.Kind is not (QuicEventKind.StreamReadable or QuicEventKind.StreamWritable)) return;
+            var key = (c, e.StreamId);
+            if (!_backlog.TryGetValue(key, out var b)) _backlog[key] = b = new Backlog();
             int n;
-            bool fin;
-            while ((n = c.StreamRead(e.StreamId, _buf, out fin, out _)) > 0 | fin)
+            bool fin = false;
+            while (b.Bytes < MaxBacklog && ((n = c.StreamRead(e.StreamId, _buf, out fin, out _)) > 0 | fin))
             {
-                c.StreamWrite(e.StreamId, _buf.AsSpan(0, n), fin);
-                if (fin) break;
+                if (n > 0) { b.Chunks.Enqueue(_buf.AsSpan(0, n).ToArray()); b.Bytes += n; }
+                if (fin) { b.Fin = true; break; }
+            }
+            while (b.Chunks.TryPeek(out var chunk))
+            {
+                bool last = b.Fin && b.Chunks.Count == 1;
+                int w = c.StreamWrite(e.StreamId, chunk.AsSpan(b.Off), last);
+                if (w < 0) { _backlog.Remove(key); return; }
+                b.Off += w;
+                b.Bytes -= w;
+                if (b.Off < chunk.Length) return; // the stream is full: the rest when it says it's writable
+                b.Chunks.Dequeue();
+                b.Off = 0;
+            }
+            if (b.Fin)
+            {
+                c.StreamWrite(e.StreamId, default, fin: true); // an empty stream, or a FIN after the last chunk
+                _backlog.Remove(key);
             }
         }
     }
@@ -54,8 +80,12 @@ internal static class QuicEndpointTests
                 int waitUs = (int)Math.Clamp(d == 0 ? 50_000 : d - now, 0, 50_000);
                 if (Socket.Poll(waitUs, SelectMode.SelectRead))
                 {
-                    n = Socket.ReceiveFrom(_buf, ref from);
-                    C.Receive(_buf.AsSpan(0, n), from, QuicEndpoint.Now());
+                    // Everything queued, then one round of sending and checking (not one per datagram).
+                    for (int i = 0; i < 256 && (i == 0 || Socket.Available > 0); i++)
+                    {
+                        n = Socket.ReceiveFrom(_buf, ref from);
+                        C.Receive(_buf.AsSpan(0, n), from, QuicEndpoint.Now());
+                    }
                 }
                 now = QuicEndpoint.Now();
                 if (C.Deadline != 0 && C.Deadline <= now) C.OnTimeout(now);
@@ -115,6 +145,13 @@ internal static class QuicEndpointTests
 
     private static bool Echo(UdpClient client, int size)
     {
+        bool ok = EchoInner(client, size, out long back, out int written);
+        if (!ok) Console.WriteLine($"    echo {size}: written {written}, back {back}, client {client.C.CloseCode} {client.C.CloseReason}");
+        return ok;
+    }
+
+    private static bool EchoInner(UdpClient client, int size, out long backLen, out int writtenOut)
+    {
         var data = new byte[size];
         new Random(size).NextBytes(data);
         long id = -1;
@@ -133,7 +170,9 @@ internal static class QuicEndpointTests
             bool f;
             while ((m = c.StreamRead(id, buf, out f, out _)) > 0 | f) { back.Write(buf, 0, m); fin |= f; if (f) break; }
             return fin;
-        });
+        }, timeoutMs: 20_000);
+        backLen = back.Length;
+        writtenOut = written;
         return ok && back.ToArray().AsSpan().SequenceEqual(data);
     }
 
@@ -150,6 +189,18 @@ internal static class QuicEndpointTests
             T.True(client.Run(() => client.C.IsClosed));
             T.True(SpinUntil(() => s.Endpoint.Connections == 0, 5000));
             T.Eq(0, s.Log.Errors);
+        });
+
+        T.Add("quic endpoint: 4 MB echoed with 64 KB windows each way (back-pressure through the application), sent with GSO", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            using var s = new Server();
+            var small = new QuicOptions { StreamReceiveWindow = 64 << 10, ConnectionReceiveWindow = 128 << 10 };
+            using var client = new UdpClient(s.EndPoint, s.ClientTls, o: small);
+            T.True(Echo(client, 4 << 20));
+            T.Eq(0, s.Log.Errors);
+            // On Linux the datagrams went out in GSO batches: far fewer sends than the ~3500 datagrams of the echo.
+            if (OperatingSystem.IsLinux()) { T.True(s.Endpoint.GsoActive); T.True(s.Endpoint.SendCalls < 3500); }
         });
 
         T.Add("quic endpoint: with Retry on, the client is validated first; a forged token makes no connection", () =>
@@ -253,5 +304,104 @@ internal static class QuicEndpointTests
         long until = Environment.TickCount64 + ms;
         while (!f()) { if (Environment.TickCount64 > until) return false; Thread.Sleep(10); }
         return true;
+    }
+}
+
+/// <summary>--bench-quic [MiB] [repeat]: a loopback download through the endpoint (server-side throughput, the HTTP/3 case).</summary>
+internal static class QuicBench
+{
+    /// <summary>Serves each stream's request ("N", in bytes) with N bytes, writing more as the stream drains.</summary>
+    private sealed class DownloadApp : IQuicApplication
+    {
+        private readonly byte[] _chunk = new byte[256 << 10];
+        private readonly Dictionary<(QuicConnection, long), long> _left = new();
+        private readonly byte[] _buf = new byte[64];
+
+        public void OnEvent(QuicConnection c, in QuicEvent e, long now)
+        {
+            var key = (c, e.StreamId);
+            if (e.Kind == QuicEventKind.StreamReadable && !_left.ContainsKey(key))
+            {
+                int n = c.StreamRead(e.StreamId, _buf, out bool fin, out _);
+                if (n > 0) _left[key] = long.Parse(System.Text.Encoding.ASCII.GetString(_buf, 0, n));
+            }
+            if (_left.TryGetValue(key, out long left) && left > 0)
+            {
+                while (left > 0)
+                {
+                    int w = c.StreamWrite(e.StreamId, _chunk.AsSpan(0, (int)Math.Min(_chunk.Length, left)), fin: left <= _chunk.Length);
+                    if (w <= 0) break;
+                    left -= w;
+                }
+                _left[key] = left;
+            }
+        }
+    }
+
+    /// <summary>CPU per thread, in jiffies (1/100 s): name/tid → utime + stime, from /proc.</summary>
+    private static Dictionary<string, long> ThreadCpu()
+    {
+        var d = new Dictionary<string, long>();
+        foreach (var t in Directory.GetDirectories("/proc/self/task"))
+        {
+            try
+            {
+                var comm = File.ReadAllText(Path.Combine(t, "comm")).Trim();
+                var f = File.ReadAllText(Path.Combine(t, "stat"));
+                var parts = f[(f.LastIndexOf(')') + 2)..].Split(' ');
+                d[comm + "/" + Path.GetFileName(t)] = long.Parse(parts[11]) + long.Parse(parts[12]);
+            }
+            catch (IOException) { }
+        }
+        return d;
+    }
+
+    public static int RunCli(string[] args)
+    {
+        if (QuicTls.Unavailable is { } why) { Console.WriteLine(why); return 1; }
+        long size = (args.Length > 1 ? long.Parse(args[1]) : 256) << 20;
+        int repeat = args.Length > 2 ? int.Parse(args[2]) : 3;
+        bool gso = !args.Contains("nogso");
+        var dir = Directory.CreateTempSubdirectory("httpgrl-quic-bench-").FullName;
+        ProxyTests.MakeCert("quic.test", dir, "q").Dispose();
+        using var tls = QuicTlsContext.Server(Path.Combine(dir, "q.crt"), Path.Combine(dir, "q.key"), ["bench"]);
+        using var ctls = QuicTlsContext.Client(Path.Combine(dir, "q.crt"));
+        using var socket = new System.Net.Sockets.Socket(System.Net.Sockets.AddressFamily.InterNetwork, System.Net.Sockets.SocketType.Dgram, System.Net.Sockets.ProtocolType.Udp);
+        socket.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        socket.ReceiveBufferSize = socket.SendBufferSize = 8 << 20;
+        var o = new QuicOptions { StreamReceiveWindow = 16 << 20, ConnectionReceiveWindow = 32 << 20, StreamSendBuffer = 8 << 20 };
+        using var ep = new QuicEndpoint(socket, tls, _ => tls, new DownloadApp(), new QuicEndpointTests.ErrorCounter(), new QuicEndpointOptions { Connection = o, Gso = gso });
+        ep.Start();
+        var before = ThreadCpu();
+        for (int run = 0; run < repeat; run++)
+        {
+            using var client = new QuicEndpointTests.UdpClient(socket.LocalEndPoint!, ctls, "bench", o);
+            client.Socket.ReceiveBufferSize = client.Socket.SendBufferSize = 8 << 20;
+            long id = -1, got = 0;
+            var buf = new byte[1 << 20];
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var cpu0 = Environment.ProcessorCount > 0 ? System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime : TimeSpan.Zero;
+            bool ok = client.Run(() =>
+            {
+                var c = client.C;
+                if (!c.HandshakeComplete) return false;
+                if (id < 0) { id = c.OpenStream(true); c.StreamWrite(id, System.Text.Encoding.ASCII.GetBytes(size.ToString()), true); sw.Restart(); }
+                while (c.TryGetEvent(out _)) { }
+                int n;
+                while ((n = c.StreamRead(id, buf, out bool fin, out _)) > 0) got += n;
+                return got >= size;
+            }, timeoutMs: 120_000);
+            double s = sw.Elapsed.TotalSeconds;
+            var cpu = System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime - cpu0;
+            var threads = ThreadCpu();
+            string top = string.Join(", ", threads.Where(t => t.Value - (before.TryGetValue(t.Key, out var b) ? b : 0) > s * 5)
+                .Select(t => $"{t.Key} {(t.Value - (before.TryGetValue(t.Key, out var b) ? b : 0)) / s:F0}%"));
+            before = threads;
+            Console.WriteLine($"bench-quic: {got >> 20} MiB in {s:F2} s = {got / s / (1 << 20):F0} MiB/s ({got * 8 / s / 1e9:F2} Gb/s), process CPU {cpu.TotalSeconds / s * 100:F0}%, " +
+                $"ok {ok}; gso {ep.GsoActive}, {ep.SendCalls} sends; threads: {top}");
+            client.C.Close(0, "", QuicEndpoint.Now());
+            client.Run(() => client.C.IsClosed, 1000);
+        }
+        return 0;
     }
 }

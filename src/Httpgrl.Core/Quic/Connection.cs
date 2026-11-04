@@ -551,7 +551,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         InstallInitialKeys(_dcid);
         // Start the Initial over: everything sent so far is forgotten, the ClientHello goes again from offset 0.
         var s = Recovery.Spaces[0];
-        foreach (var sp in s.Sent)
+        foreach (var sp in s.Sent.All())
             foreach (var f in sp.Frames)
                 if (f.Kind == SentKind.Crypto) _pns[0].CryptoSend.OnLost(f.A, (int)f.B, false);
         Recovery.Discard(0);
@@ -1241,8 +1241,8 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
                 if (p.Discarded && space == 0 && !_pns[1].Discarded) { space = 1; p = _pns[1]; }
                 p.Probes = 2;
                 var s = Recovery.Spaces[space];
-                if (s.Sent.Count > 0)
-                    foreach (var f in s.Sent[0].Frames)
+                if (s.Sent.Oldest is { } oldest)
+                    foreach (var f in oldest.Frames)
                     {
                         if (f.Kind == SentKind.Crypto) p.CryptoSend.OnLost(f.A, (int)f.B, false);
                         else if (f.Kind == SentKind.Stream && _streams.TryGetValue(f.Id, out var st) && st.Send is not null)

@@ -68,6 +68,10 @@ internal sealed class PacketKeys : IDisposable
 
     private readonly AesGcm _aead;
     private readonly Aes _hp;
+    // One reusable ECB encryptor: .NET's one-shot EncryptEcb sets up a cipher context per call, which costs more than
+    // the packet's AES-GCM (one 16-byte block per packet, here).
+    private readonly ICryptoTransform _hpEncryptor;
+    private readonly byte[] _sample = new byte[SampleLength];
     private readonly byte[] _iv = new byte[12];
     private readonly byte[] _mask = new byte[SampleLength];
 
@@ -99,6 +103,9 @@ internal sealed class PacketKeys : IDisposable
         _aead = new AesGcm(key, TagLength);
         _hp = Aes.Create();
         _hp.Key = hpKey;
+        _hp.Mode = CipherMode.ECB;
+        _hp.Padding = PaddingMode.None;
+        _hpEncryptor = _hp.CreateEncryptor();
         CryptographicOperations.ZeroMemory(key);
     }
 
@@ -124,7 +131,8 @@ internal sealed class PacketKeys : IDisposable
     /// <summary>The header-protection mask for a 16-byte sample.</summary>
     public void Mask(ReadOnlySpan<byte> sample, Span<byte> mask)
     {
-        _hp.EncryptEcb(sample[..SampleLength], _mask, PaddingMode.None);
+        sample[..SampleLength].CopyTo(_sample);
+        _hpEncryptor.TransformBlock(_sample, 0, SampleLength, _mask, 0);
         _mask.AsSpan(0, 5).CopyTo(mask);
     }
 
@@ -196,6 +204,7 @@ internal sealed class PacketKeys : IDisposable
     public void Dispose()
     {
         _aead.Dispose();
+        _hpEncryptor.Dispose();
         _hp.Dispose();
         CryptographicOperations.ZeroMemory(_iv);
         CryptographicOperations.ZeroMemory(_hpKey);
