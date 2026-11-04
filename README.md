@@ -129,6 +129,7 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `ssl_stapling_responder url;` | http, server | | Fetch from this URL instead of the certificate's. It changes where, not who: the response must still be signed by the issuer (or its delegate). |
 | `ssl_ocsp`, `ssl_trusted_certificate` | | | Not supported, and a config error rather than silently ignored. |
 | `disable_symlinks off\|on [from=$document_root\|/path];` | http, server, location | `off` | `on`: refuse (403) any path with a symlink in a component after `from` (default: after `/`, so a root reached through a symlink needs `from=$document_root`). Symlinks may lead out of the root, which a lexical containment check can't see. The check is race-free: one `openat(O_NOFOLLOW)` per component, each relative to the directory just opened, so a symlink can't be swapped in between check and open. `try_files`/`index` treat such paths as missing; directory listings hide symlinks, and enumerate the verified directory descriptor itself (through `/proc/self/fd`; without procfs, listings under `disable_symlinks` are refused with a 403 rather than done racily). `if_not_owner` isn't supported (a config error). Not on Windows. |
+| `underscores_in_headers on\|off;` | http, server | `off` | Request header names with `_` are ignored when off (taken from the default server, since it applies before `Host` picks one). See the security model for why. |
 | `server_tokens on\|off;` | | **`off`** | `off`: no `Server` header and no product name on error pages. `on`: `Server: httpgrl/<version>` plus the error-page footer. Note: nginx's `off` still sends a header; here `off` sends none. |
 | `access_log stdout\|off;` | | `stdout` | nginx's `access_log /path [format];` is accepted with a warning: records go to stdout as JSON anyway, and `log_format` is ignored. `error_log /path [level];` likewise (the level applies). That lets a stock nginx config load unchanged. |
 
@@ -376,8 +377,9 @@ Details:
 
 **Fuzzing.** Every parser of untrusted or semi-trusted bytes has a mutation-fuzz target in
 `tests/Httpgrl.Tests/Fuzz.cs`: the request head, the URI normalizer, chunked bodies, upstream response heads, the
-config parser (with every module's directives), CRLs, OCSP responses, PROXY protocol headers, `Accept-Encoding`
-and the tunnel handshake response. Each target states which rejections are legitimate and
+config parser (with every module's directives), CRLs, OCSP responses, PROXY protocol headers, `Accept-Encoding`,
+the tunnel handshake response, `Range`, `Host`/SNI names, rewrite results, and the mapping of request paths through
+`root`/`alias` (checked for containment independently of the mapper). Each target states which rejections are legitimate and
 which invariants an accepted input must hold (e.g. never both `Content-Length` and `chunked`, no dot segments
 in a path). The test suite runs a fixed-seed pass of each, so CI is also a regression fuzz. For long runs:
 
@@ -416,13 +418,20 @@ coverage-guided, so it's a complement to, not a replacement for, a coverage-guid
 **Strict parsing.**
 - Line endings must be CRLF. Bare LF or CR, obs-fold, and whitespace before `:` are rejected.
 - Exactly one `Content-Length`. `Transfer-Encoding` must be exactly `chunked` and never alongside `Content-Length`.
-- No `Transfer-Encoding` on HTTP/1.0. Exactly one `Host`, validated and lower-cased.
+- No `Transfer-Encoding` on HTTP/1.0. Exactly one `Host`, validated and lower-cased. An HTTP/1.1 request in absolute
+  form (`GET http://a.test/ HTTP/1.1`) still needs a valid `Host` field (RFC 9112 3.2), though the target's authority
+  is what selects the server. `$request_uri` is the origin-form path and query even then, as in nginx, so
+  `return 302 $request_uri;` can't be pointed at another host.
+- Header names containing `_` are ignored unless `underscores_in_headers on` (nginx's default too). CGI-style
+  backends (FastCGI, WSGI, Rack) fold `_` and `-` into one variable name, so `X_Client_Verify` would otherwise reach
+  them as the `X-Client-Verify` a proxy sets or strips.
 - Chunk sizes, chunk lines and trailers are bounded. Chunk extensions and trailer fields (which are dropped) must still be well-formed: no control characters, so no bare CR for another parser to read as a line end.
 - In short, anything a proxy in front of or behind the server could read differently is a 400. The future proxy module depends on this.
 
 **Paths.**
 - URIs are percent-decoded, dot-segments are resolved, and an escape above `/` is a 400. Control characters (`%00`–`%1F`, `%7F`) and invalid UTF-8 are rejected. **Deviation:** nginx accepts `%0A` in paths. A decoded newline in `$uri` could reach response or upstream headers, and slip past anchored regexes (`$` also matches before a trailing newline, in PCRE as in .NET). So `if ($uri ~ "^/admin$")` can't be fooled by `/admin%0A`.
-- Every mapped filesystem path is checked to stay inside its `root`/`alias` directory. This closes nginx's classic `location /img { alias /x/; }` + `/img../` hole.
+- Every mapped filesystem path is checked to stay inside its `root`/`alias` directory. This closes nginx's classic `location /img { alias /x/; }` + `/img../` hole. A value with variables is checked against its constant leading directory. One that *begins* with a variable (`root $doc;`) has none, so its evaluated value must be an absolute path without `.`/`..` segments, and is itself the boundary: whatever a variable holds, the request can't climb out of it. (Which directory a variable names is still the configuration's business: don't build one from request input.)
+- Regexes run on .NET's linear-time engine whenever the pattern allows it (no backreferences or lookarounds). The rest backtrack with a 50 ms match timeout. A timeout fails the request with a 500 and one `warn` line. Neither "matched" nor "didn't match" can be assumed without failing open somewhere (`if ($x ~ ...) { return 403; }` versus `!~`), and nginx also answers a failed regex execution with a 500.
 - Modules never see filesystem paths. They ask the core for resources by request path, so the mapping, containment and safe-open policy has exactly one implementation (`Core/Files/LocalFiles.cs`). CI enforces this with `scripts/check-boundaries.sh`.
 - Location matching is case-insensitive on case-insensitive filesystems.
 - On Windows, ADS names (`:`), trailing dots and spaces, and device names (`CON`, `NUL`, ...) are refused.
