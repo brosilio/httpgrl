@@ -3,6 +3,21 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
+## [0.3.0] - 2026-11-04
+
+### Changed (may need action)
+- TLS cipher suites now default to AEAD only. TLS 1.3 keeps its suites; TLS 1.2 offers ECDHE with AES-GCM or
+  ChaCha20-Poly1305. The CBC suites SSL Labs rates as weak, static-RSA key exchange and SHA-1 MACs are gone. Very old
+  TLS 1.2 clients that only speak CBC (roughly pre-2014 browsers) can no longer connect: list the suites you need in
+  `ssl_ciphers` to bring them back.
+
+### Added
+- `ssl_ciphers` is implemented (it was accepted and ignored). A list of suite names, OpenSSL or IANA form, gives
+  exactly those suites for TLS 1.2, in order; TLS 1.3 keeps its own unless the list names some. Unknown names are a
+  config error, and broken suites (NULL, anonymous, export, RC4, DES/3DES, MD5) are refused. OpenSSL cipher
+  expressions (`HIGH:!aNULL:!MD5`) log a warning and the default applies. On Windows the OS chooses, and an explicit
+  list is a config error.
+
 ## [0.2.0] - 2026-11-04
 
 Security fixes from a test and fuzzing sweep. Minor bump because one default changed behaviour (see "Changed").
@@ -69,5 +84,6 @@ configuration, native AOT, strict security defaults, compiled-in modules and sin
 - A dependency-free test suite that runs on the JIT and as native AOT, mutation fuzz targets for every parser of
   untrusted bytes, a soak test and a load generator.
 
+[0.3.0]: https://github.com/brosilio/httpgrl/releases/tag/v0.3.0
 [0.2.0]: https://github.com/brosilio/httpgrl/releases/tag/v0.2.0
 [0.1.0]: https://github.com/brosilio/httpgrl/releases/tag/v0.1.0
