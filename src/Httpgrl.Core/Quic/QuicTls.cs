@@ -46,7 +46,7 @@ internal sealed unsafe partial class QuicTls : IDisposable
     private const int SslCtrlSetTlsextServernameCb = 53, SslCtrlSetTlsextHostname = 55;
     private const int TlsextErrOk = 0, TlsextErrAlertFatal = 2, TlsextErrNoAck = 3;
     private const int AlertUnrecognizedName = 112, AlertNoApplicationProtocol = 120;
-    public const string CipherSuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384";
+    public const string CipherSuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256";
 
     [LibraryImport(LibSsl)] private static partial IntPtr TLS_method();
     [LibraryImport(LibSsl)] private static partial IntPtr SSL_CTX_new(IntPtr method);
@@ -90,6 +90,11 @@ internal sealed unsafe partial class QuicTls : IDisposable
     [LibraryImport(LibCrypto)] private static partial IntPtr OPENSSL_sk_value(IntPtr sk, int i);
     [LibraryImport(LibCrypto)] private static partial int i2d_X509(IntPtr x, byte** outp);
     [LibraryImport(LibCrypto)] private static partial void X509_free(IntPtr x);
+    [LibraryImport(LibCrypto)] private static partial IntPtr EVP_CIPHER_CTX_new();
+    [LibraryImport(LibCrypto)] private static partial void EVP_CIPHER_CTX_free(IntPtr ctx);
+    [LibraryImport(LibCrypto)] private static partial IntPtr EVP_chacha20();
+    [LibraryImport(LibCrypto)] private static partial int EVP_EncryptInit_ex(IntPtr ctx, IntPtr cipher, IntPtr engine, byte* key, byte* iv);
+    [LibraryImport(LibCrypto)] private static partial int EVP_EncryptUpdate(IntPtr ctx, byte* outp, int* outl, byte* inp, int inl);
     [LibraryImport(LibCrypto)] private static partial nuint ERR_get_error();
     [LibraryImport(LibCrypto)] private static partial void ERR_error_string_n(nuint e, byte* buf, nuint len);
     [LibraryImport(LibCrypto)] private static partial void ERR_clear_error();
@@ -368,8 +373,7 @@ internal sealed unsafe partial class QuicTls : IDisposable
             {
                 0x1301 => QuicCipher.Aes128Gcm,
                 0x1302 => QuicCipher.Aes256Gcm,
-                0 when len == 32 => QuicCipher.Aes128Gcm,
-                0 when len == 48 => QuicCipher.Aes256Gcm,
+                0x1303 => QuicCipher.ChaCha20,
                 _ => throw new QuicException(QuicError.InternalError, $"unsupported TLS cipher suite 0x{id:x4}"),
             };
             if ((int)len != QuicKeys.SecretLength(cipher)) throw new QuicException(QuicError.InternalError, "secret length doesn't match the cipher suite");
@@ -463,12 +467,12 @@ internal sealed unsafe partial class QuicTls : IDisposable
         return SSL_select_next_proto(outp, outlen, ours, (uint)len, inp, inlen) == 1 ? TlsextErrOk : TlsextErrAlertFatal;
     }
 
-    internal static IntPtr NewContext(bool server, string[] alpn, out IntPtr alpnArg)
+    internal static IntPtr NewContext(bool server, string[] alpn, out IntPtr alpnArg, string? suites = null)
     {
         alpnArg = IntPtr.Zero;
         var ctx = SSL_CTX_new(TLS_method());
         if (ctx == IntPtr.Zero) throw new InvalidOperationException("SSL_CTX_new failed: " + LastError());
-        if (SSL_CTX_set_ciphersuites(ctx, CipherSuites) != 1)
+        if (SSL_CTX_set_ciphersuites(ctx, suites ?? CipherSuites) != 1)
         {
             SSL_CTX_free(ctx);
             throw new InvalidOperationException("SSL_CTX_set_ciphersuites failed: " + LastError());
@@ -518,6 +522,16 @@ internal sealed unsafe partial class QuicTls : IDisposable
         SSL_CTX_set_verify(ctx, 1 /* SSL_VERIFY_PEER */, IntPtr.Zero);
     }
 
+    internal static IntPtr EvpNew() => EVP_CIPHER_CTX_new();
+    internal static void EvpFree(IntPtr ctx) => EVP_CIPHER_CTX_free(ctx);
+    internal static IntPtr EvpChaCha20() => EVP_chacha20();
+    internal static bool EvpInit(IntPtr ctx, IntPtr cipher, byte* key, byte* iv) => EVP_EncryptInit_ex(ctx, cipher, IntPtr.Zero, key, iv) == 1;
+    internal static bool EvpUpdate(IntPtr ctx, byte* outp, byte* inp, int len)
+    {
+        int n;
+        return EVP_EncryptUpdate(ctx, outp, &n, inp, len) == 1 && n == len;
+    }
+
     internal static void FreeContext(IntPtr ctx, IntPtr alpnArg)
     {
         SSL_CTX_free(ctx);
@@ -546,6 +560,41 @@ internal sealed unsafe partial class QuicTls : IDisposable
         if (_rcd != null) NativeMemory.Free(_rcd);
         if (_ourParams != null) NativeMemory.Free(_ourParams);
     }
+}
+
+/// <summary>
+/// ChaCha20 header protection (RFC 9001 5.4.4): the raw ChaCha20 block function, which .NET doesn't expose, from
+/// OpenSSL's EVP. The 16-byte sample is the IV as OpenSSL takes it (a little-endian block counter, then the nonce);
+/// the mask is the keystream's first 5 bytes.
+/// </summary>
+internal sealed unsafe class ChaChaMask : IDisposable
+{
+    private IntPtr _ctx;
+
+    public ChaChaMask(ReadOnlySpan<byte> key)
+    {
+        _ctx = QuicTls.EvpNew();
+        fixed (byte* k = key)
+            if (_ctx == IntPtr.Zero || !QuicTls.EvpInit(_ctx, QuicTls.EvpChaCha20(), k, null)) throw new InvalidOperationException("ChaCha20 unavailable in OpenSSL");
+    }
+
+    public void Mask(ReadOnlySpan<byte> sample, Span<byte> mask)
+    {
+        byte* zeros = stackalloc byte[5];
+        new Span<byte>(zeros, 5).Clear();
+        fixed (byte* iv = sample)
+        fixed (byte* m = mask)
+        {
+            if (!QuicTls.EvpInit(_ctx, IntPtr.Zero, null, iv) || !QuicTls.EvpUpdate(_ctx, m, zeros, 5)) throw new InvalidOperationException("ChaCha20 failed");
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_ctx != IntPtr.Zero) { QuicTls.EvpFree(_ctx); _ctx = IntPtr.Zero; }
+    }
+
+    ~ChaChaMask() { if (_ctx != IntPtr.Zero) QuicTls.EvpFree(_ctx); }
 }
 
 /// <summary>
@@ -591,9 +640,9 @@ internal sealed class QuicTlsContext : IDisposable
     /// A client context, verifying the server against <paramref name="caFile"/> (or nothing, for interop probes), and
     /// presenting <paramref name="certFile"/> / <paramref name="keyFile"/> when a server asks for a certificate.
     /// </summary>
-    public static QuicTlsContext Client(string? caFile, string? certFile = null, string? keyFile = null)
+    public static QuicTlsContext Client(string? caFile, string? certFile = null, string? keyFile = null, string? suites = null)
     {
-        var ctx = QuicTls.NewContext(server: false, [], out _);
+        var ctx = QuicTls.NewContext(server: false, [], out _, suites);
         try
         {
             if (caFile is not null) QuicTls.LoadVerify(ctx, caFile);

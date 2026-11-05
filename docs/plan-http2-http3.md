@@ -16,8 +16,8 @@ Status (2026-11-04): Phases 0 to 3 (HTTP/2, QUIC, HTTP/3) are done; Phase 4 (har
      This is the same `libssl.so.3` .NET loads, and it's already present on Debian 13 (checked here and on the
      production box). Certificates, signature algorithms and `X25519MLKEM768` come with it.
    - **QUIC packet protection:** .NET's `AesGcm`, AES-ECB (header protection) and `HKDF`, which call OpenSSL.
-     Initially QUIC offers only the AES-GCM suites. The ChaCha20 header-protection mask needs raw ChaCha20, which
-     .NET doesn't expose, and AES-GCM is the mandatory suite anyway. ChaCha20 can come later through OpenSSL's EVP.
+     ChaCha20-Poly1305 too: .NET's AEAD, with the header-protection mask (raw ChaCha20, which .NET doesn't expose)
+     from OpenSSL's EVP.
 4. **HTTP/3 is Linux-only and needs OpenSSL 3.5 or newer.** Elsewhere, a `quic` listener logs once why HTTP/3 is
    unavailable, and the server starts anyway (`-t` reports it too), so one config file works on old and new systems.
    HTTP/1.1 and HTTP/2 are unaffected.

@@ -3,11 +3,13 @@ using System.Security.Cryptography;
 
 namespace Httpgrl.Core.Quic;
 
-/// <summary>The AEADs QUIC packets are protected with (RFC 9001 5). ChaCha20-Poly1305 needs raw ChaCha20 for header protection, which .NET lacks.</summary>
+/// <summary>The AEADs QUIC packets are protected with (RFC 9001 5).</summary>
 internal enum QuicCipher : byte
 {
     Aes128Gcm,
     Aes256Gcm,
+    /// <summary>For clients without AES hardware. Header protection is raw ChaCha20 (from OpenSSL, see ChaChaMask).</summary>
+    ChaCha20,
 }
 
 /// <summary>
@@ -19,7 +21,7 @@ internal static class QuicKeys
     private static ReadOnlySpan<byte> InitialSaltV1 => [0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a];
 
     public static HashAlgorithmName Hash(QuicCipher c) => c == QuicCipher.Aes256Gcm ? HashAlgorithmName.SHA384 : HashAlgorithmName.SHA256;
-    public static int KeyLength(QuicCipher c) => c == QuicCipher.Aes256Gcm ? 32 : 16;
+    public static int KeyLength(QuicCipher c) => c == QuicCipher.Aes128Gcm ? 16 : 32;
     public static int SecretLength(QuicCipher c) => c == QuicCipher.Aes256Gcm ? 48 : 32;
 
     /// <summary>HKDF-Expand-Label(secret, label, "", output.Length) of TLS 1.3 (RFC 8446 7.1), with no context.</summary>
@@ -66,11 +68,13 @@ internal sealed class PacketKeys : IDisposable
     public const int TagLength = 16;
     public const int SampleLength = 16;
 
-    private readonly AesGcm _aead;
-    private readonly Aes _hp;
+    private readonly AesGcm? _aead;
+    private readonly ChaCha20Poly1305? _chacha;
+    private readonly Aes? _hp;
     // One reusable ECB encryptor: .NET's one-shot EncryptEcb sets up a cipher context per call, which costs more than
     // the packet's AES-GCM (one 16-byte block per packet, here).
-    private readonly ICryptoTransform _hpEncryptor;
+    private readonly ICryptoTransform? _hpEncryptor;
+    private readonly ChaChaMask? _hpChaCha;
     private readonly byte[] _sample = new byte[SampleLength];
     private readonly byte[] _iv = new byte[12];
     private readonly byte[] _mask = new byte[SampleLength];
@@ -83,6 +87,8 @@ internal sealed class PacketKeys : IDisposable
 
     /// <summary>AES-GCM's limits (RFC 9001 6.6): update keys before 2^23 packets; give up after 2^52 forgeries.</summary>
     public const long ConfidentialityLimit = 1L << 23, IntegrityLimit = 1L << 52;
+    /// <summary>The integrity limit for this key's AEAD: ChaCha20-Poly1305's is 2^36 (its confidentiality limit is beyond reach).</summary>
+    public long ForgeryLimit => Cipher == QuicCipher.ChaCha20 ? 1L << 36 : IntegrityLimit;
 
     public PacketKeys(QuicCipher cipher, ReadOnlySpan<byte> secret) : this(cipher, secret, null) { }
 
@@ -100,12 +106,20 @@ internal sealed class PacketKeys : IDisposable
             QuicKeys.ExpandLabel(hash, secret, "quic hp"u8, hpKey);
         }
         _hpKey = hpKey;
-        _aead = new AesGcm(key, TagLength);
-        _hp = Aes.Create();
-        _hp.Key = hpKey;
-        _hp.Mode = CipherMode.ECB;
-        _hp.Padding = PaddingMode.None;
-        _hpEncryptor = _hp.CreateEncryptor();
+        if (cipher == QuicCipher.ChaCha20)
+        {
+            _chacha = new ChaCha20Poly1305(key);
+            _hpChaCha = new ChaChaMask(hpKey);
+        }
+        else
+        {
+            _aead = new AesGcm(key, TagLength);
+            _hp = Aes.Create();
+            _hp.Key = hpKey;
+            _hp.Mode = CipherMode.ECB;
+            _hp.Padding = PaddingMode.None;
+            _hpEncryptor = _hp.CreateEncryptor();
+        }
         CryptographicOperations.ZeroMemory(key);
     }
 
@@ -131,8 +145,9 @@ internal sealed class PacketKeys : IDisposable
     /// <summary>The header-protection mask for a 16-byte sample.</summary>
     public void Mask(ReadOnlySpan<byte> sample, Span<byte> mask)
     {
+        if (_hpChaCha is not null) { _hpChaCha.Mask(sample[..SampleLength], mask[..5]); return; }
         sample[..SampleLength].CopyTo(_sample);
-        _hpEncryptor.TransformBlock(_sample, 0, SampleLength, _mask, 0);
+        _hpEncryptor!.TransformBlock(_sample, 0, SampleLength, _mask, 0);
         _mask.AsSpan(0, 5).CopyTo(mask);
     }
 
@@ -148,7 +163,8 @@ internal sealed class PacketKeys : IDisposable
         Span<byte> nonce = stackalloc byte[12];
         Nonce(nonce, pn);
         var payload = packet.Slice(headerLen, payloadLen);
-        _aead.Encrypt(nonce, payload, payload, packet.Slice(headerLen + payloadLen, TagLength), packet[..headerLen]);
+        if (_chacha is not null) _chacha.Encrypt(nonce, payload, payload, packet.Slice(headerLen + payloadLen, TagLength), packet[..headerLen]);
+        else _aead!.Encrypt(nonce, payload, payload, packet.Slice(headerLen + payloadLen, TagLength), packet[..headerLen]);
         Sealed++;
 
         // Header protection, sampled 4 bytes after the start of the packet number (RFC 9001 5.4.2).
@@ -191,7 +207,8 @@ internal sealed class PacketKeys : IDisposable
         var ct = packet.Slice(headerLength, ctLen);
         try
         {
-            _aead.Decrypt(nonce, ct, packet.Slice(headerLength + ctLen, TagLength), ct, packet[..headerLength]);
+            if (_chacha is not null) _chacha.Decrypt(nonce, ct, packet.Slice(headerLength + ctLen, TagLength), ct, packet[..headerLength]);
+            else _aead!.Decrypt(nonce, ct, packet.Slice(headerLength + ctLen, TagLength), ct, packet[..headerLength]);
             return true;
         }
         catch (AuthenticationTagMismatchException)
@@ -203,9 +220,11 @@ internal sealed class PacketKeys : IDisposable
 
     public void Dispose()
     {
-        _aead.Dispose();
-        _hpEncryptor.Dispose();
-        _hp.Dispose();
+        _aead?.Dispose();
+        _chacha?.Dispose();
+        _hpEncryptor?.Dispose();
+        _hp?.Dispose();
+        _hpChaCha?.Dispose();
         CryptographicOperations.ZeroMemory(_iv);
         CryptographicOperations.ZeroMemory(_hpKey);
     }

@@ -49,13 +49,13 @@ internal sealed class QuicNet : IDisposable
 
     public static Func<(byte[], byte[])> Cids => () => (RandomNumberGenerator.GetBytes(8), RandomNumberGenerator.GetBytes(16));
 
-    public QuicNet(int seed = 1, QuicOptions? server = null, QuicOptions? client = null, string[]? alpn = null)
+    public QuicNet(int seed = 1, QuicOptions? server = null, QuicOptions? client = null, string[]? alpn = null, string? clientSuites = null)
     {
         _rng = new Random(seed);
         _dir = Directory.CreateTempSubdirectory("httpgrl-quicnet-").FullName;
         ProxyTests.MakeCert("quic.test", _dir, "q").Dispose();
         ServerTls = QuicTlsContext.Server(Path.Combine(_dir, "q.crt"), Path.Combine(_dir, "q.key"), ["test"]);
-        ClientTls = QuicTlsContext.Client(Path.Combine(_dir, "q.crt"));
+        ClientTls = QuicTlsContext.Client(Path.Combine(_dir, "q.crt"), suites: clientSuites);
         ServerOptions = server ?? new QuicOptions();
         ClientOptions = client ?? new QuicOptions();
         Client = QuicConnection.Client(ClientTls, "quic.test", alpn ?? ["test"], ClientOptions, Cids, ServerAddress, Now);

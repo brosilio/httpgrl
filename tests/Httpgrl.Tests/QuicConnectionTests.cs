@@ -279,6 +279,16 @@ internal static class QuicConnectionTests
             T.True(unpacedBurst > pacedBurst * 2);
         });
 
+        T.Add("quic connection: a client offering only ChaCha20-Poly1305 gets it, through loss and key updates", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            using var net = new QuicNet(seed: 11, server: new QuicOptions { KeyUpdateAfter = 60 }, client: new QuicOptions { KeyUpdateAfter = 60 },
+                clientSuites: "TLS_CHACHA20_POLY1305_SHA256") { Loss = 0.03, JitterUs = 10_000 };
+            T.True(Echo(net, 500_000));
+            T.Eq(QuicCipher.ChaCha20, net.Server!.Cipher);
+            T.True(net.Server.KeyUpdates > 0);
+        });
+
         T.Add("quic connection: small flow-control windows and a slow link still move 2 MiB (window updates, blocking)", () =>
         {
             if (QuicTls.Unavailable is not null) return;

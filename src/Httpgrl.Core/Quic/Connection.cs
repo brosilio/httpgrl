@@ -137,6 +137,8 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     private long _recvPhaseStartPn, _prevRecvUntil;
     private long _keyUpdatePn = -1;   // the first packet sent under our latest send keys
     public int KeyUpdates { get; private set; }
+    /// <summary>The negotiated 1-RTT AEAD (meaningful once the handshake is complete).</summary>
+    public QuicCipher Cipher => _appCipher;
 
     // Datagrams.
     private readonly Queue<byte[]> _dgOut = new(), _dgIn = new();
@@ -420,7 +422,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
                 Finish();
                 return;
             }
-            if (p.Recv.Forged >= PacketKeys.IntegrityLimit) CloseWithError(QuicError.AeadLimitReached, 0, "too many forged packets", app: false, now);
+            if (p.Recv.Forged >= p.Recv.ForgeryLimit) CloseWithError(QuicError.AeadLimitReached, 0, "too many forged packets", app: false, now);
             return;
         }
         // Reserved bits must be zero once protection is off (RFC 9000 17.2, 17.3.1).

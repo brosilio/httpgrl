@@ -91,6 +91,29 @@ internal static class QuicTests
                 Convert.ToHexStringLower(QuicKeys.NextSecret(QuicCipher.Aes128Gcm, H("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"))));
         });
 
+        T.Add("quic protection: ChaCha20-Poly1305 reproduces RFC 9001 A.5 (key, IV, header-protection mask, the 21-byte packet)", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            var secret = H("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b");
+            using var k = new PacketKeys(QuicCipher.ChaCha20, secret);
+            T.Eq("e0459b3474bdd0e44a41c144", Convert.ToHexStringLower(k.Iv));
+            Span<byte> mask = stackalloc byte[5];
+            k.Mask(H("5e5cd55c41f69080575d7999c25a5bfb"), mask);
+            T.Eq("aefefe7d03", Convert.ToHexStringLower(mask));
+            var packet = new byte[4 + 1 + 16];
+            H("4200bff4").CopyTo(packet, 0);
+            packet[4] = 0x01; // PING
+            k.Seal(packet, 1, 3, 654360564);
+            T.Eq("4cfe4189655e5cd55c41f69080575d7999c25a5bfb", Convert.ToHexStringLower(packet));
+            // And back: unmask, decode the packet number, open.
+            using var r = new PacketKeys(QuicCipher.ChaCha20, secret);
+            int pnLen = r.Unmask(packet, 1, out ulong tr);
+            T.Eq(3, pnLen);
+            T.Eq(654360564L, Packets.DecodePacketNumber(654360563, tr, 24));
+            T.True(r.Open(packet, 4, 654360564));
+            T.Eq(1, (int)packet[4]);
+        });
+
         T.Add("quic protection: sealing the RFC 9001 client and server Initials gives the RFC's bytes", () =>
         {
             var (client, server) = QuicKeys.InitialSecrets(H("8394c8f03e515708"));
