@@ -3,6 +3,22 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
+## [0.4.3] - 2026-11-05
+
+### Added
+- HTTP/3 for servers with `ssl_verify_client`. OpenSSL collects the client's certificate during the QUIC handshake,
+  and the same verification as on TCP judges it: the CA bundle only, depth, key usage, `ssl_crl` failing closed, and
+  `$ssl_client_verify`. A refusal closes with TLS's alert (`certificate_required`, `bad_certificate`). A Host leading
+  to a server with a different client-certificate policy gets 421, as on TCP. These servers issue no session tickets.
+  They now get HTTP/3 and Alt-Svc (before, they were kept off HTTP/3).
+- ChaCha20-Poly1305 for QUIC, alongside AES-GCM. The client picks, so devices without AES hardware get it. Header
+  protection uses OpenSSL's raw ChaCha20.
+- A test pins TLS session resumption over QUIC (it already worked); 0-RTT stays refused.
+
+### Fixed
+- Switching server on SNI during a QUIC handshake now applies that server's client-certificate settings. OpenSSL's
+  context switch alone keeps the first context's.
+
 ## [0.4.2] - 2026-11-05
 
 ### Fixed
