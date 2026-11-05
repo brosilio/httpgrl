@@ -225,6 +225,36 @@ internal static class Http3SessionTests
             }
         });
 
+        Case("TLS sessions resume over QUIC (OpenSSL's client), never on servers that check client certificates (skipped without openssl -quic)", async () =>
+        {
+            if (!OpenSslHasQuic()) { Console.WriteLine("    (skipped: openssl without -quic)"); return; }
+            var conf = """
+                http { http3 on; ssl_certificate {DIR}/h3.crt; ssl_certificate_key {DIR}/h3.key;
+                  server { listen 127.0.0.1:0 ssl; listen 127.0.0.1:0 quic; server_name h3.test; root {DIR}/www; }
+                  server { listen 127.0.0.1:0 ssl; listen 127.0.0.1:0 quic; server_name secure.test; root {DIR}/www;
+                    ssl_verify_client optional_no_ca; } }
+                """;
+            await using var s = TestServer.Start(conf, Populate);
+            var q = s.QuicEndPoint;
+            string Handshake(string sni, string sessFlag, string sessFile)
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("openssl", ["s_client", "-quic", "-alpn", "h3", "-connect", $"127.0.0.1:{q.Port}",
+                    "-servername", sni, "-CAfile", Path.Combine(s.Dir, "h3.crt"), sessFlag, sessFile]) { RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                using var p = System.Diagnostics.Process.Start(psi)!;
+                Thread.Sleep(700); // long enough for the post-handshake ticket
+                p.StandardInput.Close();
+                string o = p.StandardOutput.ReadToEnd();
+                p.WaitForExit(5000);
+                return o.Contains("Reused, TLSv1.3") ? "reused" : o.Contains("New, TLSv1.3") ? "new" : "failed";
+            }
+            var sess = Path.Combine(s.Dir, "sess.pem");
+            T.Eq("new", Handshake("h3.test", "-sess_out", sess));
+            T.Eq("reused", Handshake("h3.test", "-sess_in", sess));
+            var sess2 = Path.Combine(s.Dir, "sess2.pem");
+            T.Eq("new", Handshake("secure.test", "-sess_out", sess2));
+            T.True(!File.Exists(sess2) || Handshake("secure.test", "-sess_in", sess2) == "new"); // no ticket to resume with
+        });
+
         Case("a default server with ssl_reject_handshake: named servers get HTTP/3; no SNI, or the default's name, gets no handshake", async () =>
         {
             var conf = """
@@ -329,6 +359,19 @@ internal static class Http3SessionTests
             using var fresh = Client(s);
             T.Eq("200", fresh.Get("/index.html").Status);
         });
+    }
+
+    private static bool OpenSslHasQuic()
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("openssl", ["s_client", "-help"]) { RedirectStandardOutput = true, RedirectStandardError = true };
+            using var p = System.Diagnostics.Process.Start(psi)!;
+            string v = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+            p.WaitForExit();
+            return v.Contains("-quic", StringComparison.Ordinal);
+        }
+        catch (System.ComponentModel.Win32Exception) { return false; }
     }
 
     private static bool CurlHasHttp3()
