@@ -163,7 +163,9 @@ internal static class TunnelTests
             T.True(sw.ElapsedMilliseconds < 2500); // at most the 1s connect timeout, then immediately once it's been empty that long
             sw.Restart();
             T.Eq(502, Status(await Https(remote.Port, "GET / HTTP/1.1\r\nHost: relay.test\r\nConnection: close\r\n\r\n")));
-            T.True(sw.ElapsedMilliseconds < 500);
+            // Immediately: not another 1 s connect timeout. (The bound includes a TLS handshake, slow on a loaded machine,
+            // so it sits just under the timeout rather than at a fixed "fast".)
+            T.True(sw.ElapsedMilliseconds < 950);
             T.Contains("no tunnel connection available", remote.LogText());
 
             await using (var agent = TestServer.Start(AgentConf(remote.Port), PopulateAgent))
