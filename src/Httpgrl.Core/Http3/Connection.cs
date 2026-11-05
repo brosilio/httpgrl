@@ -108,7 +108,7 @@ internal sealed class Http3Connection
 
     private void OnConnected()
     {
-        _info.SetTls(Q.ServerName, "TLSv1.3", null, null);
+        _info.SetTls(Q.ServerName, "TLSv1.3", Q.ClientCertificate, Q.ClientVerify);
         // Our control stream, with SETTINGS first (RFC 9114 6.2.1). No QPACK streams: our dynamic table is zero and we
         // never use the peer's (RFC 9204 4.2 lets us skip them).
         _control = Q.OpenStream(bidi: false);
@@ -423,7 +423,7 @@ internal sealed class Http3Connection
         var ctx = s.Ctx;
         try
         {
-            int reject = RequestLifecycle.Route(ctx, _hosts, TlsServer(), code > 0 ? code : 0, clientAuthDone: false);
+            int reject = RequestLifecycle.Route(ctx, _hosts, TlsServer(), code > 0 ? code : 0);
             ctx.SetKeepAlive(true);
             s.Phase = "processing";
             bool clean = await RequestLifecycle.RunAsync(ctx, reject).ConfigureAwait(false);
@@ -447,8 +447,19 @@ internal sealed class Http3Connection
         }
     }
 
-    /// <summary>The server the client's TLS handshake chose (SNI): its client-certificate policy is what Route checks.</summary>
-    private ServerRt TlsServer() => Q.ServerName is { } sni ? _hosts.Resolve(sni) : _hosts.Default;
+    /// <summary>
+    /// The server whose context the handshake finished under (SNI): its client-certificate policy is what was checked,
+    /// so Route refuses (421) a Host leading to a server with a different one, exactly as on TCP.
+    /// </summary>
+    private ServerRt TlsServer()
+    {
+        var s = Q.ServerName is { } sni ? _hosts.Resolve(sni) : _hosts.Default;
+        // The context may differ from that server's (no SNI, or the default had none): find the one it belongs to.
+        if (!ReferenceEquals(s.Scope.Get<SslConf>().QuicTls, Q.TlsContext))
+            foreach (var x in _hosts.Servers)
+                if (ReferenceEquals(x.Scope.Get<SslConf>().QuicTls, Q.TlsContext)) return x;
+        return s;
+    }
 
     /// <summary>Handler side: put bytes on the stream, waiting until QUIC has taken them (back-pressure).</summary>
     public ValueTask WriteAsync(H3Stream s, ReadOnlyMemory<byte> data, bool fin)

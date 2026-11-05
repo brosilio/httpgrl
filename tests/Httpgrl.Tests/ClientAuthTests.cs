@@ -14,7 +14,7 @@ internal static class ClientAuthTests
 {
     private const string Rejected = "<<REJECTED>>";
 
-    private static readonly Pki P = new();
+    internal static readonly Pki P = new();
 
     // One TLS port, two names: open.test asks for nothing, secure.test applies the policy under test.
     private static string Conf(string verify, string extra = "") => $$"""
@@ -211,7 +211,7 @@ internal static class ClientAuthTests
     private static Task<string> GetPath(int port, X509Certificate2? cert, string path) =>
         Get(port, "secure.test", cert, path: path);
 
-    private static string CrlPem(X509Certificate2 issuer, params X509Certificate2[] revoked) =>
+    internal static string CrlPem(X509Certificate2 issuer, params X509Certificate2[] revoked) =>
         CrlPem(issuer, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1), revoked);
 
     private static string CrlPem(X509Certificate2 issuer, DateTimeOffset thisUpdate, DateTimeOffset nextUpdate, params X509Certificate2[] revoked)
@@ -249,7 +249,7 @@ internal static class ClientAuthTests
     }
 
     /// <summary>A throwaway PKI: root → (alice, expired, server-only), root → intermediate → bob, and an unrelated CA → mallory.</summary>
-    private sealed class Pki
+    internal sealed class Pki
     {
         public readonly X509Certificate2 Root, Intermediate, Server, Alice, Bob, Carol, Mallory, Expired, ServerOnly;
         public readonly string ServerKey;

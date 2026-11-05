@@ -156,24 +156,73 @@ internal static class Http3SessionTests
                 T.Contains("Alt-Svc: clear", await TlsGet(s.Port, "/index.html"));
         });
 
-        Case("a server that requires client certificates isn't reachable over HTTP/3 (421), and gets no Alt-Svc", async () =>
+        Case("client certificates over HTTP/3: the same verdicts as TCP (CA-only, chain, expiry, purpose, CRL), refusals with TLS alerts", async () =>
         {
-            var conf = $$"""
-                http {
-                  server { listen 127.0.0.1:0 ssl; listen 127.0.0.1:0 quic; server_name h3.test; http3 on;
-                    ssl_certificate {DIR}/h3.crt; ssl_certificate_key {DIR}/h3.key; root {DIR}/www; }
-                  server { listen 127.0.0.1:0 ssl; listen 127.0.0.1:0 quic; server_name secure.test; http3 on;
-                    ssl_certificate {DIR}/h3.crt; ssl_certificate_key {DIR}/h3.key; root {DIR}/www;
-                    ssl_verify_client on; ssl_client_certificate {DIR}/h3.crt; }
-                }
+            var pki = ClientAuthTests.P;
+            string Conf(string mode, string extra = "") => $$"""
+                http { ssl_certificate {DIR}/srv.crt; ssl_certificate_key {DIR}/srv.key; http3 on;
+                  server { listen 127.0.0.1:0 ssl default_server; listen 127.0.0.1:0 quic default_server; server_name open.test; return 200 "open"; }
+                  server { listen 127.0.0.1:0 ssl; listen 127.0.0.1:0 quic; server_name secure.test;
+                    ssl_verify_client {{mode}}; ssl_client_certificate {DIR}/ca.crt; ssl_verify_depth 2; {{extra}}
+                    return 200 "$ssl_client_verify|$ssl_client_s_dn"; } }
                 """;
-            await using var s = TestServer.Start(conf, Populate);
-            using var c = Client(s);
-            T.Eq("200", c.Get("/index.html").Status);
-            // The handshake was for h3.test; a Host (authority) naming the client-certificate server: misdirected.
-            var r = c.Wait(c.SendRaw(H3Client.Headers((":method", "GET"), (":scheme", "https"), (":authority", "secure.test"), (":path", "/index.html"))));
-            T.Eq("421", r.Status);
-            T.Contains("no HTTP/3 for a server that requires client certificates", s.LogText());
+            void Populate(string d)
+            {
+                File.WriteAllText(Path.Combine(d, "srv.crt"), pki.Server.ExportCertificatePem());
+                File.WriteAllText(Path.Combine(d, "srv.key"), pki.ServerKey);
+                File.WriteAllText(Path.Combine(d, "ca.crt"), pki.Root.ExportCertificatePem());
+                foreach (var (name, cert, chain) in new[] { ("alice", pki.Alice, (System.Security.Cryptography.X509Certificates.X509Certificate2?)null),
+                    ("bob", pki.Bob, pki.Intermediate), ("mallory", pki.Mallory, null), ("expired", pki.Expired, null), ("serveronly", pki.ServerOnly, null) })
+                {
+                    File.WriteAllText(Path.Combine(d, name + ".crt"), cert.ExportCertificatePem() + "\n" + (chain?.ExportCertificatePem() ?? ""));
+                    File.WriteAllText(Path.Combine(d, name + ".key"), System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions.GetECDsaPrivateKey(cert)!.ExportPkcs8PrivateKeyPem());
+                }
+                File.WriteAllText(Path.Combine(d, "crl.pem"), ClientAuthTests.CrlPem(pki.Root, pki.Carol, pki.Alice));
+            }
+            H3Client Connect(TestServer s, string sni, string? who)
+            {
+                var c = new H3Client(s.QuicEndPoint, Path.Combine(s.Dir, "srv.crt"), sni,
+                    certFile: who is null ? null : Path.Combine(s.Dir, who + ".crt"), keyFile: who is null ? null : Path.Combine(s.Dir, who + ".key"));
+                c.Connect();
+                return c;
+            }
+            // What the server did: the response body, or the TLS alert it closed with.
+            string Outcome(TestServer s, string? who, string sni = "secure.test", string authority = "secure.test")
+            {
+                using var c = Connect(s, sni, who);
+                if (!c.C.IsClosed && !c.C.IsDraining)
+                {
+                    var r = c.Wait(c.SendRaw(H3Client.Headers((":method", "GET"), (":scheme", "https"), (":authority", authority), (":path", "/"))), 5000);
+                    if (r.Status is not null) return r.Status == "200" ? r.Text : r.Status;
+                }
+                c.Udp.Run(() => c.C.IsClosed || c.C.IsDraining, 3000);
+                return c.C.CloseCode is >= QuicError.CryptoError and <= QuicError.CryptoError + 255 ? "alert " + (int)(c.C.CloseCode - QuicError.CryptoError) : "closed " + c.C.CloseCode;
+            }
+            await using (var s = TestServer.Start(Conf("on"), Populate))
+            {
+                T.Eq("SUCCESS|CN=alice", Outcome(s, "alice"));
+                T.Eq("SUCCESS|CN=bob", Outcome(s, "bob"));           // through the intermediate it sent
+                T.Eq("alert 116", Outcome(s, null));                 // certificate_required
+                T.Eq("alert 42", Outcome(s, "mallory"));             // another CA: bad_certificate
+                T.Eq("alert 42", Outcome(s, "expired"));
+                T.Eq("alert 42", Outcome(s, "serveronly"));          // not for client authentication
+                T.Eq("open", Outcome(s, null, "open.test", "open.test")); // the other name asks for nothing
+                // Host switches across policies: misdirected, both ways (as on TCP).
+                T.Eq("421", Outcome(s, null, "open.test", "secure.test"));
+                T.Eq("421", Outcome(s, "alice", "secure.test", "open.test"));
+            }
+            await using (var s = TestServer.Start(Conf("optional"), Populate))
+                T.Eq("NONE|", Outcome(s, null));
+            await using (var s = TestServer.Start(Conf("optional_no_ca"), Populate))
+            {
+                var o = Outcome(s, "mallory"); // accepted, with the reason recorded (its wording depends on the chain built)
+                T.True(o.StartsWith("FAILED:", StringComparison.Ordinal) && o.EndsWith("|CN=mallory", StringComparison.Ordinal));
+            }
+            await using (var s = TestServer.Start(Conf("on", "ssl_crl {DIR}/crl.pem;"), Populate))
+            {
+                T.Eq("alert 42", Outcome(s, "alice"));               // revoked
+                T.Eq("alert 42", Outcome(s, "bob"));                 // no CRL from its intermediate: fails closed
+            }
         });
 
         Case("a default server with ssl_reject_handshake: named servers get HTTP/3; no SNI, or the default's name, gets no handshake", async () =>

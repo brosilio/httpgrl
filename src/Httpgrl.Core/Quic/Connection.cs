@@ -159,6 +159,9 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     public bool AddressValidated => _addressValidated;
     public string? Alpn => _tls.Alpn;
     public string? ServerName => _tls.ServerName;
+    /// <summary>The client's certificate (servers that asked for one) and the verdict, as in $ssl_client_verify.</summary>
+    public System.Security.Cryptography.X509Certificates.X509Certificate2? ClientCertificate { get; private set; }
+    public string? ClientVerify { get; private set; }
     public QuicTlsContext TlsContext => _tls.Context;
     public byte[] SourceCid => _scid;
     public byte[] OriginalDcid => _originalDcid;
@@ -803,6 +806,19 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     /// <summary>After TLS made progress: install what it produced, and replay packets that were waiting for keys.</summary>
     private void AfterTls(long now)
     {
+        if (_tls.HandshakeComplete && _state == State.Handshake && IsServer && _tls.Context.ClientAuth is { } auth)
+        {
+            // A client certificate is judged here, by the same policy as on TCP, before anything 1-RTT is processed.
+            var (verdict, accept) = auth.Evaluate(_tls.PeerCertificate, _tls.PeerChain);
+            ClientVerify = verdict;
+            ClientCertificate = _tls.PeerCertificate;
+            if (!accept)
+            {
+                // certificate_required (116) when none came, bad_certificate (42) otherwise: TLS's own alerts, as CRYPTO_ERROR.
+                CloseWithError(QuicError.CryptoError + (ulong)(_tls.PeerCertificate is null ? 116 : 42), 0, "client certificate refused: " + verdict, app: false, now);
+                return;
+            }
+        }
         if (_tls.HandshakeComplete && _state == State.Handshake)
         {
             _state = State.Active;

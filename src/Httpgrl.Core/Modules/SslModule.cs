@@ -32,8 +32,9 @@ public sealed class SslConf : ScopeConfig<SslConf>
     /// <summary>Built in Configure when ssl_verify_client is not off; shared by servers with identical settings.</summary>
     public ClientAuth? ClientAuth;
     /// <summary>
-    /// The OpenSSL context for HTTP/3 (QUIC's TLS), for servers with a quic listener and http3 on. Null for servers
-    /// that require client certificates (not over HTTP/3 yet) or refuse handshakes: their names refuse QUIC handshakes.
+    /// The OpenSSL context for HTTP/3 (QUIC's TLS), for servers with a quic listener and http3 on. It carries the
+    /// server's client-certificate policy (judged after the handshake by the same code as TCP). Null for servers that
+    /// refuse handshakes: their names refuse QUIC handshakes too.
     /// </summary>
     internal Quic.QuicTlsContext? QuicTls;
 
@@ -121,11 +122,15 @@ public sealed class ClientAuth
         return ("FAILED:" + failure, Mode == VerifyClient.OptionalNoCa && caOnly);
     }
 
-    /// <summary>Verify with our policy outside the handshake callback (e.g. a resumed session).</summary>
-    public (string Verdict, bool Accept) Evaluate(X509Certificate2? cert)
+    /// <summary>
+    /// Verify with our policy outside the handshake callback (a resumed session; a QUIC handshake, whose client sent
+    /// <paramref name="intermediates"/> with its certificate). Intermediates help build the chain, never anchor it.
+    /// </summary>
+    public (string Verdict, bool Accept) Evaluate(X509Certificate2? cert, X509Certificate2Collection? intermediates = null)
     {
         if (cert is null) return Evaluate(null, null, SslPolicyErrors.RemoteCertificateNotAvailable);
         using var chain = new X509Chain { ChainPolicy = Policy.Clone() };
+        if (intermediates is { Count: > 0 }) chain.ChainPolicy.ExtraStore.AddRange(intermediates);
         bool ok = chain.Build(cert);
         return Evaluate(cert, chain, ok ? SslPolicyErrors.None : SslPolicyErrors.RemoteCertificateChainErrors);
     }
@@ -290,15 +295,15 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
                 {
                     if (!_quicWarned) { _quicWarned = true; setup.Log.Warn("HTTP/3 unavailable, quic listeners are skipped", new LogField("reason", why)); }
                 }
-                else if (auth is not null)
-                    setup.Log.Warn("no HTTP/3 for a server that requires client certificates (not supported over QUIC yet)", new LogField("at", server.Source.ToString()));
                 else
                 {
-                    if (!_quicContexts.TryGetValue((cert, key), out var qtls))
+                    // One context per (certificate, key, client-certificate policy): the policy travels with it.
+                    if (!_quicContexts.TryGetValue((cert, key, auth), out var qtls))
                     {
-                        try { qtls = Quic.QuicTlsContext.Server(cert, key, ["h3"]); }
+                        string? ca = ssl.ClientCa is null ? null : Path.GetFullPath(ssl.ClientCa, root);
+                        try { qtls = Quic.QuicTlsContext.Server(cert, key, ["h3"], auth, ca); }
                         catch (InvalidOperationException e) { throw new ConfigException("HTTP/3: " + e.Message, ssl.CertificateSource); }
-                        _quicContexts[(cert, key)] = qtls;
+                        _quicContexts[(cert, key, auth)] = qtls;
                     }
                     ssl.QuicTls = qtls;
                 }
@@ -457,7 +462,7 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
     private readonly List<OcspStapler> _staplers = new();
 
     /// <summary>The configuration was replaced and its last connection is gone: stop its staplers (their state lives on).</summary>
-    private readonly Dictionary<(string, string), Quic.QuicTlsContext> _quicContexts = new();
+    private readonly Dictionary<(string, string, ClientAuth?), Quic.QuicTlsContext> _quicContexts = new();
     private bool _quicWarned;
 
     public void Dispose()

@@ -79,6 +79,17 @@ internal sealed unsafe partial class QuicTls : IDisposable
     [LibraryImport(LibSsl, StringMarshalling = StringMarshalling.Utf8)] private static partial int SSL_set1_host(IntPtr ssl, string host);
     [LibraryImport(LibSsl)] private static partial IntPtr SSL_get_current_cipher(IntPtr ssl);
     [LibraryImport(LibSsl)] private static partial ushort SSL_CIPHER_get_protocol_id(IntPtr cipher);
+    [LibraryImport(LibSsl)] private static partial void SSL_set_verify(IntPtr ssl, int mode, IntPtr cb);
+    [LibraryImport(LibSsl)] private static partial int SSL_CTX_set_num_tickets(IntPtr ctx, nuint n);
+    [LibraryImport(LibSsl)] private static partial int SSL_set_num_tickets(IntPtr ssl, nuint n);
+    [LibraryImport(LibSsl, StringMarshalling = StringMarshalling.Utf8)] private static partial IntPtr SSL_load_client_CA_file(string file);
+    [LibraryImport(LibSsl)] private static partial void SSL_CTX_set_client_CA_list(IntPtr ctx, IntPtr names);
+    [LibraryImport(LibSsl)] private static partial IntPtr SSL_get1_peer_certificate(IntPtr ssl);
+    [LibraryImport(LibSsl)] private static partial IntPtr SSL_get_peer_cert_chain(IntPtr ssl);
+    [LibraryImport(LibCrypto)] private static partial int OPENSSL_sk_num(IntPtr sk);
+    [LibraryImport(LibCrypto)] private static partial IntPtr OPENSSL_sk_value(IntPtr sk, int i);
+    [LibraryImport(LibCrypto)] private static partial int i2d_X509(IntPtr x, byte** outp);
+    [LibraryImport(LibCrypto)] private static partial void X509_free(IntPtr x);
     [LibraryImport(LibCrypto)] private static partial nuint ERR_get_error();
     [LibraryImport(LibCrypto)] private static partial void ERR_error_string_n(nuint e, byte* buf, nuint len);
     [LibraryImport(LibCrypto)] private static partial void ERR_clear_error();
@@ -219,7 +230,11 @@ internal sealed unsafe partial class QuicTls : IDisposable
                     return false;
                 }
                 Alpn = Encoding.ASCII.GetString(a, (int)alen);
-                if (_isServer) ServerName = Marshal.PtrToStringUTF8(SSL_get_servername(_ssl, 0));
+                if (_isServer)
+                {
+                    ServerName = Marshal.PtrToStringUTF8(SSL_get_servername(_ssl, 0));
+                    if (Context.ClientAuth is not null) ReadPeerCertificate();
+                }
                 return Error is null;
             }
         }
@@ -235,6 +250,40 @@ internal sealed unsafe partial class QuicTls : IDisposable
         if (e == SslErrorZeroReturn) { Fail(QuicError.ProtocolViolation, "TLS closed the connection"); return false; }
         Fail(Error ?? QuicError.CryptoError + 80 /* internal_error */, ErrorReason ?? "TLS error: " + LastError());
         return false;
+    }
+
+    /// <summary>The client's certificate (servers asking for one), as received; judged by the caller, not OpenSSL.</summary>
+    public System.Security.Cryptography.X509Certificates.X509Certificate2? PeerCertificate { get; private set; }
+    /// <summary>The intermediates the client sent with it.</summary>
+    public System.Security.Cryptography.X509Certificates.X509Certificate2Collection PeerChain { get; } = new();
+
+    private void ReadPeerCertificate()
+    {
+        IntPtr leaf = SSL_get1_peer_certificate(_ssl);
+        if (leaf == IntPtr.Zero) return;
+        try { PeerCertificate = FromDer(leaf); }
+        finally { X509_free(leaf); }
+        // On a server the chain excludes the leaf (the stack is the SSL's own: not freed here).
+        IntPtr sk = SSL_get_peer_cert_chain(_ssl);
+        if (sk == IntPtr.Zero) return;
+        int n = Math.Min(OPENSSL_sk_num(sk), 16);
+        for (int i = 0; i < n; i++)
+            if (FromDer(OPENSSL_sk_value(sk, i)) is { } c) PeerChain.Add(c);
+    }
+
+    private static System.Security.Cryptography.X509Certificates.X509Certificate2? FromDer(IntPtr x509)
+    {
+        if (x509 == IntPtr.Zero) return null;
+        int len = i2d_X509(x509, null);
+        if (len <= 0 || len > 64 << 10) return null;
+        var der = new byte[len];
+        fixed (byte* d = der)
+        {
+            byte* p = d;
+            if (i2d_X509(x509, &p) != len) return null;
+        }
+        try { return System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadCertificate(der); }
+        catch (System.Security.Cryptography.CryptographicException) { return null; }
     }
 
     private void Fail(QuicError code, string reason)
@@ -390,6 +439,10 @@ internal sealed unsafe partial class QuicTls : IDisposable
             if (!ReferenceEquals(ctx, t.Context))
             {
                 SSL_set_SSL_CTX(ssl, ctx.Handle);
+                // SSL_set_SSL_CTX keeps the verify mode (and ticket count) the SSL started with: take the new server's,
+                // or a handshake begun under one server's client-certificate settings would finish under another's.
+                SSL_set_verify(ssl, ctx.ClientAuth is null ? 0 : 1, ctx.ClientAuth is null ? IntPtr.Zero : (IntPtr)(delegate* unmanaged<int, IntPtr, int>)&AcceptAnyCb);
+                SSL_set_num_tickets(ssl, ctx.ClientAuth is null ? 2u : 0u);
                 t.Context = ctx;
             }
             return TlsextErrOk;
@@ -441,6 +494,23 @@ internal sealed unsafe partial class QuicTls : IDisposable
         if (SSL_CTX_check_private_key(ctx) != 1) throw new InvalidOperationException($"{keyFile} doesn't match {certFile}");
     }
 
+    // OpenSSL only collects the client's certificate: the verdict is ClientAuth's (CA-only trust, CRLs, depth, purpose),
+    // the same code the TCP path uses. So OpenSSL's own verification accepts whatever it's given.
+    [UnmanagedCallersOnly]
+    private static int AcceptAnyCb(int preverifyOk, IntPtr storeCtx) => 1;
+
+    /// <summary>A server context that asks for a client certificate, naming the CAs in <paramref name="caFile"/>; no session tickets.</summary>
+    internal static void RequestClientCertificate(IntPtr ctx, string? caFile)
+    {
+        SSL_CTX_set_verify(ctx, 1 /* SSL_VERIFY_PEER: request one, don't require it here */, (IntPtr)(delegate* unmanaged<int, IntPtr, int>)&AcceptAnyCb);
+        SSL_CTX_set_num_tickets(ctx, 0); // every connection gets the full check, as on TCP
+        if (caFile is not null)
+        {
+            IntPtr names = SSL_load_client_CA_file(caFile);
+            if (names != IntPtr.Zero) SSL_CTX_set_client_CA_list(ctx, names); // takes ownership
+        }
+    }
+
     internal static void LoadVerify(IntPtr ctx, string caFile)
     {
         ERR_clear_error();
@@ -487,6 +557,8 @@ internal sealed class QuicTlsContext : IDisposable
     internal IntPtr Handle { get; private set; }
     private readonly IntPtr _alpnArg;
     public bool VerifyPeer { get; }
+    /// <summary>A server's client-certificate policy (ssl_verify_client), applied after the handshake; null: none asked.</summary>
+    public Modules.ClientAuth? ClientAuth { get; private init; }
 
     private QuicTlsContext(IntPtr handle, IntPtr alpnArg, bool verify)
     {
@@ -495,31 +567,42 @@ internal sealed class QuicTlsContext : IDisposable
         VerifyPeer = verify;
     }
 
-    /// <summary>A server context: the PEM certificate chain and key (the ssl_certificate files), offering <paramref name="alpn"/>.</summary>
-    public static QuicTlsContext Server(string certFile, string keyFile, string[] alpn)
+    /// <summary>
+    /// A server context: the PEM certificate chain and key (the ssl_certificate files), offering <paramref name="alpn"/>.
+    /// With <paramref name="clientAuth"/>, it asks for a client certificate (naming the CAs in <paramref name="clientCa"/>).
+    /// </summary>
+    public static QuicTlsContext Server(string certFile, string keyFile, string[] alpn, Modules.ClientAuth? clientAuth = null, string? clientCa = null)
     {
         var ctx = QuicTls.NewContext(server: true, alpn, out var arg);
-        try { QuicTls.LoadCertificate(ctx, certFile, keyFile); }
+        try
+        {
+            QuicTls.LoadCertificate(ctx, certFile, keyFile);
+            if (clientAuth is not null) QuicTls.RequestClientCertificate(ctx, clientCa);
+        }
         catch
         {
             QuicTls.FreeContext(ctx, arg);
             throw;
         }
-        return new QuicTlsContext(ctx, arg, verify: false);
+        return new QuicTlsContext(ctx, arg, verify: false) { ClientAuth = clientAuth };
     }
 
-    /// <summary>A client context, verifying the server against <paramref name="caFile"/> (or nothing, for interop probes).</summary>
-    public static QuicTlsContext Client(string? caFile)
+    /// <summary>
+    /// A client context, verifying the server against <paramref name="caFile"/> (or nothing, for interop probes), and
+    /// presenting <paramref name="certFile"/> / <paramref name="keyFile"/> when a server asks for a certificate.
+    /// </summary>
+    public static QuicTlsContext Client(string? caFile, string? certFile = null, string? keyFile = null)
     {
         var ctx = QuicTls.NewContext(server: false, [], out _);
-        if (caFile is not null)
+        try
         {
-            try { QuicTls.LoadVerify(ctx, caFile); }
-            catch
-            {
-                QuicTls.FreeContext(ctx, IntPtr.Zero);
-                throw;
-            }
+            if (caFile is not null) QuicTls.LoadVerify(ctx, caFile);
+            if (certFile is not null) QuicTls.LoadCertificate(ctx, certFile, keyFile!);
+        }
+        catch
+        {
+            QuicTls.FreeContext(ctx, IntPtr.Zero);
+            throw;
         }
         return new QuicTlsContext(ctx, IntPtr.Zero, verify: caFile is not null);
     }
