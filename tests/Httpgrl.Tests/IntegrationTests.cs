@@ -613,8 +613,14 @@ internal static class IntegrationTests
             var r = await ReadToClose(extra, 2000);
             T.True(r.Length == 0 || r.Contains("<<RESET>>"));
             foreach (var h in held) h.Dispose();
-            await Task.Delay(100);
-            T.Eq(200, Status(await s.Raw(Get("/hello.txt"))));
+            // The slots free once the server notices the closes: soon, but not by a fixed time on a busy machine.
+            int status = 0;
+            for (long until = Environment.TickCount64 + 5000; status != 200 && Environment.TickCount64 < until;)
+            {
+                try { status = Status(await s.Raw(Get("/hello.txt"))); }
+                catch (SocketException) { await Task.Delay(50); }
+            }
+            T.Eq(200, status);
         });
 
         T.Add("dos: full table evicts idle keep-alive connections", async () =>
