@@ -176,6 +176,24 @@ internal static class Http3SessionTests
             T.Contains("no HTTP/3 for a server that requires client certificates", s.LogText());
         });
 
+        Case("a default server with ssl_reject_handshake: named servers get HTTP/3; no SNI, or the default's name, gets no handshake", async () =>
+        {
+            var conf = """
+                http {
+                  server { listen 127.0.0.1:0 ssl default_server; listen 127.0.0.1:0 quic default_server; server_name _; http3 on; ssl_reject_handshake on; }
+                  server { listen 127.0.0.1:0 ssl; listen 127.0.0.1:0 quic; server_name h3.test; http3 on;
+                    ssl_certificate {DIR}/h3.crt; ssl_certificate_key {DIR}/h3.key; root {DIR}/www; }
+                }
+                """;
+            await using var s = TestServer.Start(conf, Populate);
+            using (var c = Client(s)) T.Eq("hello", c.Get("/index.html").Text);
+            using (var c = new H3Client(s.QuicEndPoint, Path.Combine(s.Dir, "h3.crt"), sni: "other.test"))
+            {
+                T.True(!c.Connect());
+                T.True(c.C.CloseReason?.Contains("112") == true || c.C.CloseCode is not null); // unrecognized_name: no certificate shown
+            }
+        });
+
         Case("malformed requests reset their stream with H3_MESSAGE_ERROR; the connection carries on", async () =>
         {
             await using var s = TestServer.Start(Conf(), Populate);

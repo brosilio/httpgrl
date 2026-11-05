@@ -28,7 +28,10 @@ internal sealed class Http3Application(ConnectionManager mgr) : IQuicApplication
     {
         var def = binding.Hosts.Default;
         var core = def.Root.Core;
-        var tls = def.Scope.Get<SslConf>().QuicTls;
+        // OpenSSL needs a context to start a handshake with: the default server's, or (when it has none, e.g. with
+        // ssl_reject_handshake) any HTTP/3 server's. SNI then picks the server that answers; a name (or no name)
+        // leading to a server without a context refuses the handshake, so a scan by IP learns no names.
+        var tls = def.Scope.Get<SslConf>().QuicTls ?? binding.Hosts.Servers.Select(x => x.Scope.Get<SslConf>().QuicTls).FirstOrDefault(c => c is not null);
         QuicAccept? accept = null;
         if (tls is not null)
         {
