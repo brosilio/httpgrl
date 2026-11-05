@@ -17,7 +17,7 @@ internal static class Soak
 {
     private sealed class Stats
     {
-        public long Ok, Limited, Failed, Ws, Abuse, H2, H2Ws;
+        public long Ok, Limited, Failed, Ws, Abuse, H2, H2Ws, H3, H3Reconnects;
         public readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> Errors = new();
         public void Fail(string what) { Interlocked.Increment(ref Failed); Errors.AddOrUpdate(what, 1, (_, n) => n + 1); }
     }
@@ -68,7 +68,7 @@ internal static class Soak
                 location /set { set $v "$arg_x"; if ($v ~ "^(\d+)$") { return 200 "n=$1"; } return 200 "s=$v"; }
               }
               server {
-                listen 127.0.0.1:{{h2port}} ssl; server_name soak.test; http2 on;
+                listen 127.0.0.1:{{h2port}} ssl; listen 127.0.0.1:{{h2port}} quic; server_name soak.test; http2 on; http3 on;
                 ssl_certificate {{dir}}/soak.crt; ssl_certificate_key {{dir}}/soak.key;
                 root {{dir}}/www;
                 client_header_timeout 3s; client_body_timeout 3s; send_timeout 5s;
@@ -130,6 +130,13 @@ internal static class Soak
         };
         for (int k = 0; k < 24; k++) workers.Add(Traffic(h2, stats, 100 + k, stop.Token, http2: true));
         for (int k = 0; k < 2; k++) workers.Add(WebSockets(h2port, stats, stop.Token, http2: true));
+        // HTTP/3: a few connections of our own client, each on its own thread, reconnecting after a reload's GOAWAY.
+        if (Httpgrl.Core.Quic.QuicTls.Unavailable is null)
+            for (int k = 0; k < 6; k++)
+            {
+                int id = 200 + k;
+                workers.Add(Task.Factory.StartNew(() => Http3Traffic(h2port, Path.Combine(dir, "soak.crt"), stats, id, stop.Token), TaskCreationOptions.LongRunning));
+            }
         for (int k = 0; k < 4; k++) workers.Add(WebSockets(port, stats, stop.Token));
         for (int k = 0; k < 8; k++) workers.Add(Abuse(port, stats, k, stop.Token));
 
@@ -147,7 +154,7 @@ internal static class Soak
             var (rss, fd, th) = Sample(pid);
             peakRss = Math.Max(peakRss, rss);
             var mem = await Memory(http);
-            Console.WriteLine($"soak: t={sw.Elapsed.TotalSeconds:F0}s rss {rss / 1024} MB {mem} fds {fd} threads {th} ok {stats.Ok} (h2 {stats.H2}) limited {stats.Limited} ws {stats.Ws} (h2 {stats.H2Ws}) abuse {stats.Abuse} failed {stats.Failed}");
+            Console.WriteLine($"soak: t={sw.Elapsed.TotalSeconds:F0}s rss {rss / 1024} MB {mem} fds {fd} threads {th} ok {stats.Ok} (h2 {stats.H2}, h3 {stats.H3}) limited {stats.Limited} ws {stats.Ws} (h2 {stats.H2Ws}) abuse {stats.Abuse} failed {stats.Failed}");
         }
         stop.Cancel();
         try { await Task.WhenAll(workers); } catch (OperationCanceledException) { }
@@ -172,8 +179,9 @@ internal static class Soak
         long total = stats.Ok + stats.Limited + stats.Failed;
         if (stats.Failed > total / 1000 + 10) problems.Add($"{stats.Failed} of {total} requests failed");
 
-        Console.WriteLine($"soak: done. {total} requests ({stats.Ok} ok, {stats.H2} of them over HTTP/2, {stats.Limited} rate-limited, {stats.Failed} failed), {stats.Ws} websocket sessions ({stats.H2Ws} over HTTP/2), {stats.Abuse} abusive connections, {reloads} reloads");
+        Console.WriteLine($"soak: done. {total} requests ({stats.Ok} ok, {stats.H2} over HTTP/2, {stats.H3} over HTTP/3, {stats.Limited} rate-limited, {stats.Failed} failed), {stats.Ws} websocket sessions ({stats.H2Ws} over HTTP/2), {stats.Abuse} abusive connections, {reloads} reloads, {stats.H3Reconnects} HTTP/3 reconnects");
         if (stats.H2 == 0) problems.Add("no HTTP/2 requests succeeded");
+        if (stats.H3 == 0 && Httpgrl.Core.Quic.QuicTls.Unavailable is null) problems.Add("no HTTP/3 requests succeeded");
         Console.WriteLine($"soak: rss {rss0 / 1024} -> peak {peakRss / 1024} -> {rssEnd / 1024} MB; fds {fd0} -> {fdEnd}; threads {th0} -> {thEnd}");
         foreach (var (what, n) in stats.Errors.OrderByDescending(e => e.Value).Take(8)) Console.WriteLine($"  failure: {what} x{n}");
         lock (log) if (log.Length > 0) Console.WriteLine(log.ToString());
@@ -216,6 +224,45 @@ internal static class Soak
             }
             catch (TaskCanceledException) { s.Fail($"{proto}{path.Split('?')[0]}: timeout"); }
         }
+    }
+
+    /// <summary>
+    /// HTTP/3 requests from our client: files, uploads through the proxy, a few at a time. A request refused after a
+    /// GOAWAY (H3_REQUEST_REJECTED) wasn't processed, so it's retried on a new connection, as browsers do.
+    /// </summary>
+    private static void Http3Traffic(int port, string ca, Stats s, int id, CancellationToken stop)
+    {
+        var r = new Random(id);
+        string[] paths = ["small.txt", "text.txt", "big.bin", "proxy/x?id=" + id, "proxy/y", "missing"];
+        H3Client? c = null;
+        try
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                if (c is null || c.C.IsClosed || c.C.IsDraining)
+                {
+                    if (c is not null) Interlocked.Increment(ref s.H3Reconnects);
+                    c?.Dispose();
+                    c = new H3Client(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, port), ca, "soak.test");
+                    if (!c.Connect()) { s.Fail("h3: handshake"); c.Dispose(); c = null; Thread.Sleep(100); continue; }
+                }
+                var path = paths[r.Next(paths.Length)];
+                byte[]? body = path == "proxy/y" ? new byte[r.Next(1, 200_000)] : null;
+                H3Client.Response resp;
+                try
+                {
+                    long sid = c.Send(body is null ? "GET" : "POST", "/" + path, body, true, body is null ? [] : [("content-length", body.Length.ToString())]);
+                    resp = c.Wait(sid, 15_000);
+                }
+                catch (Exception e) when (e.Message == "no stream credit") { c.C.Close(0, "", Httpgrl.Core.Quic.QuicEndpoint.Now()); continue; }
+                if (resp.Reset == (ulong)Httpgrl.Core.Http3.H3Error.RequestRejected) continue; // after GOAWAY: retry elsewhere
+                if (resp.Status == "200" || (path == "missing" && resp.Status == "404")) { Interlocked.Increment(ref s.Ok); Interlocked.Increment(ref s.H3); }
+                else if (resp.Status == "429") Interlocked.Increment(ref s.Limited);
+                else if (resp.Status is null && (c.C.IsClosed || c.C.IsDraining)) continue; // the connection went away under it (reload): retry
+                else s.Fail($"h3 {path.Split('?')[0]} -> {resp.Status ?? "reset " + resp.Reset}");
+            }
+        }
+        finally { c?.Dispose(); }
     }
 
     private static async Task WebSockets(int port, Stats s, CancellationToken stop, bool http2 = false)
