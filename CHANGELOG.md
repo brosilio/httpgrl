@@ -3,6 +3,37 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
+## [0.4.0] - 2026-11-05
+
+HTTP/2 and HTTP/3, both opt-in and both written in-house (see docs/plan-http2-http3.md).
+
+### Changed (may need action)
+- Plugin and Core API: `HttpVersion` gains `Http20` and `Http30`, and `HttpVersions.Name` names them ("HTTP/2.0",
+  "HTTP/3.0"). Nothing else in the API changed, but code that assumed every request is HTTP/1.x should handle the new
+  values. For example, `Connection`/`Upgrade` headers don't exist on HTTP/2 and HTTP/3, so WebSockets there arrive as
+  translated upgrade requests (see below).
+
+### Added
+- **HTTP/2** with `http2 on;` (off by default, permanently), offered through ALPN on TLS listeners. HPACK, framing and
+  flow control are our own. There's no `h2c`. Requests get HTTP/1.1's strict parsing rules, and defences cover rapid
+  reset (CVE-2023-44487), CONTINUATION floods, HPACK bombs and control-frame floods. Every stream has its own
+  deadlines. Reloads drain in two steps (GOAWAY, PING, final GOAWAY), so no request is lost. Also
+  `http2_max_concurrent_streams`. nginx's old `listen ... http2` parameter logs that it doesn't enable HTTP/2.
+- **HTTP/3** with `http3 on;` and `listen 443 quic;` (off by default, permanently). On Linux with OpenSSL 3.5 or newer;
+  elsewhere quic listeners are skipped with a warning.
+  - The QUIC transport is our own, with no msquic and no System.Net.Quic: loss recovery, CUBIC with pacing,
+    migration and NAT rebinding, key updates, Retry, stateless resets, GSO.
+  - TLS comes from OpenSSL's QUIC TLS API. QPACK uses no dynamic table.
+  - TCP responses carry `Alt-Svc` automatically; an explicit `add_header Alt-Svc` wins.
+  - Also `http3_max_concurrent_streams`, `quic_retry` and `quic_gso`.
+  - Servers that require client certificates aren't served over HTTP/3 yet: they answer 421 and get no Alt-Svc.
+- **WebSockets over HTTP/2 and HTTP/3** (extended CONNECT, RFC 8441 and 9220). Modules see an ordinary HTTP/1.1 upgrade
+  request, so `proxy_pass` tunnels them to HTTP/1.1 backends unchanged.
+
+### Fixed
+- TLS session resumption works again with the strict cipher default. The default list is installed as OpenSSL's
+  process-wide default, so .NET keeps its server contexts and their session caches.
+
 ## [0.3.0] - 2026-11-04
 
 ### Changed (may need action)
