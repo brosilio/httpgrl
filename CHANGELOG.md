@@ -3,6 +3,13 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
+## [0.4.1] - 2026-11-05
+
+### Fixed
+- HTTP/3 refused every connection when the quic listener's default server had no certificate (`ssl_reject_handshake
+  on`, the usual way to hide domains from scans by IP). Handshakes now start from any HTTP/3 server's context, and SNI
+  picks the server. No SNI, or the default's name, still gets no handshake.
+
 ## [0.4.0] - 2026-11-05
 
 HTTP/2 and HTTP/3, both opt-in and both written in-house (see docs/plan-http2-http3.md).
