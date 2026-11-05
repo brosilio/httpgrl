@@ -3,6 +3,13 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
+## [0.4.2] - 2026-11-05
+
+### Fixed
+- HTTP/2: a drain (reload, shutdown, `keepalive_requests`) could drop its final GOAWAY when the last request finished
+  at the same moment. The connection closed without it: nothing was lost, since clients stop opening streams at the
+  first GOAWAY, but the close wasn't clean. The final GOAWAY is now queued before anything can start the close.
+
 ## [0.4.1] - 2026-11-05
 
 ### Fixed

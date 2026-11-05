@@ -770,8 +770,11 @@ internal sealed class Http2Session
             _goingAway = true; // under the lock streams are admitted under: none gets in past "last"
             last = _goAwayLast = _lastStreamId;
             idle = _active == 0;
+            // Queue the GOAWAY before releasing the lock. Once _goingAway is visible, the last stream's handler may
+            // start the graceful close; queued first, the frame is written before that close marks writes closed.
+            // (SafeWrite only queues here: the write lock is taken in order, nothing waits under _lock.)
+            _ = SafeWrite(FrameWriter.GoAway(last, H2Error.NoError));
         }
-        _ = SafeWrite(FrameWriter.GoAway(last, H2Error.NoError));
         if (idle) CloseGracefully();
     }
 
