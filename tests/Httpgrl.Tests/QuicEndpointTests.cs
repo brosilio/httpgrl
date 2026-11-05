@@ -199,8 +199,8 @@ internal static class QuicEndpointTests
             using var client = new UdpClient(s.EndPoint, s.ClientTls, o: small);
             T.True(Echo(client, 4 << 20));
             T.Eq(0, s.Log.Errors);
-            // On Linux the datagrams went out in GSO batches: far fewer sends than the ~3500 datagrams of the echo.
-            if (OperatingSystem.IsLinux()) { T.True(s.Endpoint.GsoActive); T.True(s.Endpoint.SendCalls < 3500); }
+            // On Linux the datagrams went out in GSO batches (pacing caps a batch, so not by a fixed factor).
+            if (OperatingSystem.IsLinux()) { T.True(s.Endpoint.GsoActive); T.True(s.Endpoint.SendCalls * 3 < s.Endpoint.DatagramsSent * 2); }
         });
 
         T.Add("quic endpoint: with Retry on, the client is validated first; a forged token makes no connection", () =>

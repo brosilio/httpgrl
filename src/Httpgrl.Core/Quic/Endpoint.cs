@@ -97,7 +97,7 @@ internal sealed class QuicEndpoint : IDisposable
     private bool _batchClosed;
     private EndPoint? _batchTo;
     public bool GsoActive => _gso;
-    public long SendCalls;
+    public long SendCalls, DatagramsSent;
     private Thread? _thread;
     private volatile bool _stop;
     private int _handshaking;
@@ -435,6 +435,7 @@ internal sealed class QuicEndpoint : IDisposable
 
     private void Queue(ReadOnlySpan<byte> d, EndPoint to)
     {
+        DatagramsSent++;
         if (!_gso) { SendTo(d, to); return; }
         if (_batchCount > 0 && (_batchClosed || _batchCount >= MaxSegments || !to.Equals(_batchTo))) Flush();
         d.CopyTo(_batch.AsSpan(_batchLen));
