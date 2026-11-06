@@ -1174,6 +1174,8 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     // ------------------------------------------------------------------ closing and timers
 
     /// <summary>Close with an application error code (CONNECTION_CLOSE 0x1d).</summary>
+    internal void RefuseMigration(long now) => CloseWithError(QuicError.NoViablePath, 0, "per-client connection limit", app: false, now);
+
     public void Close(ulong appError, string reason, long now) => CloseWithError(QuicError.ApplicationError, 0, reason, app: true, now, appCode: appError);
 
     private void CloseWithError(QuicError code, ulong frameType, string reason, bool app, long now, bool silent = false, ulong appCode = 0)

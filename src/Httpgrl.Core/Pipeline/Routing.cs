@@ -84,9 +84,7 @@ internal sealed class LocationTree
         var regexes = _regex;
         for (int i = 0; i < regexes.Count; i++)
         {
-            Match m;
-            try { m = regexes[i].Def!.Regex!.Match(path); }
-            catch (RegexMatchTimeoutException) { continue; }
+            var m = regexes[i].Def!.Regex!.Match(path);
             if (!m.Success) continue;
             match = m;
             var r = regexes[i];
@@ -203,8 +201,7 @@ internal sealed class VirtualHosts
             if (host.Length > prefix.Length && host.StartsWith(prefix, StringComparison.Ordinal)) return srv;
         foreach (var (re, srv) in _regex)
         {
-            try { if (re.IsMatch(host)) return srv; }
-            catch (RegexMatchTimeoutException) { }
+            if (re.IsMatch(host)) return srv;
         }
         return Default;
     }

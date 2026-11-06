@@ -18,7 +18,13 @@ internal static class RequestLifecycle
     /// </summary>
     public static int Route(HttpContextImpl ctx, VirtualHosts hosts, ServerRt? tlsServer, int reject)
     {
-        ctx.ServerRt = reject == 0 ? hosts.Resolve(ctx.Req.HostValue) : hosts.Default;
+        try { ctx.ServerRt = reject == 0 ? hosts.Resolve(ctx.Req.HostValue) : hosts.Default; }
+        catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+        {
+            // No server policy is safe to select after an indeterminate match.
+            ctx.ServerRt = hosts.Default;
+            reject = 444;
+        }
         if (reject == 0 && tlsServer is not null)
         {
             // A client may complete the handshake for one name (SNI) and then ask for another (Host). Never let that

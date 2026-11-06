@@ -370,8 +370,15 @@ internal sealed class QuicEndpoint : IDisposable
                     var moved = IpKey.From(c.C.Path);
                     if (moved != c.Client)
                     {
+                        _perClient.TryGetValue(moved, out int m);
+                        if (m >= _o.MaxConnectionsPerClient)
+                        {
+                            Refused++;
+                            c.C.RefuseMigration(now);
+                            break; // retain the original accounting until removal
+                        }
                         Release(c.Client);
-                        _perClient[moved] = (_perClient.TryGetValue(moved, out int m) ? m : 0) + 1;
+                        _perClient[moved] = m + 1;
                         c.Client = moved;
                     }
                     break;

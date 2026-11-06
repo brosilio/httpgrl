@@ -327,7 +327,10 @@ internal sealed class Http1Session
     private static ValueTask<SslServerAuthenticationOptions> SelectTls(SslStream stream, SslClientHelloInfo hello, object? state, CancellationToken ct)
     {
         var self = (Http1Session)state!;
-        var srv = self._hosts.Resolve(TlsHost(hello.ServerName));
+        ServerRt srv;
+        try { srv = self._hosts.Resolve(TlsHost(hello.ServerName)); }
+        catch (System.Text.RegularExpressions.RegexMatchTimeoutException e)
+        { throw new AuthenticationException("server name regex timed out", e); }
         // ssl_reject_handshake: SNI (or its absence) routes to a server that presents nothing. Refuse before any
         // certificate is sent, so a scan of the IP learns no names (no fallback to another server's certificate).
         if (srv.RejectHandshake) throw new AuthenticationException("handshake rejected (ssl_reject_handshake)");

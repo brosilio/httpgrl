@@ -105,6 +105,50 @@ internal static class IntegrationTests
 
     public static void Register()
     {
+        T.Add("security: regex SNI timeout refuses the TLS handshake", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0 ssl; server_name "~^(?=a)((a+)+$|a+b$)";
+                  ssl_certificate {DIR}/q.crt; ssl_certificate_key {DIR}/q.key; return 200 public; } }
+                """, d => ProxyTests.MakeCert("aaaa", d, "q").Dispose());
+            foreach (string host in new[] { "aaaa", new string('a', 60) + "b" })
+            {
+                using var tcp = new TcpClient();
+                await tcp.ConnectAsync(System.Net.IPAddress.Loopback, s.Port);
+                using var ssl = new SslStream(tcp.GetStream(), false, (_, _, _, _) => true);
+                bool accepted = false;
+                try { await ssl.AuthenticateAsClientAsync(host); accepted = true; }
+                catch (Exception e) when (e is System.Security.Authentication.AuthenticationException or IOException) { }
+                T.Eq(host == "aaaa", accepted);
+            }
+            T.NotContains("\"level\":\"error\"", s.LogText());
+        });
+
+        T.Add("security: regex Host timeout drops rather than selecting the default server", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; server_name "~^(?=a)((a+)+$|a+b$)"; return 200 public; } }
+                """);
+            T.Eq(200, Status(await s.Raw("GET / HTTP/1.1\r\nHost: aaaa\r\nConnection: close\r\n\r\n")));
+            T.Eq("", await s.Raw("GET / HTTP/1.1\r\nHost: " + new string('a', 60) + "b\r\nConnection: close\r\n\r\n"));
+        });
+
+        T.Add("security: regex location timeout fails closed", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0;
+                  location / { return 200 public; }
+                  location ~ "^/(?=a)((a+)+$|a+!$)" { deny all; return 403; }
+                } }
+                """);
+            using var client = new System.Net.Http.HttpClient();
+            var normal = await client.GetAsync($"http://127.0.0.1:{s.Port}/aaaa");
+            T.Eq(403, (int)normal.StatusCode);
+            var attack = await client.GetAsync($"http://127.0.0.1:{s.Port}/" + new string('a', 4000) + "!");
+            T.Eq(500, (int)attack.StatusCode);
+        });
+
+
         T.Add("http: static file, HEAD, content type", async () =>
         {
             await using var s = TestServer.Start(Base, Populate);
@@ -247,7 +291,7 @@ internal static class IntegrationTests
         T.Add("security: catastrophic regexes (backreferences force backtracking) cost bounded time and fail closed, quietly", async () =>
         {
             // A backreference can't run on the non-backtracking engine, so these fall back to backtracking with a match
-            // timeout. Input built to blow up (a long run that almost matches) must time out quietly: no 500, no
+            // timeout. Input built to blow up (a long run that almost matches) must fail closed with 500, no
             // error-level log line per request (an attacker could flood the log), and the server keeps serving.
             const string evil = @"(a+)+\1b$";
             await using var s = TestServer.Start($$"""
@@ -255,8 +299,8 @@ internal static class IntegrationTests
                   map $uri $m { "~{{evil}}" hit; default miss; }
                   server { listen 127.0.0.1:0 default_server; server_name "~^(a+)+\1b$";
                     location ~ {{evil}} { return 200 "loc"; }
-                    location /if/ { if ($uri ~ "{{evil}}") { return 200 "if"; } return 200 "m=$m"; }
-                    location /rw/ { rewrite "{{evil}}" /x; return 200 "rw"; }
+                    location ^~ /if/ { if ($uri ~ "{{evil}}") { return 200 "if"; } return 200 "m=$m"; }
+                    location ^~ /rw/ { rewrite "{{evil}}" /x; return 200 "rw"; }
                     location / { return 200 "m=$m"; }
                   }
                 }
@@ -265,7 +309,7 @@ internal static class IntegrationTests
             foreach (var path in new[] { "/" + payload, "/if/" + payload, "/rw/" + payload })
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var r = await s.Raw($"GET {path} HTTP/1.1\r\nHost: {new string('a', 40)}c\r\nConnection: close\r\n\r\n", 10_000);
+                var r = await s.Raw($"GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", 10_000);
                 T.True(sw.ElapsedMilliseconds < 3000);
                 // Fails closed: a timed-out regex is neither a match nor a non-match (nginx answers 500 too).
                 if (Status(r) != 500) throw new Exception($"{path}: {r}\n{s.LogText()}");

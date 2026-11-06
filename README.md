@@ -383,6 +383,8 @@ Details:
 
 ## Security model
 
+Routing regex timeouts fail closed: location matching returns 500, Host matching drops the request, and SNI matching refuses the handshake. QUIC migration into a full per-client connection allowance closes the migrating connection with `NO_VIABLE_PATH`.
+
 **Fuzzing.** Every parser of untrusted or semi-trusted bytes has a mutation-fuzz target in
 `tests/Httpgrl.Tests/Fuzz.cs`: the request head, the URI normalizer, chunked bodies, upstream response heads, the
 config parser (with every module's directives), CRLs, OCSP responses, PROXY protocol headers, `Accept-Encoding`,
@@ -464,7 +466,7 @@ coverage-guided, so it's a complement to, not a replacement for, a coverage-guid
 **Paths.**
 - URIs are percent-decoded, dot-segments are resolved, and an escape above `/` is a 400. Control characters (`%00`–`%1F`, `%7F`) and invalid UTF-8 are rejected. **Deviation:** nginx accepts `%0A` in paths. A decoded newline in `$uri` could reach response or upstream headers, and slip past anchored regexes (`$` also matches before a trailing newline, in PCRE as in .NET). So `if ($uri ~ "^/admin$")` can't be fooled by `/admin%0A`.
 - Every mapped filesystem path is checked to stay inside its `root`/`alias` directory. This closes nginx's classic `location /img { alias /x/; }` + `/img../` hole. A value with variables is checked against its constant leading directory. One that *begins* with a variable (`root $doc;`) has none, so its evaluated value must be an absolute path without `.`/`..` segments, and is itself the boundary: whatever a variable holds, the request can't climb out of it. (Which directory a variable names is still the configuration's business: don't build one from request input.)
-- Regexes run on .NET's linear-time engine whenever the pattern allows it (no backreferences or lookarounds). The rest backtrack with a 50 ms match timeout. A timeout fails the request with a 500 and one `warn` line. Neither "matched" nor "didn't match" can be assumed without failing open somewhere (`if ($x ~ ...) { return 403; }` versus `!~`), and nginx also answers a failed regex execution with a 500.
+- Regexes run on .NET's linear-time engine whenever the pattern allows it (no backreferences or lookarounds). The rest backtrack with a 50 ms match timeout. A location or request-expression timeout fails the request with a 500 and one `warn` line; a Host timeout drops the request and an SNI timeout refuses the handshake. Neither "matched" nor "didn't match" can be assumed without failing open somewhere (`if ($x ~ ...) { return 403; }` versus `!~`), and nginx also answers a failed regex execution with a 500.
 - Modules never see filesystem paths. They ask the core for resources by request path, so the mapping, containment and safe-open policy has exactly one implementation (`Core/Files/LocalFiles.cs`). CI enforces this with `scripts/check-boundaries.sh`.
 - Location matching is case-insensitive on case-insensitive filesystems.
 - On Windows, ADS names (`:`), trailing dots and spaces, and device names (`CON`, `NUL`, ...) are refused.

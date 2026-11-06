@@ -53,7 +53,7 @@ internal static class QuicEndpointTests
     /// <summary>Our QUIC client on a UDP socket, run synchronously until a condition holds.</summary>
     internal sealed class UdpClient : IDisposable
     {
-        public readonly Socket Socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        public Socket Socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         public readonly QuicConnection C;
         private readonly EndPoint _server;
         private readonly byte[] _buf = new byte[65536];
@@ -63,6 +63,13 @@ internal static class QuicEndpointTests
             _server = server;
             Socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
             C = QuicConnection.Client(tls, sni, [alpn], o ?? new QuicOptions(), QuicNet.Cids, server, QuicEndpoint.Now());
+        }
+
+        public void Rebind(string address)
+        {
+            Socket.Dispose();
+            Socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            Socket.Bind(new IPEndPoint(IPAddress.Parse(address), 0));
         }
 
         public bool Run(Func<bool> done, int timeoutMs = 10_000)
@@ -178,6 +185,30 @@ internal static class QuicEndpointTests
 
     public static void Register()
     {
+        T.Add("quic endpoint: migration enforces destination connection limit", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            using var s = new Server(new QuicEndpointOptions { MaxConnectionsPerClient = 1 });
+            using var first = new UdpClient(s.EndPoint, s.ClientTls);
+            T.True(Echo(first, 1000));
+            T.True(first.Run(() => first.C.HandshakeConfirmed));
+            using var second = new UdpClient(s.EndPoint, s.ClientTls);
+            second.Rebind("127.0.0.2");
+            T.True(Echo(second, 1000));
+            T.True(second.Run(() => second.C.HandshakeConfirmed));
+            second.Rebind("127.0.0.1");
+            long id = second.C.OpenStream(true);
+            second.C.StreamWrite(id, "move"u8, true);
+            T.True(second.Run(() => second.C.IsDraining || second.C.IsClosed, 5000));
+            T.Eq(QuicError.NoViablePath, second.C.CloseCode);
+            T.True(SpinUntil(() => s.Endpoint.Connections == 1, 5000));
+            T.True(Echo(first, 1000));
+            using var replacement = new UdpClient(s.EndPoint, s.ClientTls);
+            replacement.Rebind("127.0.0.2");
+            T.True(Echo(replacement, 1000)); // original address's accounting was released
+            T.Eq(0, s.Log.Errors);
+        });
+
         T.Add("quic endpoint: a client connects over UDP and echoes 300 KB; the endpoint forgets the connection when it closes", () =>
         {
             if (QuicTls.Unavailable is not null) return;
