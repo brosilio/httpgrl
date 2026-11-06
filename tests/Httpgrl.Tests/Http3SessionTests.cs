@@ -139,6 +139,32 @@ internal static class Http3SessionTests
             T.Eq(4L, (long)c.C.PeerParameters!.InitialMaxStreamsBidi);
         });
 
+        Case("header deadline covers trickled headers and implicitly opened streams", async () =>
+        {
+            await using var s = TestServer.Start(Conf("client_header_timeout 1s;"), Populate);
+            foreach (bool implicitStream in new[] { false, true })
+            {
+                using var c = Client(s);
+                if (implicitStream) c.C.OpenStream(bidi: true); // the next ID opens this empty stream at the server
+                long id = implicitStream ? c.Send("GET", "/index.html")
+                    : c.SendRaw([0x01, 0x40, 0x80, 0x00], fin: false); // incomplete 128-byte HEADERS
+                long next = Environment.TickCount64;
+                T.True(c.Udp.Run(() =>
+                {
+                    c.Pump();
+                    if (!implicitStream && Environment.TickCount64 >= next)
+                    {
+                        c.C.StreamWrite(id, new byte[] { 0 }, fin: false);
+                        next = Environment.TickCount64 + 100;
+                    }
+                    return c.C.IsClosed || c.C.IsDraining;
+                }, 4000));
+                T.Eq((ulong)H3Error.ExcessiveLoad, c.C.ApplicationCloseCode);
+            }
+            using var fresh = Client(s);
+            T.Eq("hello", fresh.Get("/index.html").Text);
+        });
+
         Case("opt-in: a quic listener without http3 on is a config error; Alt-Svc only where HTTP/3 is served", async () =>
         {
             T.Throws<Httpgrl.ConfigException>(() => TestServer.Start(Conf().Replace("http3 on;", ""), Populate));

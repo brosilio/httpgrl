@@ -25,9 +25,10 @@ internal sealed class Http3Connection
     private readonly ILogger _log;
     private readonly long _id;
 
-    private sealed class Request(long id)
+    private sealed class Request(long id, long headerDeadline)
     {
         public readonly long Id = id;
+        public readonly long HeaderDeadline = headerDeadline;
         public readonly H3FrameReader Reader = new(256 << 10);
         public H3Stream? Stream;
         public bool HeadersSeen, TrailersSeen, Fin, Done;
@@ -294,7 +295,7 @@ internal sealed class Http3Connection
                 Q.ResetStream(id, (ulong)H3Error.RequestRejected);
                 return;
             }
-            _requests[id] = r = new Request(id);
+            _requests[id] = r = new Request(id, QuicEndpoint.Now() + _core.ClientHeaderTimeoutMs * 1000L);
             if (id + 4 > _nextRequest) _nextRequest = id + 4;
         }
         if (r.Done) { Drain(id); return; }
@@ -565,6 +566,16 @@ internal sealed class Http3Connection
     /// <summary>Endpoint thread, once per loop turn: follow a reload (GOAWAY, then the drain deadline).</summary>
     public void Tick(long now)
     {
+        // The QUIC idle timer is refreshed by traffic, so it cannot protect unfinished heads.
+        // Include implicitly opened streams, and never extend this deadline for partial bytes.
+        if (!_closing)
+            foreach (var r in _requests.Values)
+                if (!r.Done && r.Stream is null && now >= r.HeaderDeadline)
+                {
+                    _closing = true;
+                    _ep.Run(Q, _ => Fail(H3Error.ExcessiveLoad, "request header timeout", QuicEndpoint.Now()));
+                    break;
+                }
         if (_goAway >= 0) MaybeClose(now); // after a GOAWAY of any cause, an idle connection closes
         if (!_rt.Retired) return;
         GoAway();
