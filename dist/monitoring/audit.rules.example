@@ -1,0 +1,7 @@
+# Linux auditd; replace SERVICE_UID with id -u httpgrl. These are host changes, not app config.
+# Initial server execs during deployment are expected; subsequent execs need investigation.
+-a always,exit -F arch=b64 -S execve,execveat -F uid=SERVICE_UID -k httpgrl-exec
+# Connects include legitimate upstream, DNS, tunnel, OCSP and health-check traffic.
+# Compare destination SOCKADDR records against your inventory; nonblocking EINPROGRESS is normal.
+-a always,exit -F arch=b64 -S connect -F uid=SERVICE_UID -k httpgrl-connect
+# Add b32 equivalents only on hosts supporting that ABI. Monitor audit lost/backlog counters too.

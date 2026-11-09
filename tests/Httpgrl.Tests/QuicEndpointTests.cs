@@ -139,11 +139,13 @@ internal static class QuicEndpointTests
     /// <summary>Counts error-level lines (an endpoint must never log one in these tests).</summary>
     internal sealed class ErrorCounter : ILogger
     {
+        public string? LastEvent;
         public int Errors;
         public string? Last;
         public bool IsEnabled(LogLevel level) => level >= LogLevel.Warn;
         public void Write(LogLevel level, string msg, ReadOnlySpan<LogField> fields)
         {
+            foreach (var field in fields) if (field.Key == "event") LastEvent = field.Str;
             if (level < LogLevel.Error) return;
             Errors++;
             Last = msg;
@@ -201,6 +203,7 @@ internal static class QuicEndpointTests
             second.C.StreamWrite(id, "move"u8, true);
             T.True(second.Run(() => second.C.IsDraining || second.C.IsClosed, 5000));
             T.Eq(QuicError.NoViablePath, second.C.CloseCode);
+            T.Eq("migration_limit_exceeded", s.Log.LastEvent);
             T.True(SpinUntil(() => s.Endpoint.Connections == 1, 5000));
             T.True(Echo(first, 1000));
             using var replacement = new UdpClient(s.EndPoint, s.ClientTls);

@@ -3,6 +3,24 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
+## [0.5.0] - Unreleased
+
+### Changed (may need action)
+- JSON log schema 2 removes query/fragment values from URI fields and replaces access-log Referer values with
+  presence flags. Consumers must use the new `event`, `outcome`, route and upstream fields. Privacy changes are
+  intentional; historical full-query logs require separate retention/access review.
+- CI also runs the optional operational detector's standard-library Python 3 tests.
+
+### Added
+- Process/instance/version metadata, explicit truncation flags, correlated security decision events, and exactly-once
+  access logging for interrupted HTTP/1, HTTP/2 and HTTP/3 handler lifecycles.
+- Final server-side response outcome, normalized path, selected server/location and upstream details in access records.
+- A bounded offline/streaming log detector; central TLS collection, retention, metrics/probe alert and host audit examples;
+  application audit-event contract and incident runbook in `docs/security-monitoring.md`.
+
+### Fixed
+- HTTP/3 absolute header deadlines, routing regex timeouts failing open, and QUIC migration per-client limit bypasses.
+
 ## [0.4.3] - 2026-11-05
 
 ### Added

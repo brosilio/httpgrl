@@ -1,0 +1,12 @@
+# Merge into your existing http block. Never expose metrics to the public internet.
+error_log stdout info;
+http {
+  access_log stdout;
+  server {
+    listen 127.0.0.1:9091;
+    location = /metrics { stub_status prometheus; allow 127.0.0.1; deny all; }
+    location = /monitoring-probe { return 204; }
+  }
+  # In each relevant proxy location (account for inherited proxy_set_header settings):
+  # proxy_set_header X-Request-ID $request_id;
+}

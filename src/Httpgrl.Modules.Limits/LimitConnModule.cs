@@ -123,6 +123,7 @@ public sealed class LimitConnModule : IModule
                 continue;
             }
             bool dry = c.DryRun == true;
+            ctx.SecurityEvent(dry ? "connection_limit_would_reject" : "connection_limit_exceeded");
             ctx.Items[_status] = dry ? "REJECTED_DRY_RUN" : "REJECTED";
             var level = c.Level ?? LogLevel.Warn;
             if (ctx.Log.IsEnabled(level))

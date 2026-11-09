@@ -374,6 +374,7 @@ internal sealed class QuicEndpoint : IDisposable
                         if (m >= _o.MaxConnectionsPerClient)
                         {
                             Refused++;
+                            _log.Warn("security", new("event", "migration_limit_exceeded"), new("remote", c.C.Path.ToString()));
                             c.C.RefuseMigration(now);
                             break; // retain the original accounting until removal
                         }

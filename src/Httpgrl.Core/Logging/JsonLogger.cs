@@ -31,6 +31,8 @@ public sealed class JsonLogger : ILogger, IDisposable
     });
     private long _queuedBytes;
     internal long QueuedBytes => Interlocked.Read(ref _queuedBytes);
+    private static readonly string ProcessId = Guid.NewGuid().ToString("N");
+    private static readonly string Instance = Environment.MachineName;
     private volatile bool _dead;
     private readonly Stream _out;
     private readonly Thread _thread;
@@ -89,6 +91,10 @@ public sealed class JsonLogger : ILogger, IDisposable
         w.Reset(buf);
 
         w.WriteStartObject();
+        w.WriteNumber("schema", 2);
+        w.WriteString("instance", Instance);
+        w.WriteString("process_id", ProcessId);
+        w.WriteString("version", Http.ServerInfo.Version);
         Span<char> ts = stackalloc char[32];
         DateTime.UtcNow.TryFormat(ts, out int n, "yyyy-MM-dd'T'HH:mm:ss.fff'Z'", null);
         w.WriteString("ts"u8, ts[..n]);
@@ -102,11 +108,19 @@ public sealed class JsonLogger : ILogger, IDisposable
         w.WriteString("msg"u8, message.Length > maxField ? message[..maxField] : message);
         foreach (ref readonly var f in fields)
         {
+            // Envelope identity cannot be replaced (or duplicated) by caller fields.
+            if (f.Key is "schema" or "instance" or "process_id" or "version" or "ts" or "level" or "msg" or "truncated") continue;
             switch (f.Kind)
             {
                 case LogFieldKind.String:
                     if (f.Str is null) w.WriteNull(f.Key);
-                    else w.WriteString(f.Key, f.Str.Length > maxField ? f.Str[..maxField] : f.Str);
+                    else
+                    {
+                        string value = f.Key is "uri" or "target" or "request_uri" ? LogPrivacy.PathOnly(f.Str)
+                            : f.Key is "referer" or "query" or "authorization" or "cookie" ? "[redacted]" : f.Str;
+                        if (value.Length > maxField) truncated = true;
+                        w.WriteString(f.Key, value.Length > maxField ? value[..maxField] : value);
+                    }
                     break;
                 case LogFieldKind.Long: w.WriteNumber(f.Key, f.Long); break;
                 case LogFieldKind.Double: w.WriteNumber(f.Key, double.IsFinite(f.Double) ? f.Double : 0); break;
@@ -137,7 +151,7 @@ public sealed class JsonLogger : ILogger, IDisposable
                     _out.Write(line);
                 }
                 long dropped = Interlocked.Exchange(ref _dropped, 0);
-                if (dropped > 0) _out.Write(Format(LogLevel.Warn, "log lines dropped", [new("count", dropped)], ShortField));
+                if (dropped > 0) _out.Write(Format(LogLevel.Warn, "log lines dropped", [new("event", "log_lines_dropped"), new("count", dropped)], ShortField));
                 _out.Flush();
             }
         }

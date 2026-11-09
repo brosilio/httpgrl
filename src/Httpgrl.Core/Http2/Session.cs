@@ -144,7 +144,7 @@ internal sealed class Http2Session
         }
         catch (H2Exception e)
         {
-            _rt.Log.Info("http/2 connection error", new("conn", _conn.Id), new("code", e.Code.ToString()), new("reason", e.Message), new("remote", _info.RemoteAddress));
+            _rt.Log.Info("http/2 connection error", new("event", "http2_connection_rejected"), new("conn", _conn.Id), new("code", e.Code.ToString()), new("reason", e.Message), new("remote", _info.RemoteAddress));
             await GoAwayAsync(e.Code).ConfigureAwait(false);
             await LingerAsync().ConfigureAwait(false);
         }
@@ -523,7 +523,7 @@ internal sealed class Http2Session
     {
         H2Stream? s;
         lock (_lock) _streams.TryGetValue(e.StreamId, out s);
-        _rt.Log.Debug("http/2 stream error", new("conn", _conn.Id), new("stream", (long)e.StreamId), new("code", e.Code.ToString()), new("reason", e.Message));
+        _rt.Log.Info("http/2 stream error", new("event", "http2_stream_rejected"), new("conn", _conn.Id), new("stream", (long)e.StreamId), new("code", e.Code.ToString()), new("reason", e.Message));
         if (s is not null) s.Abort(e.Message, e.Code, sendReset: true);
         else if (!WeReset(e.StreamId)) ResetLater(e.StreamId, e.Code);
     }
@@ -550,6 +550,7 @@ internal sealed class Http2Session
         }
         finally
         {
+            await RequestLifecycle.FinishAsync(ctx, _mgr).ConfigureAwait(false);
             ctx.EndRequest();
             ctx.Resp.ReturnBuffer();
             _mgr.Untrack(s);

@@ -131,6 +131,7 @@ internal static class IntegrationTests
                 """);
             T.Eq(200, Status(await s.Raw("GET / HTTP/1.1\r\nHost: aaaa\r\nConnection: close\r\n\r\n")));
             T.Eq("", await s.Raw("GET / HTTP/1.1\r\nHost: " + new string('a', 60) + "b\r\nConnection: close\r\n\r\n"));
+            T.Contains("\"event\":\"routing_regex_timeout\"", s.LogText());
         });
 
         T.Add("security: regex location timeout fails closed", async () =>

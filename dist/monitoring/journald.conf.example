@@ -1,0 +1,5 @@
+# Review host-wide disk budget before installing as /etc/systemd/journald.conf.d/httpgrl.conf
+[Journal]
+Storage=persistent
+SystemMaxUse=1G
+MaxRetentionSec=14day

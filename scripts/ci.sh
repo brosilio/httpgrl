@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 RID="${RID:-$(dotnet --info | sed -n 's/^ *RID: *//p' | head -n1)}"
 
 scripts/check-boundaries.sh
+python3 -B dist/monitoring/test_detect.py
 dotnet build -c Release
 dotnet run -c Release --no-build --project tests/Httpgrl.Tests
 dotnet publish tests/Httpgrl.Tests -c Release -r "$RID" -p:PublishAot=true -o artifacts/tests-aot

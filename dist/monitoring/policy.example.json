@@ -1,0 +1,11 @@
+{
+  "window_seconds": 300,
+  "max_keys": 10000,
+  "denials_before_success": 3,
+  "security_events": ["routing_regex_timeout", "migration_limit_exceeded", "tls_policy_mismatch", "filesystem_access_denied", "upstream_response_failed"],
+  "resources": [
+    {"path_prefix": "/.env", "never_success": true},
+    {"path_prefix": "/.git", "never_success": true},
+    {"host": "replace-with-your-host", "path_prefix": "/exports", "max_response_bytes": 10485760}
+  ]
+}

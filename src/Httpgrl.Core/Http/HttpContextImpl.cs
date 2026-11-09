@@ -80,6 +80,7 @@ internal sealed class HttpContextImpl : HttpContext
     public LocationRt Loc = null!;
     public Match? LocMatch;
     public bool Internal, InErrorPage, Upgraded, Broken, Dropped;
+    public bool ResponseComplete, RequestPending;
     public int StatusOverride, Redirects;
     private bool _keepAlive;
     private long _start;
@@ -98,6 +99,8 @@ internal sealed class HttpContextImpl : HttpContext
     public override HttpResponse Response => Resp;
     public override ConnectionInfo Connection => Info;
     public override ILogger Log => Rt.Log;
+    public override string ResponseOutcome => Dropped ? "dropped" : ResponseComplete ? "complete" : "incomplete";
+    public override string RouteLabel => Loc?.Name ?? "";
     public override IConfigScope Server => ServerRt.Scope;
     public override IConfigScope Location => Loc.Scope;
     public override bool IsInternal => Internal;
@@ -110,6 +113,10 @@ internal sealed class HttpContextImpl : HttpContext
     public void BeginRequest()
     {
         _start = Stopwatch.GetTimestamp();
+        ResponseComplete = false;
+        RequestPending = true;
+        Loc = null!;
+        ServerRt = null!;
         Req.Reset();
         Resp.Reset();
         ResetItems();
@@ -149,8 +156,9 @@ internal sealed class HttpContextImpl : HttpContext
     public override OpenResult OpenFile(string uriPath, out FileResource? file)
     {
         file = null;
-        if (MapPath(uriPath) is not { } p) return OpenResult.NotFound;
+        if (MapPath(uriPath) is not { } p) { this.SecurityEvent("filesystem_mapping_denied"); return OpenResult.NotFound; }
         var r = Files.LocalFiles.Open(p, NoSymlinksFrom(p), out var handle, out long length, out var mtime);
+        if (r == OpenResult.Forbidden) this.SecurityEvent("filesystem_access_denied");
         if (r == OpenResult.Ok) file = new Files.LocalFileResource(handle!, length, mtime, ContentTypeFor(p));
         return r;
     }

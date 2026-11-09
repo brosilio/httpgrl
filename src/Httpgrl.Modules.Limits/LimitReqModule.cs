@@ -174,6 +174,7 @@ public sealed class LimitReqModule : IModule
     private HandlerResult Reject(HttpContext ctx, LimitReqConf c, string zone, string key, long excess)
     {
         bool dry = c.DryRun == true;
+        ctx.SecurityEvent(dry ? "rate_limit_would_reject" : "rate_limit_exceeded");
         ctx.Items[_status] = dry ? "REJECTED_DRY_RUN" : "REJECTED";
         var level = c.Level ?? LogLevel.Warn;
         if (ctx.Log.IsEnabled(level))

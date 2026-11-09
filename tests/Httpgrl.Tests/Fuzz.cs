@@ -30,9 +30,19 @@ internal static partial class Fuzz
 
     public sealed class Finding(string message) : Exception(message);
 
+    private static Target LogPrivacyTarget() => new("log-privacy", B("/x?token=secret", "/%3f/x", "/x#secret"), B("?", "#", "\r\n"), bytes =>
+    {
+        var input = Encoding.UTF8.GetString(bytes);
+        var output = LogPrivacy.PathOnly(input);
+        if (!input.StartsWith(output, StringComparison.Ordinal) || output.Contains('?') || output.Contains('#'))
+            throw new Finding("log redaction retained a query/fragment or changed the path prefix");
+        if (LogPrivacy.PathOnly(output) != output) throw new Finding("redaction is not idempotent");
+        return true;
+    });
+
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
+        LogPrivacyTarget(), RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
         QuicVarIntTarget(), QuicPacketTarget(), QuicFramesTarget(), QuicTransportParametersTarget(), QuicConnectionTarget(), QpackTarget(), H3FramesTarget(), H3SessionTarget(),
     ]);
 

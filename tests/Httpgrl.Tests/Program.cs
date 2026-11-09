@@ -8,6 +8,7 @@ if (args is ["--quic-echo", ..]) return QuicEndpointTests.RunEchoCli(args);
 if (args is ["--bench-quic", ..]) return QuicBench.RunCli(args);
 
 UnitTests.Register();
+MonitoringTests.Register();
 IntegrationTests.Register();
 ProxyTests.Register();
 ClientAuthTests.Register();

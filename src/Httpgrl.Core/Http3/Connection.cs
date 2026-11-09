@@ -103,6 +103,7 @@ internal sealed class Http3Connection
 
     private void Fail(H3Error code, string why, long now)
     {
+        _log.Warn("security", new("event", why == "request header timeout" ? "header_deadline_exceeded" : "http3_connection_rejected"), new("conn", _id), new("remote", _info.RemoteAddress));
         _log.Info("http/3 connection error", new("conn", _id), new("code", code.ToString()), new("reason", why), new("remote", _info.RemoteAddress));
         Q.Close((ulong)code, why, now);
     }
@@ -374,7 +375,7 @@ internal sealed class Http3Connection
 
     private void StreamError(Request r, H3Error code, string why)
     {
-        _log.Debug("http/3 stream error", new("conn", _id), new("stream", r.Id), new("code", code.ToString()), new("reason", why));
+        _log.Info("http/3 stream error", new("event", "http3_stream_rejected"), new("conn", _id), new("stream", r.Id), new("code", code.ToString()), new("reason", why));
         r.Done = true;
         Q.StopSending(r.Id, (ulong)code);
         Q.ResetStream(r.Id, (ulong)code);
@@ -438,6 +439,7 @@ internal sealed class Http3Connection
         }
         finally
         {
+            await RequestLifecycle.FinishAsync(ctx, _mgr).ConfigureAwait(false);
             ctx.EndRequest();
             ctx.Resp.ReturnBuffer();
             _mgr.Untrack(s);

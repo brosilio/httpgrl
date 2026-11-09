@@ -161,6 +161,7 @@ internal static class Http3SessionTests
                 }, 4000));
                 T.Eq((ulong)H3Error.ExcessiveLoad, c.C.ApplicationCloseCode);
             }
+            T.Contains("\"event\":\"header_deadline_exceeded\"", s.LogText());
             using var fresh = Client(s);
             T.Eq("hello", fresh.Get("/index.html").Text);
         });

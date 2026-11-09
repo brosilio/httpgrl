@@ -1,0 +1,22 @@
+groups:
+  - name: httpgrl-evidence
+    rules:
+      - alert: HttpgrlLogsDropped
+        expr: increase(httpgrl_log_lines_dropped_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "httpgrl lost log evidence on {{ $labels.instance }}"
+      - alert: HttpgrlScrapeUnavailable
+        expr: up{job="httpgrl"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "httpgrl metrics unavailable on {{ $labels.instance }}"
+      - alert: HttpgrlMonitoringMissing
+        expr: absent_over_time(up{job="httpgrl"}[5m])
+        labels:
+          severity: critical
+        annotations:
+          summary: "No httpgrl scrape targets are reporting"

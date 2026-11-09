@@ -139,7 +139,7 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `quic_retry on\|off;` | http, server | `off` | Validate every client's address with a Retry (one more round trip) before keeping any state for it. Off, Retry is still used automatically once many handshakes are pending. Retry tokens are AEAD-sealed and bound to the client's address, the time and its connection IDs. |
 | `quic_gso on\|off;` | http, server | `on` | Send runs of QUIC datagrams with one system call (UDP GSO). If the kernel or route refuses, it turns off by itself with a warning. |
 | `server_tokens on\|off;` | | **`off`** | `off`: no `Server` header and no product name on error pages. `on`: `Server: httpgrl/<version>` plus the error-page footer. Note: nginx's `off` still sends a header; here `off` sends none. |
-| `access_log stdout\|off;` | | `stdout` | nginx's `access_log /path [format];` is accepted with a warning: records go to stdout as JSON anyway, and `log_format` is ignored. `error_log /path [level];` likewise (the level applies). That lets a stock nginx config load unchanged. |
+| `access_log stdout\|off;` | | `stdout` | nginx's `access_log /path [format];` is accepted with a warning: records go to stdout as JSON anyway, and `log_format` is ignored. Access records include final outcome, route and upstream details; query values and Referer values are omitted (schema 2). `error_log /path [level];` likewise (the level applies). That lets a stock nginx config load unchanged. |
 
 ### Rewrite, map and headers
 
@@ -381,6 +381,13 @@ Details:
   changed, the connections are closed and redialed with the new settings, so rotating the agent's certificate
   takes effect.
 
+## Security monitoring
+
+See [security monitoring](docs/security-monitoring.md) for the implementation plan, JSON schema 2, event catalog,
+request/upstream correlation, privacy defaults, detector rules and collection/alerting deployment examples. Access
+logs distinguish complete, incomplete and dropped responses. Query strings and Referer values are omitted.
+The server remains dependency-free; optional operational detection and CI detector tests use Python 3 standard library.
+
 ## Security model
 
 Routing regex timeouts fail closed: location matching returns 500, Host matching drops the request, and SNI matching refuses the handshake. QUIC migration into a full per-client connection allowance closes the migrating connection with `NO_VIABLE_PATH`.
@@ -518,6 +525,10 @@ post-quantum support. Upgrading the OS turns it on; httpgrl needs no change. Not
 - The server doesn't identify itself by default (`server_tokens off`).
 
 ## Writing a module
+
+For request audit events, `ctx.ResponseOutcome` exposes the final server-side result and `ctx.RouteLabel` names the
+selected configuration location. `ctx.SecurityEvent("constant_event_id")` emits a bounded, correlated decision through
+`ILogger`; use constant IDs and never put secrets in custom fields. See the [event contract](docs/security-monitoring.md).
 
 A module declares directives (and variables), stores settings in typed per-scope config slots that inherit
 top-down, then installs phase handlers. That is the same lifecycle as an nginx module.

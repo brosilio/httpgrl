@@ -189,7 +189,7 @@ internal sealed class ConnectionManager : IDisposable
             }
             foreach (var (c, why) in doomed)
             {
-                if (why is not ("shutdown" or "configuration reloaded")) _log.Info("connection aborted", new("conn", c.Id), new("reason", why));
+                if (why is not ("shutdown" or "configuration reloaded")) _log.Info("connection aborted", new("event", why == "request header timeout" ? "header_deadline_exceeded" : "connection_aborted"), new("conn", c.Id), new("reason", why));
                 c.Abort(why, graceful: why is "shutdown" or "configuration reloaded" or "reload drain timeout");
             }
             doomed.Clear();
@@ -199,7 +199,7 @@ internal sealed class ConnectionManager : IDisposable
             foreach (var d in _sweep)
             {
                 if (Expired(d, now) is not { } why) continue;
-                _log.Info("stream aborted", new("reason", why), new("bytes", Volatile.Read(ref d.RateBytes)), new("busy_ms", Volatile.Read(ref d.RateBusyMs)),
+                _log.Info("stream aborted", new("event", "stream_aborted"), new("reason", why), new("bytes", Volatile.Read(ref d.RateBytes)), new("busy_ms", Volatile.Read(ref d.RateBusyMs)),
                     new("reading", Volatile.Read(ref d.ReadStartedAt) != 0), new("writing", Volatile.Read(ref d.WriteStartedAt) != 0));
                 d.Abort(why);
             }

@@ -1,0 +1,10 @@
+[Unit]
+Description=Exercise httpgrl access logging for end-to-end monitoring
+[Service]
+Type=oneshot
+DynamicUser=yes
+ExecStart=/usr/bin/curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9091/monitoring-probe
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
