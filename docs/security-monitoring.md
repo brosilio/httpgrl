@@ -110,7 +110,8 @@ loss alerts; lines are limited to 64 KiB. Correlation and alert suppression are 
 it and may repeat alerts. Replay a window of raw logs after restart. Capacity/clock skew/late delivery can weaken
 correlation. Preserve raw central logs for reanalysis. Policy errors are operator errors and should prevent deployment.
 
-`httpgrl-monitor.service` provides a local journal consumer with five-minute replay on restart. Install the script
+`httpgrl-monitor.service` provides a local journal consumer with five-minute replay on restart. It selects
+`_TRANSPORT=stdout` so systemd lifecycle messages are not mistaken for malformed application JSON. Install the script
 at `/usr/local/lib/httpgrl-monitor/detect.py`, policy at `/etc/httpgrl-monitor/policy.json` (operator writable only),
 and the unit under `/etc/systemd/system`. Its dynamic user belongs to `systemd-journal` and can read the journal;
 use a collector-side detector instead if that access is inappropriate. Monitor this service's availability too.
@@ -140,6 +141,10 @@ Examples in `dist/monitoring/` are **not installed automatically**:
    Preserve collector host identity rather than allowing JSON `instance` to overwrite trusted labels.
 6. Forward detector records (`httpgrl-monitor.service`) as well as raw server records; the rsyslog example selects both.
    Configure notification grouping and ownership. No destination or recipients are assumed in this repository.
+
+Binary deployments need a readiness check: `Type=exec` becoming active does not mean listeners are bound yet.
+Use a bounded retry (for example, `curl --retry 10 --retry-connrefused --retry-delay 1 --retry-max-time 30`) before
+triggering rollback. Keep the prior binary and configuration together in a root-only backup.
 
 Deployment acceptance: send a normal request and a denied request; find both at the remote collector by request ID.
 Temporarily stop forwarding (leave the server running) and verify the missing-probe alert fires, then restore forwarding
