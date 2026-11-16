@@ -67,7 +67,10 @@ docker compose up --build                              # see compose.yaml
 | Project | Role |
 |---|---|
 | `src/Httpgrl.Abstractions` | **The plugin API.** It is the only thing modules reference. |
-| `src/Httpgrl.Core` | Config parser, HTTP/1.1 engine, connection management, TLS, logging. Also the core modules (`http_core`, `http_ssl`, `http_log`), which are written against the same API. |
+| `src/Httpgrl.Core` | Config parser, HTTP/1.1 and HTTP/2 engines, the HTTP/3 server adapter, connection management, TLS, logging. Also the core modules (`http_core`, `http_ssl`, `http_log`), which are written against the same API. |
+| `src/Httpgrl.HttpFields` | **Protocol library.** HPACK and its Huffman code, shared by HTTP/2 and QPACK. No dependencies. |
+| `src/Httpgrl.Quic` | **Protocol library.** QUIC: the connection state machine on a caller-supplied clock, recovery and congestion control, TLS through OpenSSL 3.5's QUIC API, and the server UDP endpoint. No dependencies. |
+| `src/Httpgrl.Http3` | **Protocol library.** HTTP/3 framing, QPACK, and `Http3ServerConnection` (control and QPACK streams, request streams, GOAWAY, the request-head deadline). Depends only on the two above. |
 | `src/Httpgrl.Modules.StaticFiles` | `http_index`, `http_autoindex`, `http_static`. |
 | `src/Httpgrl.Modules.Rewrite` | `http_rewrite` (`return`, `set`, `if`, `break`) and `http_map`. |
 | `src/Httpgrl.Modules.Headers` | `http_headers`: `add_header`. |
@@ -78,12 +81,20 @@ docker compose up --build                              # see compose.yaml
 | `src/Httpgrl.Modules.Proxy` | `http_proxy`: `proxy_pass`, `upstream {}`, WebSocket/Upgrade tunnelling. |
 | `src/Httpgrl` | Host executable. The compiled-in module list is in `Program.cs`. |
 | `tests/Httpgrl.Tests` | A dependency-free test runner. It runs on the JIT, and `ci.sh` also publishes and runs it as native AOT. |
+| `tests/Httpgrl.Libraries.Smoke` | Uses the protocol libraries through their public API only (a QUIC server serving HTTP/3, and a client request), on the JIT and as native AOT. |
+
+The protocol libraries are public API for other software (the plan is in
+[docs/plan-protocol-libraries.md](docs/plan-protocol-libraries.md)). The server uses them the way any other consumer
+would: through their public API, with no `InternalsVisibleTo` to Core. `scripts/check-boundaries.sh` enforces which
+library may reference which.
 
 Inside Core:
 - `Config/`: lexer, parser, scopes, and the `$variable` compiler.
 - `Http/`: request parser, URI normaliser, body decoder, response writer, session loop.
 - `Pipeline/`: location/vhost routing and phase execution.
 - `Hosting/`: sockets, the connection table and the deadline sweeper.
+- `Http2/`: HTTP/2 framing, sessions and streams.
+- `Http3/`: the HTTP/3 server adapter: maps `Http3ServerConnection` requests onto the pipeline and follows reloads.
 
 ## Configuration
 

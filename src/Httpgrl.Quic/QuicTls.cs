@@ -2,7 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>QUIC encryption levels, numbered as OpenSSL's protection levels (OSSL_RECORD_PROTECTION_LEVEL_*).</summary>
 internal enum QuicLevel : byte
@@ -598,16 +598,32 @@ internal sealed unsafe class ChaChaMask : IDisposable
 }
 
 /// <summary>
+/// A server's client-certificate policy, applied once the handshake has collected the client's certificate and before
+/// anything 1-RTT is processed. OpenSSL only collects the certificate; the verdict is entirely the policy's.
+/// </summary>
+public interface IQuicClientCertificatePolicy
+{
+    /// <summary>
+    /// The verdict (for logs and <c>$ssl_client_verify</c>-like variables) and whether the handshake may proceed.
+    /// <paramref name="certificate"/> is null when the client sent none.
+    /// </summary>
+    (string Verdict, bool Accept) Evaluate(System.Security.Cryptography.X509Certificates.X509Certificate2? certificate, System.Security.Cryptography.X509Certificates.X509Certificate2Collection? intermediates);
+}
+
+/// <summary>
 /// An OpenSSL context for QUIC: one per server{} (its certificate, AES-GCM suites, ALPN), or a client's (its CA).
 /// Built at configuration time; disposed with the configuration.
 /// </summary>
-internal sealed class QuicTlsContext : IDisposable
+public sealed class QuicTlsContext : IDisposable
 {
+    /// <summary>Why QUIC's TLS can't run on this system (no OpenSSL 3.5 with its QUIC API), or null when it can.</summary>
+    public static string? Unavailable => QuicTls.Unavailable;
+
     internal IntPtr Handle { get; private set; }
     private readonly IntPtr _alpnArg;
     public bool VerifyPeer { get; }
     /// <summary>A server's client-certificate policy (ssl_verify_client), applied after the handshake; null: none asked.</summary>
-    public Modules.ClientAuth? ClientAuth { get; private init; }
+    public IQuicClientCertificatePolicy? ClientAuth { get; private init; }
 
     private QuicTlsContext(IntPtr handle, IntPtr alpnArg, bool verify)
     {
@@ -620,7 +636,7 @@ internal sealed class QuicTlsContext : IDisposable
     /// A server context: the PEM certificate chain and key (the ssl_certificate files), offering <paramref name="alpn"/>.
     /// With <paramref name="clientAuth"/>, it asks for a client certificate (naming the CAs in <paramref name="clientCa"/>).
     /// </summary>
-    public static QuicTlsContext Server(string certFile, string keyFile, string[] alpn, Modules.ClientAuth? clientAuth = null, string? clientCa = null)
+    public static QuicTlsContext Server(string certFile, string keyFile, string[] alpn, IQuicClientCertificatePolicy? clientAuth = null, string? clientCa = null)
     {
         var ctx = QuicTls.NewContext(server: true, alpn, out var arg);
         try

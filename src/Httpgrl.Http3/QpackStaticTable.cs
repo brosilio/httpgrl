@@ -1,5 +1,5 @@
 // Generated from RFC 9204 Appendix A (the RFC text, not typed by hand).
-namespace Httpgrl.Core.Http3;
+namespace Httpgrl.Http3;
 
 internal static class QpackStaticTable
 {

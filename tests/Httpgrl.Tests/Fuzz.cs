@@ -524,19 +524,19 @@ internal static partial class Fuzz
             data =>
             {
                 const int listMax = 16 << 10, tableMax = 4096;
-                var d = new Httpgrl.Core.Http2.HpackDecoder(tableMax, listMax);
+                var d = new Httpgrl.HttpFields.HpackDecoder(tableMax, listMax);
                 var got = new List<(byte[], byte[])>();
                 long size = 0;
                 try { d.Decode(data, (n, v) => { got.Add((n.ToArray(), v.ToArray())); size += n.Length + v.Length + 32; }); }
-                catch (Httpgrl.Core.Http2.HpackException) { return false; }
+                catch (Httpgrl.HttpFields.HpackException) { return false; }
                 if (d.TableSize > tableMax) throw new Finding($"dynamic table at {d.TableSize} bytes");
                 if (size > listMax) throw new Finding($"emitted {size} bytes of fields");
                 if (got.Count > 128) throw new Finding($"emitted {got.Count} fields");
                 var buf = new byte[64];
                 int len = 0;
-                foreach (var (n, v) in got) Httpgrl.Core.Http2.HpackEncoder.Encode(ref buf, ref len, Encoding.Latin1.GetString(n), Encoding.Latin1.GetString(v));
+                foreach (var (n, v) in got) Httpgrl.HttpFields.HpackEncoder.Encode(ref buf, ref len, Encoding.Latin1.GetString(n), Encoding.Latin1.GetString(v));
                 var again = new List<(byte[], byte[])>();
-                new Httpgrl.Core.Http2.HpackDecoder(tableMax, 1 << 30, 1 << 20).Decode(buf.AsSpan(0, len), (n, v) => again.Add((n.ToArray(), v.ToArray())));
+                new Httpgrl.HttpFields.HpackDecoder(tableMax, 1 << 30, 1 << 20).Decode(buf.AsSpan(0, len), (n, v) => again.Add((n.ToArray(), v.ToArray())));
                 if (again.Count != got.Count) throw new Finding("round trip changed the field count");
                 for (int k = 0; k < got.Count; k++)
                     if (!again[k].Item1.AsSpan().SequenceEqual(got[k].Item1) || !again[k].Item2.AsSpan().SequenceEqual(got[k].Item2)) throw new Finding($"round trip changed field {k}");
@@ -552,12 +552,12 @@ internal static partial class Fuzz
         {
             var dec = new byte[data.Length * 8 / 5 + 1];
             int n;
-            try { n = Httpgrl.Core.Http2.Huffman.Decode(data, dec); }
-            catch (Httpgrl.Core.Http2.HpackException) { return false; }
-            var enc = new byte[Httpgrl.Core.Http2.Huffman.EncodedLength(dec.AsSpan(0, n))];
-            int e = Httpgrl.Core.Http2.Huffman.Encode(dec.AsSpan(0, n), enc);
+            try { n = Httpgrl.HttpFields.Huffman.Decode(data, dec); }
+            catch (Httpgrl.HttpFields.HpackException) { return false; }
+            var enc = new byte[Httpgrl.HttpFields.Huffman.EncodedLength(dec.AsSpan(0, n))];
+            int e = Httpgrl.HttpFields.Huffman.Encode(dec.AsSpan(0, n), enc);
             var back = new byte[e * 8 / 5 + 1];
-            int m = Httpgrl.Core.Http2.Huffman.Decode(enc.AsSpan(0, e), back);
+            int m = Httpgrl.HttpFields.Huffman.Decode(enc.AsSpan(0, e), back);
             if (!back.AsSpan(0, m).SequenceEqual(dec.AsSpan(0, n))) throw new Finding("encode/decode round trip differs");
             return true;
         }, MaxLen: 512);

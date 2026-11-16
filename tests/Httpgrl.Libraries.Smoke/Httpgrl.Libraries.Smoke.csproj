@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Uses the protocol libraries exactly as an outside consumer (the game engine) would: public API only, no
+    InternalsVisibleTo. ci.sh runs it on the JIT and as native AOT. Run: dotnet run -c Release (from this dir).
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Httpgrl.Quic/Httpgrl.Quic.csproj" />
+    <ProjectReference Include="../../src/Httpgrl.Http3/Httpgrl.Http3.csproj" />
+    <ProjectReference Include="../../src/Httpgrl.HttpFields/Httpgrl.HttpFields.csproj" />
+  </ItemGroup>
+</Project>

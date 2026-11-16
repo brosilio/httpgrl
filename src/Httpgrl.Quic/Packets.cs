@@ -1,6 +1,6 @@
 using System.Buffers.Binary;
 
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 internal enum PacketType : byte
 {

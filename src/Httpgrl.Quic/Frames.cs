@@ -1,4 +1,4 @@
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>QUIC frame types (RFC 9000 19, RFC 9221 4). Ranges (ACK, STREAM, ...) are named by their first value.</summary>
 internal static class QuicFrameType

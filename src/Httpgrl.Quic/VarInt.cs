@@ -1,9 +1,9 @@
 using System.Buffers.Binary;
 
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>QUIC variable-length integers (RFC 9000 16): 1, 2, 4 or 8 bytes, the top two bits giving the length.</summary>
-internal static class VarInt
+public static class VarInt
 {
     public const ulong Max = (1UL << 62) - 1;
 

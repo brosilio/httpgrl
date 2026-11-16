@@ -19,6 +19,9 @@ ARG TARGETARCH
 COPY global.json Directory.Build.props httpgrl.slnx ./
 COPY src/Httpgrl.Abstractions/Httpgrl.Abstractions.csproj src/Httpgrl.Abstractions/
 COPY src/Httpgrl.Core/Httpgrl.Core.csproj src/Httpgrl.Core/
+COPY src/Httpgrl.HttpFields/Httpgrl.HttpFields.csproj src/Httpgrl.HttpFields/
+COPY src/Httpgrl.Quic/Httpgrl.Quic.csproj src/Httpgrl.Quic/
+COPY src/Httpgrl.Http3/Httpgrl.Http3.csproj src/Httpgrl.Http3/
 COPY src/Httpgrl.Modules.StaticFiles/Httpgrl.Modules.StaticFiles.csproj src/Httpgrl.Modules.StaticFiles/
 COPY src/Httpgrl.Modules.Rewrite/Httpgrl.Modules.Rewrite.csproj src/Httpgrl.Modules.Rewrite/
 COPY src/Httpgrl.Modules.Headers/Httpgrl.Modules.Headers.csproj src/Httpgrl.Modules.Headers/

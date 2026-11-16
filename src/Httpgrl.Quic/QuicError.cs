@@ -1,7 +1,7 @@
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>QUIC transport error codes (RFC 9000 20.1). TLS alerts are <see cref="CryptoError"/> + the alert.</summary>
-internal enum QuicError : ulong
+public enum QuicError : ulong
 {
     NoError = 0x00,
     InternalError = 0x01,
@@ -24,7 +24,7 @@ internal enum QuicError : ulong
 }
 
 /// <summary>A connection error: closes the connection with CONNECTION_CLOSE carrying <see cref="Code"/>.</summary>
-internal sealed class QuicException(QuicError code, string message, ulong frameType = 0) : Exception(message)
+public sealed class QuicException(QuicError code, string message, ulong frameType = 0) : Exception(message)
 {
     public QuicError Code { get; } = code;
     /// <summary>The frame type that caused it, for CONNECTION_CLOSE (0 when it wasn't a frame).</summary>

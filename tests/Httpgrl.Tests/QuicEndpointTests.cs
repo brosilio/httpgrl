@@ -1,6 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 
 namespace Httpgrl.Tests;
 
@@ -137,8 +137,16 @@ internal static class QuicEndpointTests
     }
 
     /// <summary>Counts error-level lines (an endpoint must never log one in these tests).</summary>
-    internal sealed class ErrorCounter : ILogger
+    internal sealed class ErrorCounter : ILogger, IQuicLog
     {
+        public void Write(QuicLogLevel level, string msg, ReadOnlySpan<(string Key, string? Value)> fields)
+        {
+            foreach (var (k, v) in fields) if (k == "event") LastEvent = v;
+            if (level < QuicLogLevel.Error) return;
+            Errors++;
+            Last = msg;
+        }
+
         public string? LastEvent;
         public int Errors;
         public string? Last;
@@ -187,6 +195,22 @@ internal static class QuicEndpointTests
 
     public static void Register()
     {
+        T.Add("quic endpoint: per-client key groups addresses exactly as the TCP limits do (IPv4, mapped IPv4, IPv6 /64)", () =>
+        {
+            // Httpgrl.Quic can't use Core's IpKey, so it has a twin: a drift would let one transport's limit be dodged.
+            string[] addrs = ["192.0.2.1", "192.0.2.2", "::ffff:192.0.2.1", "2001:db8:1:2::1", "2001:db8:1:2:ffff::9", "2001:db8:1:3::1", "::1", "0.0.0.1"];
+            foreach (var a in addrs)
+                foreach (var b in addrs)
+                {
+                    var ea = new IPEndPoint(IPAddress.Parse(a), 443);
+                    var eb = new IPEndPoint(IPAddress.Parse(b), 1234);
+                    bool tcp = Httpgrl.Core.Hosting.IpKey.From(ea) == Httpgrl.Core.Hosting.IpKey.From(eb);
+                    bool quic = ClientKey.From(ea) == ClientKey.From(eb);
+                    T.Eq(tcp, quic, a + " vs " + b);
+                }
+            T.Eq(ClientKey.From(new IPEndPoint(IPAddress.Parse("2001:db8:1:2::1"), 1)), ClientKey.From(new IPEndPoint(IPAddress.Parse("2001:db8:1:2:ffff::9"), 2)));
+            T.True(ClientKey.From(new IPEndPoint(IPAddress.Parse("192.0.2.1"), 1)) != ClientKey.From(new IPEndPoint(IPAddress.Parse("192.0.2.2"), 1)));
+        });
         T.Add("quic endpoint: migration enforces destination connection limit", () =>
         {
             if (QuicTls.Unavailable is not null) return;
@@ -346,7 +370,7 @@ internal static class QuicEndpointTests
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         socket.Bind(new IPEndPoint(IPAddress.Loopback, port));
         using var log = new Httpgrl.Core.Logging.JsonLogger(Console.OpenStandardOutput(), LogLevel.Debug);
-        using var ep = new QuicEndpoint(socket, tls, _ => tls, new EchoApp(), log, o);
+        using var ep = new QuicEndpoint(socket, tls, _ => tls, new EchoApp(), new Httpgrl.Core.Logging.QuicLogAdapter(log), o);
         ep.Start();
         Console.WriteLine($"quic echo on {socket.LocalEndPoint}, ALPN echo, trust {Path.Combine(dir, "q.crt")}");
         Thread.Sleep(Timeout.Infinite);

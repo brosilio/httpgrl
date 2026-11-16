@@ -1,7 +1,7 @@
 using System.Net;
 using System.Text;
 using Httpgrl.Core.Http3;
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 
 namespace Httpgrl.Tests;
 

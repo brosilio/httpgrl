@@ -61,7 +61,7 @@ public enum VerifyClient : byte { Off, On, Optional, OptionalNoCa }
 /// no system roots, no revocation fetches, no AIA downloads (a client-supplied URL must never make us connect out),
 /// and the leaf must allow TLS client authentication.
 /// </summary>
-public sealed class ClientAuth
+public sealed class ClientAuth : Httpgrl.Quic.IQuicClientCertificatePolicy
 {
     private static readonly Oid ClientAuthEku = new("1.3.6.1.5.5.7.3.2");
 
@@ -291,7 +291,7 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
             ssl.ClientAuth = auth;
             if (sc.Listens.Exists(l => l.Quic) && server.Get<HttpCoreConf>().Http3Enabled)
             {
-                if (Quic.QuicTls.Unavailable is { } why)
+                if (Quic.QuicTlsContext.Unavailable is { } why)
                 {
                     if (!_quicWarned) { _quicWarned = true; setup.Log.Warn("HTTP/3 unavailable, quic listeners are skipped", new LogField("reason", why)); }
                 }

@@ -12,6 +12,10 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
 - CI also runs the optional operational detector's standard-library Python 3 tests.
 
 ### Added
+- Protocol libraries, public API for other software: `Httpgrl.Quic` (QUIC transport, recovery, TLS, server
+  endpoint), `Httpgrl.Http3` (HTTP/3 framing, QPACK, `Http3ServerConnection`) and `Httpgrl.HttpFields` (HPACK,
+  Huffman). The server is rebuilt on them and uses only their public API. No change on the wire or in configuration.
+  See `docs/plan-protocol-libraries.md`.
 - Process/instance/version metadata, explicit truncation flags, correlated security decision events, and exactly-once
   access logging for interrupted HTTP/1, HTTP/2 and HTTP/3 handler lifecycles.
 - Final server-side response outcome, normalized path, selected server/location and upstream details in access records.

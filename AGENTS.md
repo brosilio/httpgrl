@@ -107,7 +107,7 @@ actually takes effect.
 - **Always work on `develop`.** Commit there (or on short-lived topic branches cut from it and merged back).
 - **`main` is "mostly stable".** It only moves by merging `develop` once `./scripts/ci.sh` passes. Never commit directly to `main`, and never rewrite its history.
 - **Releases are cut from tagged commits on `main`** (e.g. `v0.2.0`). Tag only on `main`, only on a commit that passed CI. Bump `<Version>` in `Directory.Build.props` to match the tag, and add the release to `CHANGELOG.md`.
-- **Versions follow [Semantic Versioning 2.0.0](https://semver.org/)** everywhere: tags (`vMAJOR.MINOR.PATCH`), `<Version>`, the changelog and the binary's reported version. The public API is the configuration language, the plugin API (`Httpgrl.Abstractions`) and the Core APIs other software builds on (`ServerBuilder`, `HttpServer`, `JsonLogger`).
+- **Versions follow [Semantic Versioning 2.0.0](https://semver.org/)** everywhere: tags (`vMAJOR.MINOR.PATCH`), `<Version>`, the changelog and the binary's reported version. The public API is the configuration language, the plugin API (`Httpgrl.Abstractions`), the protocol libraries (`Httpgrl.Quic`, `Httpgrl.Http3`, `Httpgrl.HttpFields`) and the Core APIs other software builds on (`ServerBuilder`, `HttpServer`, `JsonLogger`).
   - While at `0.y.z` (initial development), a breaking change bumps MINOR and anything else bumps PATCH.
   - From `1.0.0`: breaking changes bump MAJOR, new features MINOR, fixes PATCH.
   - "Best implementation over backwards compatibility" still holds, but a break is a version bump that's called out in the changelog, never a silent change.

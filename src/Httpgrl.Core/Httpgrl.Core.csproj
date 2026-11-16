@@ -4,6 +4,10 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Httpgrl.Abstractions/Httpgrl.Abstractions.csproj" />
+    <!-- The protocol libraries, used only through their public API (no InternalsVisibleTo to Core). -->
+    <ProjectReference Include="../Httpgrl.HttpFields/Httpgrl.HttpFields.csproj" />
+    <ProjectReference Include="../Httpgrl.Quic/Httpgrl.Quic.csproj" />
+    <ProjectReference Include="../Httpgrl.Http3/Httpgrl.Http3.csproj" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Httpgrl.Tests" />

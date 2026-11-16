@@ -1,6 +1,6 @@
 using System.Net;
 using System.Security.Cryptography;
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 
 namespace Httpgrl.Tests;
 

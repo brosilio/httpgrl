@@ -85,6 +85,7 @@ internal sealed class Connection : Deadlines
     }
 }
 
+// The QUIC endpoint has a twin of this (Httpgrl.Quic ClientKey) for its per-client limit: keep the two identical.
 /// <summary>Per-client accounting key: an IPv4 address, or an IPv6 /64 (one end-site).</summary>
 internal readonly record struct IpKey(ulong Hi, ulong Lo)
 {

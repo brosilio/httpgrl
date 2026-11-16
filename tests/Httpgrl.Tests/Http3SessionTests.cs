@@ -1,6 +1,6 @@
 using System.Net;
 using Httpgrl.Core.Http3;
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 
 namespace Httpgrl.Tests;
 

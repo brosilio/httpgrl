@@ -241,7 +241,7 @@ public sealed class HttpServer : IAsyncDisposable
         var (b, rt) = (l.Current.Binding, l.Current.Rt);
         var app = new Http3.Http3Application(_mgr);
         app.Update(b, rt);
-        var ep = new Quic.QuicEndpoint(l.Socket, null, _ => null, app, rt.Log, QuicOptions(b, rt));
+        var ep = new Quic.QuicEndpoint(l.Socket, null, _ => null, app, new Logging.QuicLogAdapter(rt.Log), QuicOptions(b, rt));
         app.Attach(ep);
         l.App = app;
         l.Endpoint = ep;

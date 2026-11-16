@@ -2,7 +2,7 @@ using System.Net;
 using Httpgrl.Core.Hosting;
 using Httpgrl.Core.Modules;
 using Httpgrl.Core.Pipeline;
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 
 namespace Httpgrl.Core.Http3;
 
