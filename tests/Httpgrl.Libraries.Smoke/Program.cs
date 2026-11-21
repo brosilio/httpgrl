@@ -1,5 +1,6 @@
 // The protocol libraries through their public API only: a QUIC server endpoint serving HTTP/3 with
-// Http3ServerConnection, and a hand-driven QUIC client making one HTTP/3 request over loopback UDP. Exits 0 on
+// Http3ServerConnection, and the QUIC client endpoint making one HTTP/3 request over loopback UDP, verifying the
+// server's certificate. Exits 0 on
 // success, 1 on failure, and 0 with a note when this system's OpenSSL has no QUIC API (as httpgrl itself does).
 using System.Net;
 using System.Net.Sockets;
@@ -95,69 +96,58 @@ sealed class HelloApp : IQuicApplication, IHttp3ServerHandler
     }
 }
 
-static class Client
+/// <summary>One GET over HTTP/3, through the public client endpoint.</summary>
+sealed class Client(string path) : IQuicApplication
 {
+    public string Status = "", Body = "";
+    public readonly ManualResetEventSlim Done = new();
+    private long _request = -1;
+    private readonly byte[] _buf = new byte[65536];
+    private readonly H3FrameReader _reader = new(1 << 16);
+    private readonly QpackDecoder _qpack = new(1 << 16);
+
     public static (string Status, string Body) Get(EndPoint server, QuicTlsContext tls, string path)
     {
-        using var s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        s.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        using var c = QuicConnection.Client(tls, "smoke.test", ["h3"], new QuicOptions(), () => (RandomNumberGenerator.GetBytes(8), RandomNumberGenerator.GetBytes(16)), server, QuicEndpoint.Now());
-        var buf = new byte[65536];
-        long request = -1;
-        string status = "", body = "";
-        bool done = false;
-        var reader = new H3FrameReader(1 << 16);
-        var qpack = new QpackDecoder(1 << 16);
-        EndPoint from = new IPEndPoint(IPAddress.Any, 0);
-        long until = Environment.TickCount64 + 10_000;
-        while (!done && !c.IsClosed && Environment.TickCount64 < until)
+        var app = new Client(path);
+        using var ep = new QuicClientEndpoint(app);
+        ep.Start();
+        var c = ep.Connect(server, "smoke.test", ["h3"], tls);
+        app.Done.Wait(10_000);
+        ep.Run(c, q => q.Close(0x100, "", QuicClock.Now()));
+        return (app.Status, app.Body);
+    }
+
+    public void Closed(QuicConnection c) => Done.Set();
+
+    public void OnEvent(QuicConnection c, in QuicEvent e, long now)
+    {
+        if (e.Kind == QuicEventKind.Connected)
         {
-            long now = QuicEndpoint.Now();
-            while (c.TryGetEvent(out var e))
-            {
-                if (e.Kind == QuicEventKind.Connected && request < 0)
-                {
-                    long control = c.OpenStream(bidi: false);
-                    c.StreamWrite(control, [(byte)H3StreamType.Control, .. H3FrameWriter.Settings((H3Settings.MaxFieldSectionSize, 1 << 16))], fin: false);
-                    byte[] head = new byte[256];
-                    int len = 0;
-                    QpackEncoder.Begin(ref head, ref len);
-                    QpackEncoder.Encode(ref head, ref len, ":method", "GET");
-                    QpackEncoder.Encode(ref head, ref len, ":scheme", "https");
-                    QpackEncoder.Encode(ref head, ref len, ":authority", "smoke.test");
-                    QpackEncoder.Encode(ref head, ref len, ":path", path);
-                    var frame = new byte[len + 16];
-                    int h = H3FrameWriter.Header(frame, H3FrameType.Headers, len);
-                    head.AsSpan(0, len).CopyTo(frame.AsSpan(h));
-                    request = c.OpenStream(bidi: true);
-                    c.StreamWrite(request, frame.AsSpan(0, h + len), fin: true);
-                }
-                else if (e.Kind == QuicEventKind.StreamReadable && e.StreamId == request)
-                {
-                    int n;
-                    while ((n = c.StreamRead(request, buf, out bool fin, out _)) > 0 || fin)
-                    {
-                        reader.Feed(buf.AsSpan(0, n),
-                            (type, payload) => { if (type == H3FrameType.Headers) qpack.Decode(payload, (k, v) => { if (k.SequenceEqual(":status"u8)) status = Encoding.ASCII.GetString(v); }); },
-                            data => body += Encoding.ASCII.GetString(data));
-                        if (fin) { done = true; break; }
-                    }
-                }
-            }
-            int m;
-            while ((m = c.Send(buf, now, out var to)) > 0) s.SendTo(buf.AsSpan(0, m), to);
-            long d = c.Deadline;
-            int waitUs = (int)Math.Clamp(d == 0 ? 50_000 : d - now, 0, 50_000);
-            if (s.Poll(waitUs, SelectMode.SelectRead))
-                for (int i = 0; i < 64 && (i == 0 || s.Available > 0); i++)
-                {
-                    int n = s.ReceiveFrom(buf, ref from);
-                    c.Receive(buf.AsSpan(0, n), from, QuicEndpoint.Now());
-                }
-            now = QuicEndpoint.Now();
-            if (c.Deadline != 0 && c.Deadline <= now) c.OnTimeout(now);
+            long control = c.OpenStream(bidi: false);
+            c.StreamWrite(control, [(byte)H3StreamType.Control, .. H3FrameWriter.Settings((H3Settings.MaxFieldSectionSize, 1 << 16))], fin: false);
+            byte[] head = new byte[256];
+            int len = 0;
+            QpackEncoder.Begin(ref head, ref len);
+            QpackEncoder.Encode(ref head, ref len, ":method", "GET");
+            QpackEncoder.Encode(ref head, ref len, ":scheme", "https");
+            QpackEncoder.Encode(ref head, ref len, ":authority", "smoke.test");
+            QpackEncoder.Encode(ref head, ref len, ":path", path);
+            var frame = new byte[len + 16];
+            int h = H3FrameWriter.Header(frame, H3FrameType.Headers, len);
+            head.AsSpan(0, len).CopyTo(frame.AsSpan(h));
+            _request = c.OpenStream(bidi: true);
+            c.StreamWrite(_request, frame.AsSpan(0, h + len), fin: true);
         }
-        c.Close(0x100, "", QuicEndpoint.Now());
-        return (status, body);
+        else if (e.Kind == QuicEventKind.StreamReadable && e.StreamId == _request)
+        {
+            int n;
+            while ((n = c.StreamRead(_request, _buf, out bool fin, out _)) > 0 || fin)
+            {
+                _reader.Feed(_buf.AsSpan(0, n),
+                    (type, payload) => { if (type == H3FrameType.Headers) _qpack.Decode(payload, (k, v) => { if (k.SequenceEqual(":status"u8)) Status = Encoding.ASCII.GetString(v); }); },
+                    data => Body += Encoding.ASCII.GetString(data));
+                if (fin) { Done.Set(); break; }
+            }
+        }
     }
 }

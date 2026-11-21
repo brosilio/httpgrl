@@ -27,6 +27,7 @@ QuicTlsTests.Register();
 QuicRecoveryTests.Register();
 QuicConnectionTests.Register();
 QuicEndpointTests.Register();
+QuicClientTests.Register();
 QuicInteropCases.Register();
 Http3Tests.Register();
 Http3SessionTests.Register();

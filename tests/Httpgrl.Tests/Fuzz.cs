@@ -43,14 +43,14 @@ internal static partial class Fuzz
     private static readonly Lazy<Target[]> All = new(() =>
     [
         LogPrivacyTarget(), RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
-        QuicVarIntTarget(), QuicPacketTarget(), QuicFramesTarget(), QuicTransportParametersTarget(), QuicConnectionTarget(), QpackTarget(), H3FramesTarget(), H3SessionTarget(),
+        QuicVarIntTarget(), QuicPacketTarget(), QuicFramesTarget(), QuicTransportParametersTarget(), QuicConnectionTarget(), QuicClientHandshakeTarget(), QuicClientFramesTarget(), QpackTarget(), H3FramesTarget(), H3SessionTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "qpack", "h3-frames", "h3-session" })
+        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "quic-client-handshake", "quic-client-frames", "qpack", "h3-frames", "h3-session" })
         {
-            int iterations = name == "config" ? 3_000 : name == "h2-session" ? 2_000 : name == "quic-connection" ? 1_000 : name == "h3-session" ? 100 : 20_000;
+            int iterations = name == "config" ? 3_000 : name == "h2-session" ? 2_000 : name is "quic-connection" or "quic-client-frames" ? 1_000 : name == "quic-client-handshake" ? 3_000 : name == "h3-session" ? 100 : 20_000;
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
             {
                 var t = Array.Find(All.Value, x => x.Name == name)!;

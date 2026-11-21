@@ -16,6 +16,11 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
   endpoint), `Httpgrl.Http3` (HTTP/3 framing, QPACK, `Http3ServerConnection`) and `Httpgrl.HttpFields` (HPACK,
   Huffman). The server is rebuilt on them and uses only their public API. No change on the wire or in configuration.
   See `docs/plan-protocol-libraries.md`.
+- QUIC client side in `Httpgrl.Quic`: `QuicClientEndpoint` (one UDP socket, many connections), TLS behind
+  `QuicTlsContext`/`IQuicTlsSession` so a platform can bring its own, and `QuicOpenSsl` to choose which OpenSSL
+  files load (per-platform defaults). Client contexts verify the server (CA bundle or system roots, and the name)
+  unless made with `ClientWithoutVerification`. Clients ignore Version Negotiation that doesn't echo their
+  connection IDs or that lists v1, and Retry that isn't addressed to them or hands back their own DCID.
 - Process/instance/version metadata, explicit truncation flags, correlated security decision events, and exactly-once
   access logging for interrupted HTTP/1, HTTP/2 and HTTP/3 handler lifecycles.
 - Final server-side response outcome, normalized path, selected server/location and upstream details in access records.

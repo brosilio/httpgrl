@@ -69,7 +69,7 @@ docker compose up --build                              # see compose.yaml
 | `src/Httpgrl.Abstractions` | **The plugin API.** It is the only thing modules reference. |
 | `src/Httpgrl.Core` | Config parser, HTTP/1.1 and HTTP/2 engines, the HTTP/3 server adapter, connection management, TLS, logging. Also the core modules (`http_core`, `http_ssl`, `http_log`), which are written against the same API. |
 | `src/Httpgrl.HttpFields` | **Protocol library.** HPACK and its Huffman code, shared by HTTP/2 and QPACK. No dependencies. |
-| `src/Httpgrl.Quic` | **Protocol library.** QUIC: the connection state machine on a caller-supplied clock, recovery and congestion control, TLS through OpenSSL 3.5's QUIC API, and the server UDP endpoint. No dependencies. |
+| `src/Httpgrl.Quic` | **Protocol library.** QUIC: the connection state machine on a caller-supplied clock, recovery and congestion control, the server and client UDP endpoints, and TLS behind `QuicTlsContext` (built in: OpenSSL 3.5's QUIC API, loaded per platform; clients verify the server by default). No dependencies. |
 | `src/Httpgrl.Http3` | **Protocol library.** HTTP/3 framing, QPACK, and `Http3ServerConnection` (control and QPACK streams, request streams, GOAWAY, the request-head deadline). Depends only on the two above. |
 | `src/Httpgrl.Modules.StaticFiles` | `http_index`, `http_autoindex`, `http_static`. |
 | `src/Httpgrl.Modules.Rewrite` | `http_rewrite` (`return`, `set`, `if`, `break`) and `http_map`. |

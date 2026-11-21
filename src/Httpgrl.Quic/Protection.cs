@@ -4,7 +4,7 @@ using System.Security.Cryptography;
 namespace Httpgrl.Quic;
 
 /// <summary>The AEADs QUIC packets are protected with (RFC 9001 5).</summary>
-internal enum QuicCipher : byte
+public enum QuicCipher : byte
 {
     Aes128Gcm,
     Aes256Gcm,

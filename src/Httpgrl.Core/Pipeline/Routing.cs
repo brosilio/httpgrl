@@ -276,7 +276,7 @@ internal static class RoutingBuilder
         foreach (var (spec, hosts) in groups.Values)
         {
             // A quic listener is skipped where HTTP/3 can't run (logged once by the ssl module); the rest still starts.
-            if (spec.Quic && Quic.QuicTlsContext.Unavailable is not null) continue;
+            if (spec.Quic && Http3.Http3Support.Unavailable is not null) continue;
             if (spec.EndPoint is IPEndPoint ip && spec.IsWildcard)
             {
                 var b = new ListenBinding(spec.EndPoint, spec.Ssl, spec.Backlog, spec.ReusePort, spec.Quic) { Hosts = hosts, ProxyProtocol = spec.ProxyProtocol };
@@ -287,7 +287,7 @@ internal static class RoutingBuilder
         foreach (var (spec, hosts) in groups.Values)
         {
             if (spec.IsWildcard) continue;
-            if (spec.Quic && Quic.QuicTlsContext.Unavailable is not null) continue;
+            if (spec.Quic && Http3.Http3Support.Unavailable is not null) continue;
             if (spec.EndPoint is IPEndPoint ip && ip.Port != 0 && wild.TryGetValue((ip.AddressFamily, ip.Port, spec.Quic), out var w))
             {
                 if (w.Ssl != spec.Ssl) throw new ConfigException($"conflicting \"ssl\" parameter for port {ip.Port}", spec.Source);

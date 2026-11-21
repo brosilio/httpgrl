@@ -291,7 +291,7 @@ internal sealed class SslModule(string prefix) : IModule, IDisposable
             ssl.ClientAuth = auth;
             if (sc.Listens.Exists(l => l.Quic) && server.Get<HttpCoreConf>().Http3Enabled)
             {
-                if (Quic.QuicTlsContext.Unavailable is { } why)
+                if (Http3.Http3Support.Unavailable is { } why)
                 {
                     if (!_quicWarned) { _quicWarned = true; setup.Log.Warn("HTTP/3 unavailable, quic listeners are skipped", new LogField("reason", why)); }
                 }

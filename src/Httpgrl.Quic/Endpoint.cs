@@ -42,7 +42,7 @@ public sealed class QuicEndpointOptions
 /// IDs with stateless resets, and runs every connection's timers. One thread owns the socket and all its
 /// connections, so none of the connection state needs locks; other threads hand it work through <see cref="Post"/>.
 /// </summary>
-public sealed class QuicEndpoint : IDisposable
+public sealed class QuicEndpoint : IQuicDispatcher, IDisposable
 {
     public const int CidLength = 8;
     private const long RetryTokenLifetimeUs = 10_000_000;
@@ -55,18 +55,6 @@ public sealed class QuicEndpoint : IDisposable
         public readonly List<CidKey> Cids = new();
         public long Queued;
         public bool Handshaking = true;
-    }
-
-    /// <summary>A connection ID as a dictionary key without allocating: up to 20 bytes in three words.</summary>
-    private readonly record struct CidKey(ulong A, ulong B, uint C, byte Len)
-    {
-        public static CidKey From(ReadOnlySpan<byte> cid)
-        {
-            Span<byte> b = stackalloc byte[24];
-            b.Clear();
-            cid[..Math.Min(cid.Length, 20)].CopyTo(b);
-            return new(BinaryPrimitives.ReadUInt64LittleEndian(b), BinaryPrimitives.ReadUInt64LittleEndian(b[8..]), BinaryPrimitives.ReadUInt32LittleEndian(b[16..]), (byte)cid.Length);
-        }
     }
 
     private readonly Socket _socket;
@@ -128,18 +116,8 @@ public sealed class QuicEndpoint : IDisposable
         }
     }
 
-    private static readonly long ClockStart = Stopwatch.GetTimestamp();
-
-    /// <summary>
-    /// Microseconds on a monotonic clock that starts at one second when the process first uses QUIC: always positive
-    /// (connections use 0 for "no deadline"), and divided before it's multiplied (ticks × 10^6 overflows a long after
-    /// a few hours of uptime at nanosecond resolution).
-    /// </summary>
-    public static long Now()
-    {
-        long t = Stopwatch.GetTimestamp() - ClockStart, f = Stopwatch.Frequency;
-        return 1_000_000 + t / f * 1_000_000 + t % f * 1_000_000 / f;
-    }
+    /// <summary>The QUIC clock (<see cref="QuicClock.Now"/>).</summary>
+    public static long Now() => QuicClock.Now();
 
     public void Start()
     {

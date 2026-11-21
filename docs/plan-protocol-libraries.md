@@ -1,6 +1,6 @@
 # Protocol libraries: roadmap
 
-Status (2026-11-16): agreed with the owner. M0 is done (on `develop`, uncommitted until reviewed); M1 is next.
+Status (2026-11-16): agreed with the owner. M0 and M1 are done; M2 is next (the engine asks whether M3 should come first).
 
 ## Why
 
@@ -106,6 +106,24 @@ Goal: same server, same wire behaviour, built on public libraries.
 - **Tests:** client↔server over real loopback UDP. A wrong hostname, an untrusted CA and a wrong ALPN each fail the
   handshake. A test TLS provider that wraps the OpenSSL one proves the interface is enough. The smoke program
   connects with the public client endpoint.
+
+### M1 as built
+
+- TLS: `QuicTlsContext` is an abstract provider (`CreateServerSession`, `CreateClientSession`) making
+  `IQuicTlsSession`s; `IQuicTlsHost`, `QuicLevel` and `QuicCipher` are public. The OpenSSL provider stays the default
+  (`QuicTlsContext.Server/Client/ClientWithoutVerification`); it refuses an SNI choice of another provider's context.
+  ChaCha20 header protection still uses libcrypto (packet protection, not TLS): a provider without OpenSSL limits
+  itself to the AES-GCM suites.
+- `QuicOpenSsl`: a DllImport resolver maps our logical `libssl`/`libcrypto` to per-OS defaults or the files the
+  application names (before first use). `QuicTlsContext.Unavailable` no longer gates on Linux; the server keeps its
+  Linux-only HTTP/3 in Core (`Http3Support`).
+- `QuicClientEndpoint` (dual-stack by default, IPv4-mapped addresses normalised so paths compare), `QuicClock`, and
+  `IQuicDispatcher` (both endpoints), which `Http3ServerConnection` now takes.
+- Client hardening: Version Negotiation must echo our IDs and leave out v1; Retry must be addressed to our SCID and
+  not hand back our DCID. Transport-parameter checks (`original_destination_connection_id`,
+  `retry_source_connection_id`) were already in place.
+- Tests: `QuicClientTests` (endpoint, verification failures, explicit no-verify, third-party provider, VN, a whole
+  connection on a clock days ahead of the process's); fuzz targets `quic-client-handshake` and `quic-client-frames`.
 
 ## M2: datagrams for games
 

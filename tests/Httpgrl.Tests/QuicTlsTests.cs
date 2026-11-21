@@ -135,7 +135,7 @@ internal static class QuicTlsTests
             {
                 ProxyTests.MakeCert("quic.test", dir, "q").Dispose();
                 using var sctx = QuicTlsContext.Server(Path.Combine(dir, "q.crt"), Path.Combine(dir, "q.key"), ["h3"]);
-                using var cctx = QuicTlsContext.Client(null);
+                using var cctx = QuicTlsContext.ClientWithoutVerification();
                 var sh = new Host(Params([0xbb], odcid: [1]));
                 var ch = new Host();
                 using var server = QuicTls.Server(sctx, _ => sctx, sh);

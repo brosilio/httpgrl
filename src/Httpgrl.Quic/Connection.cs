@@ -59,7 +59,7 @@ public sealed class QuicConnection : IQuicTlsHost, IDisposable
 
     public readonly bool IsServer;
     private readonly QuicOptions _o;
-    private readonly QuicTls _tls;
+    private readonly IQuicTlsSession _tls;
     private readonly Pns[] _pns = [new(), new(), new()];
     internal readonly Recovery Recovery;
     private State _state = State.Handshake;
@@ -193,8 +193,8 @@ public sealed class QuicConnection : IQuicTlsHost, IDisposable
         _ourCids.Add((0, scid, scidResetToken ?? new byte[16], true, true));
         InstallInitialKeys(server ? originalDcid : dcid);
         _tls = server
-            ? QuicTls.Server(ctx, select!, this)
-            : QuicTls.Client(ctx, sni!, alpn!, OurParameters().ToArray(), this);
+            ? ctx.CreateServerSession(select!, this)
+            : ctx.CreateClientSession(sni!, alpn!, OurParameters().ToArray(), this);
     }
 
     /// <summary>
@@ -364,9 +364,13 @@ public sealed class QuicConnection : IQuicTlsHost, IDisposable
     {
         if (h.Type == PacketType.UnknownVersion)
         {
-            // Version Negotiation (version 0) only matters to a client that hasn't heard from the server: we speak v1
-            // only, so there's nothing to negotiate to. Anything else is dropped (RFC 9000 6.2).
-            if (!IsServer && h.Version == 0 && !_peerCidSet && _pns[0].LargestReceived < 0)
+            // Version Negotiation (version 0) only matters to a client that hasn't heard from the server (not even a
+            // Retry): we speak v1 only, so there's nothing to negotiate to, and the connection ends. It must echo our
+            // connection IDs, and one that lists v1 (the version we used) is forged or stale: dropped, like anything
+            // else (RFC 9000 6.2, 17.2.1).
+            if (!IsServer && h.Version == 0 && !_peerCidSet && !_retried && _pns[0].LargestReceived < 0
+                && h.Dcid(packet).SequenceEqual(_scid) && h.Scid(packet).SequenceEqual(_dcid)
+                && Packets.IsVersionNegotiationWithout(packet[(h.ScidOffset + h.ScidLength)..], Packets.Version1))
                 CloseWithError(QuicError.ConnectionRefused, 0, "server doesn't support QUIC v1", app: false, now, silent: true);
             return;
         }
@@ -568,6 +572,8 @@ public sealed class QuicConnection : IQuicTlsHost, IDisposable
     {
         // A client accepts one Retry, before anything else from the server, that authenticates (RFC 9000 17.2.5.2).
         if (IsServer || _retried || _peerCidSet) return;
+        // Addressed to us, and not handing back the DCID we chose (RFC 9000 17.2.5.2).
+        if (!h.Dcid(packet).SequenceEqual(_scid) || h.Scid(packet).SequenceEqual(_originalDcid)) return;
         if (!RetryIntegrity.Verify(packet, _originalDcid)) return;
         int tokenStart = h.ScidOffset + h.ScidLength;
         var token = packet[tokenStart..^PacketKeys.TagLength];

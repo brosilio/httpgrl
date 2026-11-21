@@ -34,7 +34,7 @@ internal sealed class H3Client : IDisposable
 
     public H3Client(IPEndPoint server, string? caFile = null, string sni = "h3.test", string alpn = "h3", string? certFile = null, string? keyFile = null)
     {
-        _tls = QuicTlsContext.Client(caFile, certFile, keyFile);
+        _tls = caFile is null ? QuicTlsContext.ClientWithoutVerification(certFile, keyFile) : QuicTlsContext.Client(caFile, certFile, keyFile);
         _authority = sni;
         Udp = new QuicEndpointTests.UdpClient(server, _tls, alpn, new QuicOptions { MaxStreamsUni = 10 }, sni);
     }

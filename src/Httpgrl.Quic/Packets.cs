@@ -38,6 +38,18 @@ internal struct PacketHeader
 internal static class Packets
 {
     public const uint Version1 = 0x0000_0001;
+
+    /// <summary>
+    /// Whether a Version Negotiation packet's version list (what follows its SCID) is well formed (a non-empty run of
+    /// 4-byte versions) and leaves out <paramref name="version"/>.
+    /// </summary>
+    public static bool IsVersionNegotiationWithout(ReadOnlySpan<byte> versions, uint version)
+    {
+        if (versions.IsEmpty || versions.Length % 4 != 0) return false;
+        for (int i = 0; i < versions.Length; i += 4)
+            if (System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(versions[i..]) == version) return false;
+        return true;
+    }
     public const int MaxCidLength = 20;
     /// <summary>The smallest datagram that may carry a client's Initial (RFC 9000 14.1).</summary>
     public const int MinInitialDatagram = 1200;

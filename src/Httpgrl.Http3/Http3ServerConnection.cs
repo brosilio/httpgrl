@@ -65,7 +65,7 @@ public interface IHttp3ServerHandler
 public sealed class Http3ServerConnection
 {
     public readonly QuicConnection Quic;
-    private readonly QuicEndpoint _ep;
+    private readonly IQuicDispatcher _ep;
     private readonly IHttp3ServerHandler _app;
     private readonly Http3ServerOptions _o;
 
@@ -105,10 +105,10 @@ public sealed class Http3ServerConnection
     private readonly byte[] _buf = new byte[16 << 10];
     private readonly QpackDecoder _qpack;
 
-    public Http3ServerConnection(QuicConnection quic, QuicEndpoint endpoint, IHttp3ServerHandler handler, Http3ServerOptions? options = null)
+    public Http3ServerConnection(QuicConnection quic, IQuicDispatcher dispatcher, IHttp3ServerHandler handler, Http3ServerOptions? options = null)
     {
         Quic = quic;
-        _ep = endpoint;
+        _ep = dispatcher;
         _app = handler;
         _o = options ?? new Http3ServerOptions();
         _qpack = new QpackDecoder(_o.MaxFieldSectionSize);
@@ -457,7 +457,7 @@ public sealed class Http3ServerConnection
     }
 
     /// <summary>Any thread: the application consumed body below its window: read more from the QUIC stream.</summary>
-    public void ResumeReading(long streamId) => _ep.Run(Quic, _ => ReadRequest(streamId, QuicEndpoint.Now()));
+    public void ResumeReading(long streamId) => _ep.Run(Quic, _ => ReadRequest(streamId, QuicClock.Now()));
 
     /// <summary>Any thread: reset a request stream both ways (the application gave up on it).</summary>
     public void ResetLater(long streamId, H3Error code) => _ep.Run(Quic, q =>
@@ -487,10 +487,10 @@ public sealed class Http3ServerConnection
     /// </summary>
     public void Finished(long streamId) => _ep.Run(Quic, _ =>
     {
-        if (!_requests.Remove(streamId, out var r)) { MaybeClose(QuicEndpoint.Now()); return; }
+        if (!_requests.Remove(streamId, out var r)) { MaybeClose(QuicClock.Now()); return; }
         r.Done = true;
         if (!r.Fin) Quic.StopSending(r.Id, (ulong)H3Error.NoError);
-        MaybeClose(QuicEndpoint.Now());
+        MaybeClose(QuicClock.Now());
     });
 
     // ------------------------------------------------------------------ writing (endpoint thread)
@@ -527,7 +527,7 @@ public sealed class Http3ServerConnection
         if (_goAway >= 0 || _control < 0) return;
         _goAway = _nextRequest;
         Quic.StreamWrite(_control, H3FrameWriter.GoAway(_goAway), fin: false);
-        MaybeClose(QuicEndpoint.Now()); // nothing running: done now, not at the next tick
+        MaybeClose(QuicClock.Now()); // nothing running: done now, not at the next tick
     }
 
     private void MaybeClose(long now)
@@ -549,7 +549,7 @@ public sealed class Http3ServerConnection
                 if (!r.Done && r.Stream is null && now >= r.HeaderDeadline)
                 {
                     _closing = true;
-                    _ep.Run(Quic, _ => Fail(H3Error.ExcessiveLoad, "request header timeout", QuicEndpoint.Now()));
+                    _ep.Run(Quic, _ => Fail(H3Error.ExcessiveLoad, "request header timeout", QuicClock.Now()));
                     break;
                 }
         if (_goAway >= 0) MaybeClose(now); // after a GOAWAY of any cause, an idle connection closes
