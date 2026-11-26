@@ -1,0 +1,7 @@
+# /etc/systemd/system/httpgrl.service.d/logging.conf
+[Service]
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=httpgrl
+# httpgrl already bounds logging; journal suppression would hide a second source of loss.
+LogRateLimitIntervalSec=0

@@ -1,4 +1,4 @@
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>What a sent packet carried that matters if it's acknowledged or lost (RFC 9000 13.3).</summary>
 internal enum SentKind : byte
@@ -29,7 +29,7 @@ internal struct SentFrame
     public long Id, A, B;
 }
 
-internal enum CongestionControl : byte
+public enum CongestionControl : byte
 {
     NewReno,
     /// <summary>RFC 9438: better on long, fast paths; Reno-friendly where Reno would do better.</summary>

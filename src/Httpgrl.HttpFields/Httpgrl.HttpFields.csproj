@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Header-field compression shared by HTTP/2 and HTTP/3: HPACK (RFC 7541) and its Huffman code. No dependencies. -->
+  <PropertyGroup>
+    <RootNamespace>Httpgrl.HttpFields</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Httpgrl.Tests" />
+  </ItemGroup>
+</Project>

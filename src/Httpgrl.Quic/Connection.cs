@@ -2,10 +2,10 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Security.Cryptography;
 
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>Limits and windows a connection advertises and enforces.</summary>
-internal sealed class QuicOptions
+public sealed class QuicOptions
 {
     public int MaxIdleTimeoutMs = 30_000;
     public int HandshakeTimeoutMs = 10_000;
@@ -38,7 +38,7 @@ internal sealed class QuicOptions
 /// <see cref="OnTimeout"/>. Times are microseconds on the caller's clock, which can be virtual: that's what makes
 /// the network simulator's tests deterministic. Not thread-safe: one caller at a time.
 /// </summary>
-internal sealed class QuicConnection : IQuicTlsHost, IDisposable
+public sealed class QuicConnection : IQuicTlsHost, IDisposable
 {
     private enum State { Handshake, Active, Closing, Draining, Closed }
 
@@ -59,9 +59,9 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
 
     public readonly bool IsServer;
     private readonly QuicOptions _o;
-    private readonly QuicTls _tls;
+    private readonly IQuicTlsSession _tls;
     private readonly Pns[] _pns = [new(), new(), new()];
-    public readonly Recovery Recovery;
+    internal readonly Recovery Recovery;
     private State _state = State.Handshake;
 
     // Connection IDs.
@@ -138,7 +138,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     private long _keyUpdatePn = -1;   // the first packet sent under our latest send keys
     public int KeyUpdates { get; private set; }
     /// <summary>The negotiated 1-RTT AEAD (meaningful once the handshake is complete).</summary>
-    public QuicCipher Cipher => _appCipher;
+    internal QuicCipher Cipher => _appCipher;
 
     // Datagrams.
     private readonly Queue<byte[]> _dgOut = new(), _dgIn = new();
@@ -167,7 +167,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     public QuicTlsContext TlsContext => _tls.Context;
     public byte[] SourceCid => _scid;
     public byte[] OriginalDcid => _originalDcid;
-    public TransportParameters? PeerParameters => _peer;
+    internal TransportParameters? PeerParameters => _peer;
     public long BytesReceived => _bytesReceived;
     public long BytesSent => _bytesSent;
 
@@ -193,8 +193,8 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
         _ourCids.Add((0, scid, scidResetToken ?? new byte[16], true, true));
         InstallInitialKeys(server ? originalDcid : dcid);
         _tls = server
-            ? QuicTls.Server(ctx, select!, this)
-            : QuicTls.Client(ctx, sni!, alpn!, OurParameters().ToArray(), this);
+            ? ctx.CreateServerSession(select!, this)
+            : ctx.CreateClientSession(sni!, alpn!, OurParameters().ToArray(), this);
     }
 
     /// <summary>
@@ -234,7 +234,7 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     /// copy. Servers create no state (no TLS, no connection) for one that doesn't: garbage costs a few AES blocks,
     /// not a handshake.
     /// </summary>
-    public static bool IsAuthenticInitial(ReadOnlySpan<byte> packet, PacketHeader h)
+    internal static bool IsAuthenticInitial(ReadOnlySpan<byte> packet, PacketHeader h)
     {
         if (h.Type != PacketType.Initial || h.Length > packet.Length) return false;
         var copy = System.Buffers.ArrayPool<byte>.Shared.Rent(h.Length);
@@ -364,9 +364,13 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     {
         if (h.Type == PacketType.UnknownVersion)
         {
-            // Version Negotiation (version 0) only matters to a client that hasn't heard from the server: we speak v1
-            // only, so there's nothing to negotiate to. Anything else is dropped (RFC 9000 6.2).
-            if (!IsServer && h.Version == 0 && !_peerCidSet && _pns[0].LargestReceived < 0)
+            // Version Negotiation (version 0) only matters to a client that hasn't heard from the server (not even a
+            // Retry): we speak v1 only, so there's nothing to negotiate to, and the connection ends. It must echo our
+            // connection IDs, and one that lists v1 (the version we used) is forged or stale: dropped, like anything
+            // else (RFC 9000 6.2, 17.2.1).
+            if (!IsServer && h.Version == 0 && !_peerCidSet && !_retried && _pns[0].LargestReceived < 0
+                && h.Dcid(packet).SequenceEqual(_scid) && h.Scid(packet).SequenceEqual(_dcid)
+                && Packets.IsVersionNegotiationWithout(packet[(h.ScidOffset + h.ScidLength)..], Packets.Version1))
                 CloseWithError(QuicError.ConnectionRefused, 0, "server doesn't support QUIC v1", app: false, now, silent: true);
             return;
         }
@@ -568,6 +572,8 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     {
         // A client accepts one Retry, before anything else from the server, that authenticates (RFC 9000 17.2.5.2).
         if (IsServer || _retried || _peerCidSet) return;
+        // Addressed to us, and not handing back the DCID we chose (RFC 9000 17.2.5.2).
+        if (!h.Dcid(packet).SequenceEqual(_scid) || h.Scid(packet).SequenceEqual(_originalDcid)) return;
         if (!RetryIntegrity.Verify(packet, _originalDcid)) return;
         int tokenStart = h.ScidOffset + h.ScidLength;
         var token = packet[tokenStart..^PacketKeys.TagLength];
@@ -1174,6 +1180,8 @@ internal sealed class QuicConnection : IQuicTlsHost, IDisposable
     // ------------------------------------------------------------------ closing and timers
 
     /// <summary>Close with an application error code (CONNECTION_CLOSE 0x1d).</summary>
+    internal void RefuseMigration(long now) => CloseWithError(QuicError.NoViablePath, 0, "per-client connection limit", app: false, now);
+
     public void Close(ulong appError, string reason, long now) => CloseWithError(QuicError.ApplicationError, 0, reason, app: true, now, appCode: appError);
 
     private void CloseWithError(QuicError code, ulong frameType, string reason, bool app, long now, bool silent = false, ulong appCode = 0)

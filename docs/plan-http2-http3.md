@@ -32,7 +32,7 @@ Status (2026-11-04): Phases 0 to 3 (HTTP/2, QUIC, HTTP/3) are done; Phase 4 (har
    detection, PTO, pacing, ACK delay) get the best mechanism we can find, most likely one timing wheel shared by all
    QUIC connections on a dedicated thread. The requirement from AGENTS.md is the intent: cheap per connection at
    scale, and impossible for a client to dodge.
-9. **Server side only.** `proxy_pass` upstreams and reverse tunnels stay HTTP/1.1.
+9. **Server side only.** (Superseded for QUIC by `plan-protocol-libraries.md`: QUIC gets a client for library consumers.) `proxy_pass` upstreams and reverse tunnels stay HTTP/1.1.
 
 ## Who writes what
 

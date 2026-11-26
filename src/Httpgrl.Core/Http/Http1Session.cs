@@ -102,7 +102,7 @@ internal sealed class Http1Session
                         (verdict, bool accept) = auth.Evaluate(clientCert);
                         if (!accept)
                         {
-                            _rt.Log.Info("client certificate rejected", new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", verdict));
+                            _rt.Log.Info("client certificate rejected", new("event", "client_certificate_rejected"), new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", verdict));
                             return;
                         }
                     }
@@ -220,7 +220,7 @@ internal sealed class Http1Session
         }
         catch (AuthenticationException e) when (_transport is ClientAuthSslStream { Verdict: { } v } && v != "SUCCESS")
         {
-            _rt.Log.Info("client certificate rejected", new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", v), new("detail", e.Message));
+            _rt.Log.Info("client certificate rejected", new("event", "client_certificate_rejected"), new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", v), new("detail", e.Message));
         }
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or AuthenticationException or OperationCanceledException || (e is InvalidOperationException && _conn.IsAborted))
         {
@@ -232,6 +232,7 @@ internal sealed class Http1Session
         }
         finally
         {
+            if (ctx is not null) await RequestLifecycle.FinishAsync(ctx, _mgr).ConfigureAwait(false);
             ctx?.EndRequest(); // a request cut short still releases what it reserved
             ctx?.Resp.ReturnBuffer();
             input.Dispose();
@@ -327,7 +328,13 @@ internal sealed class Http1Session
     private static ValueTask<SslServerAuthenticationOptions> SelectTls(SslStream stream, SslClientHelloInfo hello, object? state, CancellationToken ct)
     {
         var self = (Http1Session)state!;
-        var srv = self._hosts.Resolve(TlsHost(hello.ServerName));
+        ServerRt srv;
+        try { srv = self._hosts.Resolve(TlsHost(hello.ServerName)); }
+        catch (System.Text.RegularExpressions.RegexMatchTimeoutException e)
+        {
+            self._rt.Log.Warn("security", new("event", "routing_regex_timeout"), new("conn", self._conn.Id), new("stage", "sni"));
+            throw new AuthenticationException("server name regex timed out", e);
+        }
         // ssl_reject_handshake: SNI (or its absence) routes to a server that presents nothing. Refuse before any
         // certificate is sent, so a scan of the IP learns no names (no fallback to another server's certificate).
         if (srv.RejectHandshake) throw new AuthenticationException("handshake rejected (ssl_reject_handshake)");

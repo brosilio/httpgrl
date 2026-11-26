@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- HTTP/3 (RFC 9114) and QPACK (RFC 9204) over Httpgrl.Quic: framing, control and QPACK streams, request streams. -->
+  <PropertyGroup>
+    <RootNamespace>Httpgrl.Http3</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Httpgrl.Quic/Httpgrl.Quic.csproj" />
+    <ProjectReference Include="../Httpgrl.HttpFields/Httpgrl.HttpFields.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Httpgrl.Tests" />
+  </ItemGroup>
+</Project>

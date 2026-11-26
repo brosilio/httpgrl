@@ -463,6 +463,7 @@ internal static class ProxyHandler
         {
             conn.Dispose();
             if (ctx.Aborted.IsCancellationRequested) return HandlerResult.Drop;
+            ctx.SecurityEvent("upstream_response_failed");
             ctx.Log.Warn("upstream failed mid-response", new("upstream", conn.Server.Display), new("uri", ctx.Request.RawTarget), new("error", e.Message));
             // Before the head went out this is a clean 502; after, the core cuts the connection so the
             // truncated body can't pass for a complete one.
@@ -538,6 +539,7 @@ internal static class ProxyHandler
         {
             await reader.CompleteAsync().ConfigureAwait(false);
             if (ctx.Aborted.IsCancellationRequested) return HandlerResult.Drop;
+            ctx.SecurityEvent("upstream_response_failed");
             ctx.Log.Warn("upstream failed mid-response", new("upstream", conn.Server.Display), new("uri", ctx.Request.RawTarget), new("error", e.Message));
             return HandlerResult.WithStatus(502);
         }

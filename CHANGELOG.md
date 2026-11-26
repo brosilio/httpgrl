@@ -3,6 +3,33 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
+## [0.5.0] - 2026-11-25
+
+### Changed (may need action)
+- JSON log schema 2 removes query/fragment values from URI fields and replaces access-log Referer values with
+  presence flags. Consumers must use the new `event`, `outcome`, route and upstream fields. Privacy changes are
+  intentional; historical full-query logs require separate retention/access review.
+- CI also runs the optional operational detector's standard-library Python 3 tests.
+
+### Added
+- Protocol libraries, public API for other software: `Httpgrl.Quic` (QUIC transport, recovery, TLS, server
+  endpoint), `Httpgrl.Http3` (HTTP/3 framing, QPACK, `Http3ServerConnection`) and `Httpgrl.HttpFields` (HPACK,
+  Huffman). The server is rebuilt on them and uses only their public API. No change on the wire or in configuration.
+  See `docs/plan-protocol-libraries.md`.
+- QUIC client side in `Httpgrl.Quic`: `QuicClientEndpoint` (one UDP socket, many connections), TLS behind
+  `QuicTlsContext`/`IQuicTlsSession` so a platform can bring its own, and `QuicOpenSsl` to choose which OpenSSL
+  files load (per-platform defaults). Client contexts verify the server (CA bundle or system roots, and the name)
+  unless made with `ClientWithoutVerification`. Clients ignore Version Negotiation that doesn't echo their
+  connection IDs or that lists v1, and Retry that isn't addressed to them or hands back their own DCID.
+- Process/instance/version metadata, explicit truncation flags, correlated security decision events, and exactly-once
+  access logging for interrupted HTTP/1, HTTP/2 and HTTP/3 handler lifecycles.
+- Final server-side response outcome, normalized path, selected server/location and upstream details in access records.
+- A bounded offline/streaming log detector; central TLS collection, retention, metrics/probe alert and host audit examples;
+  application audit-event contract and incident runbook in `docs/security-monitoring.md`.
+
+### Fixed
+- HTTP/3 absolute header deadlines, routing regex timeouts failing open, and QUIC migration per-client limit bypasses.
+
 ## [0.4.3] - 2026-11-05
 
 ### Added

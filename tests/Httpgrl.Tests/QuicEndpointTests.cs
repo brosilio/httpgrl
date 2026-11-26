@@ -1,6 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 
 namespace Httpgrl.Tests;
 
@@ -53,7 +53,7 @@ internal static class QuicEndpointTests
     /// <summary>Our QUIC client on a UDP socket, run synchronously until a condition holds.</summary>
     internal sealed class UdpClient : IDisposable
     {
-        public readonly Socket Socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        public Socket Socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         public readonly QuicConnection C;
         private readonly EndPoint _server;
         private readonly byte[] _buf = new byte[65536];
@@ -63,6 +63,13 @@ internal static class QuicEndpointTests
             _server = server;
             Socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
             C = QuicConnection.Client(tls, sni, [alpn], o ?? new QuicOptions(), QuicNet.Cids, server, QuicEndpoint.Now());
+        }
+
+        public void Rebind(string address)
+        {
+            Socket.Dispose();
+            Socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            Socket.Bind(new IPEndPoint(IPAddress.Parse(address), 0));
         }
 
         public bool Run(Func<bool> done, int timeoutMs = 10_000)
@@ -130,13 +137,23 @@ internal static class QuicEndpointTests
     }
 
     /// <summary>Counts error-level lines (an endpoint must never log one in these tests).</summary>
-    internal sealed class ErrorCounter : ILogger
+    internal sealed class ErrorCounter : ILogger, IQuicLog
     {
+        public void Write(QuicLogLevel level, string msg, ReadOnlySpan<(string Key, string? Value)> fields)
+        {
+            foreach (var (k, v) in fields) if (k == "event") LastEvent = v;
+            if (level < QuicLogLevel.Error) return;
+            Errors++;
+            Last = msg;
+        }
+
+        public string? LastEvent;
         public int Errors;
         public string? Last;
         public bool IsEnabled(LogLevel level) => level >= LogLevel.Warn;
         public void Write(LogLevel level, string msg, ReadOnlySpan<LogField> fields)
         {
+            foreach (var field in fields) if (field.Key == "event") LastEvent = field.Str;
             if (level < LogLevel.Error) return;
             Errors++;
             Last = msg;
@@ -178,6 +195,47 @@ internal static class QuicEndpointTests
 
     public static void Register()
     {
+        T.Add("quic endpoint: per-client key groups addresses exactly as the TCP limits do (IPv4, mapped IPv4, IPv6 /64)", () =>
+        {
+            // Httpgrl.Quic can't use Core's IpKey, so it has a twin: a drift would let one transport's limit be dodged.
+            string[] addrs = ["192.0.2.1", "192.0.2.2", "::ffff:192.0.2.1", "2001:db8:1:2::1", "2001:db8:1:2:ffff::9", "2001:db8:1:3::1", "::1", "0.0.0.1"];
+            foreach (var a in addrs)
+                foreach (var b in addrs)
+                {
+                    var ea = new IPEndPoint(IPAddress.Parse(a), 443);
+                    var eb = new IPEndPoint(IPAddress.Parse(b), 1234);
+                    bool tcp = Httpgrl.Core.Hosting.IpKey.From(ea) == Httpgrl.Core.Hosting.IpKey.From(eb);
+                    bool quic = ClientKey.From(ea) == ClientKey.From(eb);
+                    T.Eq(tcp, quic, a + " vs " + b);
+                }
+            T.Eq(ClientKey.From(new IPEndPoint(IPAddress.Parse("2001:db8:1:2::1"), 1)), ClientKey.From(new IPEndPoint(IPAddress.Parse("2001:db8:1:2:ffff::9"), 2)));
+            T.True(ClientKey.From(new IPEndPoint(IPAddress.Parse("192.0.2.1"), 1)) != ClientKey.From(new IPEndPoint(IPAddress.Parse("192.0.2.2"), 1)));
+        });
+        T.Add("quic endpoint: migration enforces destination connection limit", () =>
+        {
+            if (QuicTls.Unavailable is not null) return;
+            using var s = new Server(new QuicEndpointOptions { MaxConnectionsPerClient = 1 });
+            using var first = new UdpClient(s.EndPoint, s.ClientTls);
+            T.True(Echo(first, 1000));
+            T.True(first.Run(() => first.C.HandshakeConfirmed));
+            using var second = new UdpClient(s.EndPoint, s.ClientTls);
+            second.Rebind("127.0.0.2");
+            T.True(Echo(second, 1000));
+            T.True(second.Run(() => second.C.HandshakeConfirmed));
+            second.Rebind("127.0.0.1");
+            long id = second.C.OpenStream(true);
+            second.C.StreamWrite(id, "move"u8, true);
+            T.True(second.Run(() => second.C.IsDraining || second.C.IsClosed, 5000));
+            T.Eq(QuicError.NoViablePath, second.C.CloseCode);
+            T.Eq("migration_limit_exceeded", s.Log.LastEvent);
+            T.True(SpinUntil(() => s.Endpoint.Connections == 1, 5000));
+            T.True(Echo(first, 1000));
+            using var replacement = new UdpClient(s.EndPoint, s.ClientTls);
+            replacement.Rebind("127.0.0.2");
+            T.True(Echo(replacement, 1000)); // original address's accounting was released
+            T.Eq(0, s.Log.Errors);
+        });
+
         T.Add("quic endpoint: a client connects over UDP and echoes 300 KB; the endpoint forgets the connection when it closes", () =>
         {
             if (QuicTls.Unavailable is not null) return;
@@ -312,7 +370,7 @@ internal static class QuicEndpointTests
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         socket.Bind(new IPEndPoint(IPAddress.Loopback, port));
         using var log = new Httpgrl.Core.Logging.JsonLogger(Console.OpenStandardOutput(), LogLevel.Debug);
-        using var ep = new QuicEndpoint(socket, tls, _ => tls, new EchoApp(), log, o);
+        using var ep = new QuicEndpoint(socket, tls, _ => tls, new EchoApp(), new Httpgrl.Core.Logging.QuicLogAdapter(log), o);
         ep.Start();
         Console.WriteLine($"quic echo on {socket.LocalEndPoint}, ALPN echo, trust {Path.Combine(dir, "q.crt")}");
         Thread.Sleep(Timeout.Infinite);

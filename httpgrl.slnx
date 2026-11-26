@@ -2,6 +2,9 @@
   <Folder Name="/src/">
     <Project Path="src/Httpgrl.Abstractions/Httpgrl.Abstractions.csproj" />
     <Project Path="src/Httpgrl.Core/Httpgrl.Core.csproj" />
+    <Project Path="src/Httpgrl.HttpFields/Httpgrl.HttpFields.csproj" />
+    <Project Path="src/Httpgrl.Quic/Httpgrl.Quic.csproj" />
+    <Project Path="src/Httpgrl.Http3/Httpgrl.Http3.csproj" />
     <Project Path="src/Httpgrl.Modules.Headers/Httpgrl.Modules.Headers.csproj" />
     <Project Path="src/Httpgrl.Modules.Limits/Httpgrl.Modules.Limits.csproj" />
     <Project Path="src/Httpgrl.Modules.Proxy/Httpgrl.Modules.Proxy.csproj" />
@@ -14,5 +17,6 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Httpgrl.Tests/Httpgrl.Tests.csproj" />
+    <Project Path="tests/Httpgrl.Libraries.Smoke/Httpgrl.Libraries.Smoke.csproj" />
   </Folder>
 </Solution>

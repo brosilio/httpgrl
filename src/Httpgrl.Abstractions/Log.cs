@@ -34,3 +34,24 @@ public static class LoggerExtensions
     public static void Warn(this ILogger l, string msg, params ReadOnlySpan<LogField> f) { if (l.IsEnabled(LogLevel.Warn)) l.Write(LogLevel.Warn, msg, f); }
     public static void Error(this ILogger l, string msg, params ReadOnlySpan<LogField> f) { if (l.IsEnabled(LogLevel.Error)) l.Write(LogLevel.Error, msg, f); }
 }
+
+/// <summary>Safe default logging of request targets. Query and fragment values are never retained.</summary>
+public static class LogPrivacy
+{
+    public static string PathOnly(string value)
+    {
+        int end = value.AsSpan().IndexOfAny('?', '#');
+        return end < 0 ? value : value[..end];
+    }
+}
+
+public static class SecurityLogging
+{
+    /// <summary>Emit a bounded, correlated security decision, independent of access_log. Event names must be constants.</summary>
+    public static void SecurityEvent(this HttpContext ctx, string eventId)
+    {
+        ctx.Log.Warn("security", new("event", eventId), new("request_id", ctx.Request.Id),
+            new("conn", ctx.Connection.Id), new("remote", ctx.Connection.RemoteAddress),
+            new("method", ctx.Request.Method), new("path", ctx.Request.Path));
+    }
+}

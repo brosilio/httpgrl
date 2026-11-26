@@ -1,6 +1,6 @@
 using System.Buffers;
 
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>Disjoint, sorted, half-open ranges [Start, End) of non-negative integers: received packet numbers, stream bytes.</summary>
 internal sealed class RangeSet

@@ -131,7 +131,7 @@ internal static class Soak
         for (int k = 0; k < 24; k++) workers.Add(Traffic(h2, stats, 100 + k, stop.Token, http2: true));
         for (int k = 0; k < 2; k++) workers.Add(WebSockets(h2port, stats, stop.Token, http2: true));
         // HTTP/3: a few connections of our own client, each on its own thread, reconnecting after a reload's GOAWAY.
-        if (Httpgrl.Core.Quic.QuicTls.Unavailable is null)
+        if (Httpgrl.Quic.QuicTls.Unavailable is null)
             for (int k = 0; k < 6; k++)
             {
                 int id = 200 + k;
@@ -181,7 +181,7 @@ internal static class Soak
 
         Console.WriteLine($"soak: done. {total} requests ({stats.Ok} ok, {stats.H2} over HTTP/2, {stats.H3} over HTTP/3, {stats.Limited} rate-limited, {stats.Failed} failed), {stats.Ws} websocket sessions ({stats.H2Ws} over HTTP/2), {stats.Abuse} abusive connections, {reloads} reloads, {stats.H3Reconnects} HTTP/3 reconnects");
         if (stats.H2 == 0) problems.Add("no HTTP/2 requests succeeded");
-        if (stats.H3 == 0 && Httpgrl.Core.Quic.QuicTls.Unavailable is null) problems.Add("no HTTP/3 requests succeeded");
+        if (stats.H3 == 0 && Httpgrl.Quic.QuicTls.Unavailable is null) problems.Add("no HTTP/3 requests succeeded");
         Console.WriteLine($"soak: rss {rss0 / 1024} -> peak {peakRss / 1024} -> {rssEnd / 1024} MB; fds {fd0} -> {fdEnd}; threads {th0} -> {thEnd}");
         foreach (var (what, n) in stats.Errors.OrderByDescending(e => e.Value).Take(8)) Console.WriteLine($"  failure: {what} x{n}");
         lock (log) if (log.Length > 0) Console.WriteLine(log.ToString());
@@ -254,8 +254,8 @@ internal static class Soak
                     long sid = c.Send(body is null ? "GET" : "POST", "/" + path, body, true, body is null ? [] : [("content-length", body.Length.ToString())]);
                     resp = c.Wait(sid, 15_000);
                 }
-                catch (Exception e) when (e.Message == "no stream credit") { c.C.Close(0, "", Httpgrl.Core.Quic.QuicEndpoint.Now()); continue; }
-                if (resp.Reset == (ulong)Httpgrl.Core.Http3.H3Error.RequestRejected) continue; // after GOAWAY: retry elsewhere
+                catch (Exception e) when (e.Message == "no stream credit") { c.C.Close(0, "", Httpgrl.Quic.QuicEndpoint.Now()); continue; }
+                if (resp.Reset == (ulong)Httpgrl.Http3.H3Error.RequestRejected) continue; // after GOAWAY: retry elsewhere
                 if (resp.Status == "200" || (path == "missing" && resp.Status == "404")) { Interlocked.Increment(ref s.Ok); Interlocked.Increment(ref s.H3); }
                 else if (resp.Status == "429") Interlocked.Increment(ref s.Limited);
                 else if (resp.Status is null && (c.C.IsClosed || c.C.IsDraining)) continue; // the connection went away under it (reload): retry

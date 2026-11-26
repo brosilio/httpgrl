@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- QUIC (RFC 9000/9001/9002): connection state machine on a caller-supplied clock, recovery, TLS through OpenSSL,
+       and a server UDP endpoint. References nothing else of httpgrl's. -->
+  <PropertyGroup>
+    <RootNamespace>Httpgrl.Quic</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Httpgrl.Tests" />
+  </ItemGroup>
+</Project>

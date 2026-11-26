@@ -67,7 +67,10 @@ docker compose up --build                              # see compose.yaml
 | Project | Role |
 |---|---|
 | `src/Httpgrl.Abstractions` | **The plugin API.** It is the only thing modules reference. |
-| `src/Httpgrl.Core` | Config parser, HTTP/1.1 engine, connection management, TLS, logging. Also the core modules (`http_core`, `http_ssl`, `http_log`), which are written against the same API. |
+| `src/Httpgrl.Core` | Config parser, HTTP/1.1 and HTTP/2 engines, the HTTP/3 server adapter, connection management, TLS, logging. Also the core modules (`http_core`, `http_ssl`, `http_log`), which are written against the same API. |
+| `src/Httpgrl.HttpFields` | **Protocol library.** HPACK and its Huffman code, shared by HTTP/2 and QPACK. No dependencies. |
+| `src/Httpgrl.Quic` | **Protocol library.** QUIC: the connection state machine on a caller-supplied clock, recovery and congestion control, the server and client UDP endpoints, and TLS behind `QuicTlsContext` (built in: OpenSSL 3.5's QUIC API, loaded per platform; clients verify the server by default). No dependencies. |
+| `src/Httpgrl.Http3` | **Protocol library.** HTTP/3 framing, QPACK, and `Http3ServerConnection` (control and QPACK streams, request streams, GOAWAY, the request-head deadline). Depends only on the two above. |
 | `src/Httpgrl.Modules.StaticFiles` | `http_index`, `http_autoindex`, `http_static`. |
 | `src/Httpgrl.Modules.Rewrite` | `http_rewrite` (`return`, `set`, `if`, `break`) and `http_map`. |
 | `src/Httpgrl.Modules.Headers` | `http_headers`: `add_header`. |
@@ -78,12 +81,20 @@ docker compose up --build                              # see compose.yaml
 | `src/Httpgrl.Modules.Proxy` | `http_proxy`: `proxy_pass`, `upstream {}`, WebSocket/Upgrade tunnelling. |
 | `src/Httpgrl` | Host executable. The compiled-in module list is in `Program.cs`. |
 | `tests/Httpgrl.Tests` | A dependency-free test runner. It runs on the JIT, and `ci.sh` also publishes and runs it as native AOT. |
+| `tests/Httpgrl.Libraries.Smoke` | Uses the protocol libraries through their public API only (a QUIC server serving HTTP/3, and a client request), on the JIT and as native AOT. |
+
+The protocol libraries are public API for other software (the plan is in
+[docs/plan-protocol-libraries.md](docs/plan-protocol-libraries.md)). The server uses them the way any other consumer
+would: through their public API, with no `InternalsVisibleTo` to Core. `scripts/check-boundaries.sh` enforces which
+library may reference which.
 
 Inside Core:
 - `Config/`: lexer, parser, scopes, and the `$variable` compiler.
 - `Http/`: request parser, URI normaliser, body decoder, response writer, session loop.
 - `Pipeline/`: location/vhost routing and phase execution.
 - `Hosting/`: sockets, the connection table and the deadline sweeper.
+- `Http2/`: HTTP/2 framing, sessions and streams.
+- `Http3/`: the HTTP/3 server adapter: maps `Http3ServerConnection` requests onto the pipeline and follows reloads.
 
 ## Configuration
 
@@ -139,7 +150,7 @@ tuning directives (`worker_processes`, `sendfile`, `tcp_nopush`, `user`, `pid`, 
 | `quic_retry on\|off;` | http, server | `off` | Validate every client's address with a Retry (one more round trip) before keeping any state for it. Off, Retry is still used automatically once many handshakes are pending. Retry tokens are AEAD-sealed and bound to the client's address, the time and its connection IDs. |
 | `quic_gso on\|off;` | http, server | `on` | Send runs of QUIC datagrams with one system call (UDP GSO). If the kernel or route refuses, it turns off by itself with a warning. |
 | `server_tokens on\|off;` | | **`off`** | `off`: no `Server` header and no product name on error pages. `on`: `Server: httpgrl/<version>` plus the error-page footer. Note: nginx's `off` still sends a header; here `off` sends none. |
-| `access_log stdout\|off;` | | `stdout` | nginx's `access_log /path [format];` is accepted with a warning: records go to stdout as JSON anyway, and `log_format` is ignored. `error_log /path [level];` likewise (the level applies). That lets a stock nginx config load unchanged. |
+| `access_log stdout\|off;` | | `stdout` | nginx's `access_log /path [format];` is accepted with a warning: records go to stdout as JSON anyway, and `log_format` is ignored. Access records include final outcome, route and upstream details; query values and Referer values are omitted (schema 2). `error_log /path [level];` likewise (the level applies). That lets a stock nginx config load unchanged. |
 
 ### Rewrite, map and headers
 
@@ -381,7 +392,16 @@ Details:
   changed, the connections are closed and redialed with the new settings, so rotating the agent's certificate
   takes effect.
 
+## Security monitoring
+
+See [security monitoring](docs/security-monitoring.md) for the implementation plan, JSON schema 2, event catalog,
+request/upstream correlation, privacy defaults, detector rules and collection/alerting deployment examples. Access
+logs distinguish complete, incomplete and dropped responses. Query strings and Referer values are omitted.
+The server remains dependency-free; optional operational detection and CI detector tests use Python 3 standard library.
+
 ## Security model
+
+Routing regex timeouts fail closed: location matching returns 500, Host matching drops the request, and SNI matching refuses the handshake. QUIC migration into a full per-client connection allowance closes the migrating connection with `NO_VIABLE_PATH`.
 
 **Fuzzing.** Every parser of untrusted or semi-trusted bytes has a mutation-fuzz target in
 `tests/Httpgrl.Tests/Fuzz.cs`: the request head, the URI normalizer, chunked bodies, upstream response heads, the
@@ -438,6 +458,8 @@ coverage-guided, so it's a complement to, not a replacement for, a coverage-guid
 - **Ending connections:** errors end with a GOAWAY that the client gets to read, thanks to a lingering close. Reload, shutdown and `keepalive_requests` drain in two steps (RFC 9113 6.8): a GOAWAY that refuses nothing yet, plus a PING. When the PING comes back, the final GOAWAY names the last request the client sent before it saw the first one, and later streams are ignored, which the client retries elsewhere. Running streams finish (within `reload_drain_timeout`), then a FIN and a bounded read to the client's close. A session drains itself, so reload doesn't close an HTTP/2 connection as an "idle" keep-alive while a request is on the wire.
 
 **HTTP/3** (`http3 on`, `listen ... quic`):
+
+- `client_header_timeout` is an absolute deadline from request stream opening, including implicitly opened streams. Partial headers and other QUIC traffic cannot extend it; expiry closes the connection with `H3_EXCESSIVE_LOAD`.
 - **Client certificates:** judged by the same code as on TCP, as soon as the handshake completes and before any request is read. A request whose authority leads to a server with a different client-certificate policy than the one the handshake chose (SNI) gets 421, as on TCP. Switching server on SNI carries that server's verify mode into the handshake (OpenSSL's context switch alone wouldn't).
 - **The same request rules as HTTP/2** (it's the same validator): lower-case names, pseudo-fields first and once, no connection-specific fields, one matching `content-length`, the same path normalizer. A malformed request resets its stream (`H3_MESSAGE_ERROR`); framing violations close the connection with the code RFC 9114 names. A request with no body is recognized by its stream ending right behind the HEADERS frame (HTTP/3 has no END_STREAM flag).
 - **QPACK without a dynamic table.** We advertise a capacity of 0, so field sections are static references and literals only. A dynamic reference is `QPACK_DECOMPRESSION_FAILED`, and an insert on the encoder stream is `QPACK_ENCODER_STREAM_ERROR`. No compression state means nothing to desynchronize, nothing to block on, and nothing to probe. Sizes are bounded as in HPACK, and a section over the limit gets 431 for that request only.
@@ -462,7 +484,7 @@ coverage-guided, so it's a complement to, not a replacement for, a coverage-guid
 **Paths.**
 - URIs are percent-decoded, dot-segments are resolved, and an escape above `/` is a 400. Control characters (`%00`–`%1F`, `%7F`) and invalid UTF-8 are rejected. **Deviation:** nginx accepts `%0A` in paths. A decoded newline in `$uri` could reach response or upstream headers, and slip past anchored regexes (`$` also matches before a trailing newline, in PCRE as in .NET). So `if ($uri ~ "^/admin$")` can't be fooled by `/admin%0A`.
 - Every mapped filesystem path is checked to stay inside its `root`/`alias` directory. This closes nginx's classic `location /img { alias /x/; }` + `/img../` hole. A value with variables is checked against its constant leading directory. One that *begins* with a variable (`root $doc;`) has none, so its evaluated value must be an absolute path without `.`/`..` segments, and is itself the boundary: whatever a variable holds, the request can't climb out of it. (Which directory a variable names is still the configuration's business: don't build one from request input.)
-- Regexes run on .NET's linear-time engine whenever the pattern allows it (no backreferences or lookarounds). The rest backtrack with a 50 ms match timeout. A timeout fails the request with a 500 and one `warn` line. Neither "matched" nor "didn't match" can be assumed without failing open somewhere (`if ($x ~ ...) { return 403; }` versus `!~`), and nginx also answers a failed regex execution with a 500.
+- Regexes run on .NET's linear-time engine whenever the pattern allows it (no backreferences or lookarounds). The rest backtrack with a 50 ms match timeout. A location or request-expression timeout fails the request with a 500 and one `warn` line; a Host timeout drops the request and an SNI timeout refuses the handshake. Neither "matched" nor "didn't match" can be assumed without failing open somewhere (`if ($x ~ ...) { return 403; }` versus `!~`), and nginx also answers a failed regex execution with a 500.
 - Modules never see filesystem paths. They ask the core for resources by request path, so the mapping, containment and safe-open policy has exactly one implementation (`Core/Files/LocalFiles.cs`). CI enforces this with `scripts/check-boundaries.sh`.
 - Location matching is case-insensitive on case-insensitive filesystems.
 - On Windows, ADS names (`:`), trailing dots and spaces, and device names (`CON`, `NUL`, ...) are refused.
@@ -514,6 +536,10 @@ post-quantum support. Upgrading the OS turns it on; httpgrl needs no change. Not
 - The server doesn't identify itself by default (`server_tokens off`).
 
 ## Writing a module
+
+For request audit events, `ctx.ResponseOutcome` exposes the final server-side result and `ctx.RouteLabel` names the
+selected configuration location. `ctx.SecurityEvent("constant_event_id")` emits a bounded, correlated decision through
+`ILogger`; use constant IDs and never put secrets in custom fields. See the [event contract](docs/security-monitoring.md).
 
 A module declares directives (and variables), stores settings in typed per-scope config slots that inherit
 top-down, then installs phase handlers. That is the same lifecycle as an nginx module.

@@ -72,6 +72,7 @@ public sealed class AccessModule : IModule
             bool match = r.All || (r.Unix ? ip is null : ip is not null && r.Net!.Value.Contains(ip));
             if (!match) continue;
             if (r.Allow) return new(HandlerResult.Declined);
+            ctx.SecurityEvent("access_denied");
             if (ctx.Log.IsEnabled(LogLevel.Info))
                 ctx.Log.Info("access forbidden by rule", new("remote", ctx.Connection.RemoteAddress), new("uri", ctx.Request.Path));
             return new(HandlerResult.WithStatus(403));

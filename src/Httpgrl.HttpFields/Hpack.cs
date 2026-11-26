@@ -1,16 +1,16 @@
 using System.Buffers;
 
-namespace Httpgrl.Core.Http2;
+namespace Httpgrl.HttpFields;
 
 /// <summary>A header block that violates HPACK (a COMPRESSION_ERROR) or our limits (decoded size, field count).</summary>
-internal sealed class HpackException(string message, bool limit = false) : Exception(message)
+public sealed class HpackException(string message, bool limit = false) : Exception(message)
 {
     /// <summary>A limit, not a protocol violation: the request is refused (431) rather than the connection killed.</summary>
     public bool Limit { get; } = limit;
 }
 
 /// <summary>The Huffman code of RFC 7541 (canonical, so decodable from code lengths alone).</summary>
-internal static class Huffman
+public static class Huffman
 {
     private const int MaxLen = 30;
     // Canonical decoding: per code length, the first code and where its symbols start in Sorted.
@@ -105,7 +105,7 @@ internal static class Huffman
 /// a hostile header block bounded: total decoded size and field count per block, the table capped at the size we
 /// advertised, string lengths checked against what's left before anything is allocated.
 /// </summary>
-internal sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int maxFields = 128)
+public sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int maxFields = 128)
 {
     private readonly int _maxTableSize = maxTableSize;
     private readonly List<(byte[] Name, byte[] Value)> _table = new(); // newest first
@@ -119,7 +119,7 @@ internal sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int 
     /// Decode one complete header block, handing each field to <paramref name="onField"/> (name, value; spans valid only
     /// during the call). Throws <see cref="HpackException"/>.
     /// </summary>
-    public void Decode(ReadOnlySpan<byte> block, HpackFieldHandler onField)
+    public void Decode(ReadOnlySpan<byte> block, FieldHandler onField)
     {
         int pos = 0, fields = 0;
         long listSize = 0;
@@ -169,7 +169,7 @@ internal sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int 
 
     private string? _overLimit;
 
-    private void Emit(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value, ref long listSize, ref int fields, HpackFieldHandler onField)
+    private void Emit(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value, ref long listSize, ref int fields, FieldHandler onField)
     {
         if (_overLimit is not null) return;
         listSize += name.Length + value.Length + 32; // RFC 9113 SETTINGS_MAX_HEADER_LIST_SIZE accounting
@@ -214,7 +214,7 @@ internal sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int 
     }
 
     /// <summary>An N-bit prefix integer (RFC 7541 5.1), capped far below overflow.</summary>
-    internal static int ReadInt(ReadOnlySpan<byte> s, ref int pos, int prefix)
+    public static int ReadInt(ReadOnlySpan<byte> s, ref int pos, int prefix)
     {
         int max = (1 << prefix) - 1;
         int v = s[pos++] & max;
@@ -258,13 +258,13 @@ internal sealed class HpackDecoder(int maxTableSize, int maxHeaderListSize, int 
     }
 }
 
-internal delegate void HpackFieldHandler(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value);
+public delegate void FieldHandler(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value);
 
 /// <summary>
 /// HPACK encoder for responses. Stateless by design: static-table references and literals, never the dynamic table, so
 /// there's no state to desynchronize and nothing for a client to probe (no compression oracle across responses).
 /// </summary>
-internal static class HpackEncoder
+public static class HpackEncoder
 {
     private static readonly Dictionary<string, int> StaticNames = BuildNames();
     private static readonly Dictionary<(string, string), int> StaticPairs = BuildPairs();
@@ -324,7 +324,7 @@ internal static class HpackEncoder
         }
     }
 
-    internal static void WriteInt(byte[] buf, ref int len, byte flags, int prefix, int v)
+    public static void WriteInt(byte[] buf, ref int len, byte flags, int prefix, int v)
     {
         int max = (1 << prefix) - 1;
         if (v < max) { buf[len++] = (byte)(flags | v); return; }

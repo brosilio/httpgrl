@@ -1,9 +1,9 @@
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 
-namespace Httpgrl.Core.Http3;
+namespace Httpgrl.Http3;
 
 /// <summary>HTTP/3 error codes (RFC 9114 8.1) and QPACK's (RFC 9204 6).</summary>
-internal enum H3Error : ulong
+public enum H3Error : ulong
 {
     NoError = 0x100,
     GeneralProtocolError = 0x101,
@@ -28,13 +28,13 @@ internal enum H3Error : ulong
 }
 
 /// <summary>An HTTP/3 error: of the connection (CONNECTION_CLOSE), or of one stream (reset it).</summary>
-internal sealed class H3Exception(H3Error code, string message, bool connection = true) : Exception(message)
+public sealed class H3Exception(H3Error code, string message, bool connection = true) : Exception(message)
 {
     public H3Error Code { get; } = code;
     public bool IsConnectionError { get; } = connection;
 }
 
-internal static class H3FrameType
+public static class H3FrameType
 {
     public const ulong Data = 0x00, Headers = 0x01, CancelPush = 0x03, Settings = 0x04, PushPromise = 0x05, GoAway = 0x07, MaxPushId = 0x0d;
 
@@ -42,12 +42,12 @@ internal static class H3FrameType
     public static bool IsHttp2Only(ulong t) => t is 0x02 or 0x06 or 0x08 or 0x09;
 }
 
-internal static class H3StreamType
+public static class H3StreamType
 {
     public const ulong Control = 0x00, Push = 0x01, QpackEncoder = 0x02, QpackDecoder = 0x03;
 }
 
-internal static class H3Settings
+public static class H3Settings
 {
     public const ulong QpackMaxTableCapacity = 0x01, MaxFieldSectionSize = 0x06, QpackBlockedStreams = 0x07,
         EnableConnectProtocol = 0x08, H3Datagram = 0x33;
@@ -61,7 +61,7 @@ internal static class H3Settings
 /// that need it (HEADERS, SETTINGS, the control frames), bounded by <c>maxPayload</c>; DATA payload is handed out as
 /// it comes; unknown types are skipped without buffering (7.2.8).
 /// </summary>
-internal sealed class H3FrameReader(int maxPayload)
+public sealed class H3FrameReader(int maxPayload)
 {
     private enum Phase { Type, Length, Payload, Skip, Data }
     private Phase _phase = Phase.Type;
@@ -164,10 +164,10 @@ internal sealed class H3FrameReader(int maxPayload)
         or H3FrameType.GoAway or H3FrameType.MaxPushId;
 }
 
-internal delegate void H3FrameHandler(ulong type, ReadOnlySpan<byte> payload);
-internal delegate void H3DataHandler(ReadOnlySpan<byte> data);
+public delegate void H3FrameHandler(ulong type, ReadOnlySpan<byte> payload);
+public delegate void H3DataHandler(ReadOnlySpan<byte> data);
 
-internal static class H3FrameWriter
+public static class H3FrameWriter
 {
     /// <summary>A frame header (type, length); the bytes written.</summary>
     public static int Header(Span<byte> d, ulong type, long length)
@@ -205,17 +205,15 @@ internal static class H3FrameWriter
     public static Dictionary<ulong, ulong> ParseSettings(ReadOnlySpan<byte> payload)
     {
         var d = new Dictionary<ulong, ulong>();
-        var r = new QuicReader(payload, QuicError.FrameEncodingError);
-        try
+        int pos = 0;
+        while (pos < payload.Length)
         {
-            while (!r.End)
-            {
-                ulong id = r.VarInt(), v = r.VarInt();
-                if (H3Settings.IsHttp2Only(id)) throw new H3Exception(H3Error.SettingsError, "an HTTP/2 setting");
-                if (!d.TryAdd(id, v)) throw new H3Exception(H3Error.SettingsError, "duplicate setting");
-            }
+            if (!VarInt.TryRead(payload[pos..], out ulong id, out int a) || !VarInt.TryRead(payload[(pos + a)..], out ulong v, out int b))
+                throw new H3Exception(H3Error.FrameError, "malformed SETTINGS");
+            pos += a + b;
+            if (H3Settings.IsHttp2Only(id)) throw new H3Exception(H3Error.SettingsError, "an HTTP/2 setting");
+            if (!d.TryAdd(id, v)) throw new H3Exception(H3Error.SettingsError, "duplicate setting");
         }
-        catch (QuicException) { throw new H3Exception(H3Error.FrameError, "malformed SETTINGS"); }
         return d;
     }
 }

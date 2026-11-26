@@ -1,7 +1,7 @@
 using System.Buffers;
 using Httpgrl.Core.Hosting;
 using Httpgrl.Core.Http;
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 
 namespace Httpgrl.Core.Http3;
 
@@ -11,7 +11,7 @@ namespace Httpgrl.Core.Http3;
 /// endpoint's thread; this object is the handler's side, and everything it does there goes through
 /// <see cref="Http3Connection"/>.
 /// </summary>
-internal sealed class H3Stream : Deadlines
+internal sealed class H3Stream : Deadlines, IHttp3Request
 {
     public readonly long Id;
     public readonly Http3Connection Conn;
@@ -51,6 +51,10 @@ internal sealed class H3Stream : Deadlines
         Body.Wake();
         Wire.Fail();
     }
+
+    bool IHttp3Request.HasRoom => Body.HasRoom;
+    bool IHttp3Request.Deliver(ReadOnlySpan<byte> data, bool end) => Body.Deliver(data, end);
+    void IHttp3Request.Abort(string reason, H3Error code) => Abort(reason, code, reset: false);
 
     public void Dispose() => _cts.Dispose();
 }

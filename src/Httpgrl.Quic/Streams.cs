@@ -1,7 +1,7 @@
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>Stream ID arithmetic (RFC 9000 2.1): the low bit is the initiator, the next the direction.</summary>
-internal static class StreamId
+public static class StreamId
 {
     public static bool IsBidi(long id) => (id & 2) == 0;
     public static bool IsClientInitiated(long id) => (id & 1) == 0;
@@ -43,7 +43,7 @@ internal sealed class QuicStream(long id, bool local, SendBuffer? send, RecvBuff
     public bool Finished => SendDone && (Recv is null || RecvDone);
 }
 
-internal enum QuicEventKind : byte
+public enum QuicEventKind : byte
 {
     /// <summary>The handshake completed (ALPN and SNI are known).</summary>
     Connected,
@@ -65,7 +65,7 @@ internal enum QuicEventKind : byte
     Closed,
 }
 
-internal struct QuicEvent
+public struct QuicEvent
 {
     public QuicEventKind Kind;
     public long StreamId;

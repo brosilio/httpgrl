@@ -3,15 +3,14 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
-using Httpgrl.Core.Hosting;
 
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>What a new connection gets: the TLS contexts and limits of the configuration it starts under.</summary>
-internal readonly record struct QuicAccept(QuicTlsContext Tls, Func<string?, QuicTlsContext?> Select, QuicOptions Options);
+public readonly record struct QuicAccept(QuicTlsContext Tls, Func<string?, QuicTlsContext?> Select, QuicOptions Options);
 
 /// <summary>What runs on a QUIC endpoint (HTTP/3, or a test protocol). Every call is on the endpoint's thread.</summary>
-internal interface IQuicApplication
+public interface IQuicApplication
 {
     /// <summary>The configuration a new connection from <paramref name="remote"/> starts under; null: the endpoint's own.</summary>
     QuicAccept? Accept(EndPoint remote) => null;
@@ -23,7 +22,7 @@ internal interface IQuicApplication
     void Tick(long now) { }
 }
 
-internal sealed class QuicEndpointOptions
+public sealed class QuicEndpointOptions
 {
     public int MaxConnections = 10_000;
     public int MaxConnectionsPerClient = 256;
@@ -43,31 +42,19 @@ internal sealed class QuicEndpointOptions
 /// IDs with stateless resets, and runs every connection's timers. One thread owns the socket and all its
 /// connections, so none of the connection state needs locks; other threads hand it work through <see cref="Post"/>.
 /// </summary>
-internal sealed class QuicEndpoint : IDisposable
+public sealed class QuicEndpoint : IQuicDispatcher, IDisposable
 {
     public const int CidLength = 8;
     private const long RetryTokenLifetimeUs = 10_000_000;
 
-    private sealed class Conn(QuicConnection c, IpKey client)
+    private sealed class Conn(QuicConnection c, ClientKey client)
     {
         public readonly QuicConnection C = c;
         /// <summary>Whose per-client allowance it counts against: the address it started from, then each validated one.</summary>
-        public IpKey Client = client;
+        public ClientKey Client = client;
         public readonly List<CidKey> Cids = new();
         public long Queued;
         public bool Handshaking = true;
-    }
-
-    /// <summary>A connection ID as a dictionary key without allocating: up to 20 bytes in three words.</summary>
-    private readonly record struct CidKey(ulong A, ulong B, uint C, byte Len)
-    {
-        public static CidKey From(ReadOnlySpan<byte> cid)
-        {
-            Span<byte> b = stackalloc byte[24];
-            b.Clear();
-            cid[..Math.Min(cid.Length, 20)].CopyTo(b);
-            return new(BinaryPrimitives.ReadUInt64LittleEndian(b), BinaryPrimitives.ReadUInt64LittleEndian(b[8..]), BinaryPrimitives.ReadUInt32LittleEndian(b[16..]), (byte)cid.Length);
-        }
     }
 
     private readonly Socket _socket;
@@ -76,11 +63,11 @@ internal sealed class QuicEndpoint : IDisposable
     private readonly QuicTlsContext? _defaultTls;
     private readonly Func<string?, QuicTlsContext?> _selectTls;
     private readonly IQuicApplication _app;
-    private readonly ILogger _log;
+    private readonly IQuicLog _log;
     private readonly Dictionary<CidKey, Conn> _cids = new();
     private readonly HashSet<Conn> _conns = new();
     private readonly Dictionary<QuicConnection, Conn> _byConn = new(ReferenceEqualityComparer.Instance);
-    private readonly Dictionary<IpKey, int> _perClient = new();
+    private readonly Dictionary<ClientKey, int> _perClient = new();
     private readonly PriorityQueue<Conn, long> _timers = new();
     private readonly Queue<Action> _posted = new();
     private readonly AesGcm _tokenAead;
@@ -109,7 +96,7 @@ internal sealed class QuicEndpoint : IDisposable
     public int Connections => _conns.Count;
     public EndPoint LocalEndPoint => _socket.LocalEndPoint!;
 
-    public QuicEndpoint(Socket socket, QuicTlsContext? defaultTls, Func<string?, QuicTlsContext?> selectTls, IQuicApplication app, ILogger log, QuicEndpointOptions? options = null)
+    public QuicEndpoint(Socket socket, QuicTlsContext? defaultTls, Func<string?, QuicTlsContext?> selectTls, IQuicApplication app, IQuicLog log, QuicEndpointOptions? options = null)
     {
         _socket = socket;
         _defaultTls = defaultTls;
@@ -129,18 +116,8 @@ internal sealed class QuicEndpoint : IDisposable
         }
     }
 
-    private static readonly long ClockStart = Stopwatch.GetTimestamp();
-
-    /// <summary>
-    /// Microseconds on a monotonic clock that starts at one second when the process first uses QUIC: always positive
-    /// (connections use 0 for "no deadline"), and divided before it's multiplied (ticks × 10^6 overflows a long after
-    /// a few hours of uptime at nanosecond resolution).
-    /// </summary>
-    public static long Now()
-    {
-        long t = Stopwatch.GetTimestamp() - ClockStart, f = Stopwatch.Frequency;
-        return 1_000_000 + t / f * 1_000_000 + t % f * 1_000_000 / f;
-    }
+    /// <summary>The QUIC clock (<see cref="QuicClock.Now"/>).</summary>
+    public static long Now() => QuicClock.Now();
 
     public void Start()
     {
@@ -193,7 +170,7 @@ internal sealed class QuicEndpoint : IDisposable
                 RunTimers(now);
                 RunPosted(now);
                 try { _app.Tick(now); }
-                catch (Exception x) when (x is not OutOfMemoryException) { _log.Error("quic application tick failed", new LogField("error", x.Message), new LogField("stack", x.StackTrace)); }
+                catch (Exception x) when (x is not OutOfMemoryException) { _log.Error("quic application tick failed", ("error", x.Message), ("stack", x.StackTrace)); }
                 long next = _timers.TryPeek(out _, out long t) ? t : now + 1_000_000;
                 int waitUs = (int)Math.Clamp(next - now, 0, 1_000_000);
                 if (!_socket.Poll(waitUs, SelectMode.SelectRead)) continue;
@@ -210,7 +187,7 @@ internal sealed class QuicEndpoint : IDisposable
             catch (ObjectDisposedException) { return; }
             catch (Exception e) when (!_stop)
             {
-                _log.Error("quic endpoint error", new LogField("error", e.GetType().Name), new LogField("detail", e.Message), new LogField("stack", e.StackTrace));
+                _log.Error("quic endpoint error", ("error", e.GetType().Name), ("detail", e.Message), ("stack", e.StackTrace));
             }
         }
     }
@@ -271,7 +248,7 @@ internal sealed class QuicEndpoint : IDisposable
 
     private void NewConnection(Span<byte> d, PacketHeader h, EndPoint from, long now)
     {
-        var client = IpKey.From(from);
+        var client = ClientKey.From(from);
         _perClient.TryGetValue(client, out int mine);
         if (_conns.Count >= _o.MaxConnections || mine >= _o.MaxConnectionsPerClient)
         {
@@ -311,7 +288,7 @@ internal sealed class QuicEndpoint : IDisposable
         }
         catch (Exception e) when (e is QuicException or InvalidOperationException)
         {
-            _log.Warn("quic connection setup failed", new LogField("error", e.Message));
+            _log.Warn("quic connection setup failed", ("error", e.Message));
             return;
         }
         var conn = new Conn(qc, client);
@@ -367,11 +344,19 @@ internal sealed class QuicEndpoint : IDisposable
                 case QuicEventKind.PathValidated:
                 {
                     // Per-client limits follow the validated address.
-                    var moved = IpKey.From(c.C.Path);
+                    var moved = ClientKey.From(c.C.Path);
                     if (moved != c.Client)
                     {
+                        _perClient.TryGetValue(moved, out int m);
+                        if (m >= _o.MaxConnectionsPerClient)
+                        {
+                            Refused++;
+                            _log.Warn("security", ("event", "migration_limit_exceeded"), ("remote", c.C.Path.ToString()));
+                            c.C.RefuseMigration(now);
+                            break; // retain the original accounting until removal
+                        }
                         Release(c.Client);
-                        _perClient[moved] = (_perClient.TryGetValue(moved, out int m) ? m : 0) + 1;
+                        _perClient[moved] = m + 1;
                         c.Client = moved;
                     }
                     break;
@@ -383,7 +368,7 @@ internal sealed class QuicEndpoint : IDisposable
                     try { _app.OnEvent(c.C, e, now); }
                     catch (Exception x) when (x is not OutOfMemoryException)
                     {
-                        _log.Error("quic application error", new LogField("error", x.GetType().Name), new LogField("detail", x.Message), new LogField("stack", x.StackTrace));
+                        _log.Error("quic application error", ("error", x.GetType().Name), ("detail", x.Message), ("stack", x.StackTrace));
                         c.C.Close(0x0102 /* H3_INTERNAL_ERROR */, "internal error", now);
                     }
                     break;
@@ -410,7 +395,7 @@ internal sealed class QuicEndpoint : IDisposable
         if (!_conns.Remove(c)) return;
         _byConn.Remove(c.C);
         try { _app.Closed(c.C); }
-        catch (Exception x) when (x is not OutOfMemoryException) { _log.Error("quic application close failed", new LogField("error", x.Message), new LogField("stack", x.StackTrace)); }
+        catch (Exception x) when (x is not OutOfMemoryException) { _log.Error("quic application close failed", ("error", x.Message), ("stack", x.StackTrace)); }
         if (c.Handshaking) { c.Handshaking = false; _handshaking--; }
         foreach (var k in c.Cids)
             if (_cids.TryGetValue(k, out var x) && ReferenceEquals(x, c)) _cids.Remove(k);
@@ -418,7 +403,7 @@ internal sealed class QuicEndpoint : IDisposable
         c.C.Dispose();
     }
 
-    private void Release(IpKey client)
+    private void Release(ClientKey client)
     {
         if (_perClient.TryGetValue(client, out int n))
         {
@@ -460,7 +445,7 @@ internal sealed class QuicEndpoint : IDisposable
             // The route or device won't segment (EIO and friends): stop using GSO, and send these one by one.
             _gso = false;
             try { _socket.SetRawSocketOption(SolUdp, UdpSegment, new byte[4]); } catch (SocketException) { }
-            _log.Warn("quic: UDP GSO failed, sending datagrams one at a time", new LogField("error", e.SocketErrorCode.ToString()));
+            _log.Warn("quic: UDP GSO failed, sending datagrams one at a time", ("error", e.SocketErrorCode.ToString()));
             for (int at = 0; at < len; at += _segment) SendTo(_batch.AsSpan(at, Math.Min(_segment, len - at)), to);
         }
         catch (SocketException) { }
@@ -545,7 +530,7 @@ internal sealed class QuicEndpoint : IDisposable
         foreach (var c in _conns)
         {
             try { _app.Closed(c.C); } // the application lets go of what it holds (a configuration generation)
-            catch (Exception x) when (x is not OutOfMemoryException) { _log.Error("quic application close failed", new LogField("error", x.Message)); }
+            catch (Exception x) when (x is not OutOfMemoryException) { _log.Error("quic application close failed", ("error", x.Message)); }
             c.C.Dispose();
         }
         _conns.Clear();

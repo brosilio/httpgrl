@@ -1,0 +1,15 @@
+# Adapt job/instance labels to your collector. One absence rule per expected instance.
+# Parse the syslog MESSAGE as JSON, not the entire RFC5424 envelope.
+groups:
+  - name: httpgrl-log-evidence
+    rules:
+      - alert: HttpgrlLogDeliveryMissing
+        expr: absent_over_time({job="httpgrl", instance="REPLACE_ME"} | json | event="http_access" | path="/monitoring-probe" | outcome="complete" [5m])
+        labels:
+          severity: critical
+        annotations:
+          summary: "httpgrl probe records missing from central logs"
+      - alert: HttpgrlSecurityDetection
+        expr: sum by (instance, rule, severity) (count_over_time({job="httpgrl-monitor"} | json | event="security_alert" [5m])) > 0
+        annotations:
+          summary: "httpgrl detector reported {{ $labels.rule }}"

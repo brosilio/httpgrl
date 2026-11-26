@@ -1,6 +1,6 @@
 using System.Net;
 using System.Security.Cryptography;
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 
 namespace Httpgrl.Tests;
 
@@ -49,8 +49,9 @@ internal sealed class QuicNet : IDisposable
 
     public static Func<(byte[], byte[])> Cids => () => (RandomNumberGenerator.GetBytes(8), RandomNumberGenerator.GetBytes(16));
 
-    public QuicNet(int seed = 1, QuicOptions? server = null, QuicOptions? client = null, string[]? alpn = null, string? clientSuites = null)
+    public QuicNet(int seed = 1, QuicOptions? server = null, QuicOptions? client = null, string[]? alpn = null, string? clientSuites = null, long start = 1_000_000)
     {
+        Now = start;
         _rng = new Random(seed);
         _dir = Directory.CreateTempSubdirectory("httpgrl-quicnet-").FullName;
         ProxyTests.MakeCert("quic.test", _dir, "q").Dispose();

@@ -1,9 +1,9 @@
 using System.Text;
-using Httpgrl.Core.Http2;
+using Httpgrl.HttpFields;
 
-namespace Httpgrl.Core.Http3;
+namespace Httpgrl.Http3;
 
-internal sealed class QpackException(string message, bool limit = false) : Exception(message)
+public sealed class QpackException(string message, bool limit = false) : Exception(message)
 {
     /// <summary>A size limit was exceeded (answer 431), as opposed to a malformed section (QPACK_DECOMPRESSION_FAILED).</summary>
     public bool Limit { get; } = limit;
@@ -15,7 +15,7 @@ internal sealed class QpackException(string message, bool limit = false) : Excep
 /// QPACK_DECOMPRESSION_FAILED (4.5.1, 2.2.3). With no table there's no state across streams: nothing to block on,
 /// nothing to desynchronize. Sizes are bounded as in HPACK: the decoded section, field count, string lengths.
 /// </summary>
-internal sealed class QpackDecoder(int maxFieldSectionSize, int maxFields = 128)
+public sealed class QpackDecoder(int maxFieldSectionSize, int maxFields = 128)
 {
     private byte[] _scratch = new byte[256];
 
@@ -23,7 +23,7 @@ internal sealed class QpackDecoder(int maxFieldSectionSize, int maxFields = 128)
         Array.ConvertAll(QpackStaticTable.Entries, e => (Encoding.ASCII.GetBytes(e.Name), Encoding.ASCII.GetBytes(e.Value)));
 
     /// <summary>Decode one field section (a HEADERS frame's payload). Throws <see cref="QpackException"/>.</summary>
-    public void Decode(ReadOnlySpan<byte> section, HpackFieldHandler onField)
+    public void Decode(ReadOnlySpan<byte> section, FieldHandler onField)
     {
         int pos = 0;
         if (section.IsEmpty) throw new QpackException("empty field section");
@@ -71,7 +71,7 @@ internal sealed class QpackDecoder(int maxFieldSectionSize, int maxFields = 128)
         if (over is not null) throw new QpackException(over, limit: true);
     }
 
-    private void Emit(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value, ref long size, ref int fields, ref string? over, HpackFieldHandler onField)
+    private void Emit(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value, ref long size, ref int fields, ref string? over, FieldHandler onField)
     {
         if (over is not null) return;
         size += name.Length + value.Length + 32; // RFC 9114 4.2.2 accounting (as HTTP/2's)
@@ -121,7 +121,7 @@ internal sealed class QpackDecoder(int maxFieldSectionSize, int maxFields = 128)
 /// QPACK encoding for responses: stateless, like our HPACK encoder. A section prefix of zero (no dynamic table), then
 /// static references where the table has the field, literals otherwise, Huffman when it's shorter.
 /// </summary>
-internal static class QpackEncoder
+public static class QpackEncoder
 {
     private static readonly Dictionary<string, int> Names = BuildNames();
     private static readonly Dictionary<(string, string), int> Pairs = BuildPairs();

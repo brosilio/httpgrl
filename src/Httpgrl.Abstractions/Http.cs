@@ -27,6 +27,10 @@ public abstract class HttpContext
     public abstract HttpResponse Response { get; }
     public abstract ConnectionInfo Connection { get; }
     public abstract ILogger Log { get; }
+    /// <summary>Final server-side response outcome: complete, incomplete, dropped, or unknown. Not proof of client receipt.</summary>
+    public virtual string ResponseOutcome => "unknown";
+    /// <summary>Selected location label for audit records; never a filesystem path.</summary>
+    public virtual string RouteLabel => "";
 
     /// <summary>The selected server block.</summary>
     public abstract IConfigScope Server { get; }

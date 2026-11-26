@@ -1,0 +1,22 @@
+[Unit]
+Description=httpgrl log detection (local journal)
+After=systemd-journald.service
+
+[Service]
+DynamicUser=yes
+SupplementaryGroups=systemd-journal
+# Replays five minutes after restart; alerts can repeat. Raw central logs remain authoritative.
+ExecStart=/bin/sh -c 'journalctl --follow --since=-5min --unit=httpgrl.service --output=cat --no-pager _TRANSPORT=stdout | python3 -B /usr/local/lib/httpgrl-monitor/detect.py --policy /etc/httpgrl-monitor/policy.json'
+Restart=always
+RestartSec=5
+SyslogIdentifier=httpgrl-monitor
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

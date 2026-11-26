@@ -2,6 +2,7 @@
 # Modules (src/Httpgrl.Modules.*) may only use the plugin API: no direct filesystem access (resources come
 # from HttpContext.Probe/OpenFile/ListDirectory), no native interop, no process spawning, no reflection or
 # assembly loading, and no project reference other than Httpgrl.Abstractions.
+# Protocol libraries (Httpgrl.HttpFields, Httpgrl.Quic, Httpgrl.Http3) may reference only each other, in one direction.
 set -eu
 cd "$(dirname "$0")/.."
 fail=0
@@ -24,5 +25,31 @@ for dir in src/Httpgrl.Modules.*; do
         fi
     done
 done
-[ "$fail" -eq 0 ] && echo "module boundaries ok"
+
+# Protocol libraries (docs/plan-protocol-libraries.md): Httpgrl.HttpFields and Httpgrl.Quic reference nothing of ours,
+# Httpgrl.Http3 only those two. None of them may reach into Core or Abstractions, and none lets Core see its internals:
+# the server uses them through their public API, like any other consumer.
+check_lib() { # project, allowed references (regex)
+    proj="src/$1/$1.csproj"
+    refs=$(grep -oE '<(ProjectReference|PackageReference) Include="[^"]*"' "$proj" | sed 's/.*Include="//; s/"$//' || true)
+    for r in $refs; do
+        if ! echo "$r" | grep -qE "^($2)$"; then
+            echo "library boundary violation: $proj references $r"
+            fail=1
+        fi
+    done
+    if grep -rnE 'Httpgrl\.(Core|Abstractions)\b|\bnamespace Httpgrl;' "src/$1" --include='*.cs' | grep -v '/obj/' | grep -v '/bin/'; then
+        echo "library boundary violation: $1 uses Httpgrl.Core or Httpgrl.Abstractions"
+        fail=1
+    fi
+    if grep -qE 'InternalsVisibleTo Include="Httpgrl\.(Core|Http3|Quic|HttpFields)"' "$proj"; then
+        echo "library boundary violation: $proj shows its internals to another httpgrl project"
+        fail=1
+    fi
+}
+check_lib Httpgrl.HttpFields 'NONE'
+check_lib Httpgrl.Quic 'NONE'
+check_lib Httpgrl.Http3 '\.\./Httpgrl\.Quic/Httpgrl\.Quic\.csproj|\.\./Httpgrl\.HttpFields/Httpgrl\.HttpFields\.csproj'
+
+[ "$fail" -eq 0 ] && echo "module and library boundaries ok"
 exit "$fail"

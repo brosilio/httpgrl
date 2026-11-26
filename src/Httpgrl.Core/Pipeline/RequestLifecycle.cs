@@ -18,7 +18,14 @@ internal static class RequestLifecycle
     /// </summary>
     public static int Route(HttpContextImpl ctx, VirtualHosts hosts, ServerRt? tlsServer, int reject)
     {
-        ctx.ServerRt = reject == 0 ? hosts.Resolve(ctx.Req.HostValue) : hosts.Default;
+        try { ctx.ServerRt = reject == 0 ? hosts.Resolve(ctx.Req.HostValue) : hosts.Default; }
+        catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+        {
+            // No server policy is safe to select after an indeterminate match.
+            ctx.ServerRt = hosts.Default;
+            ctx.SecurityEvent("routing_regex_timeout");
+            reject = 444;
+        }
         if (reject == 0 && tlsServer is not null)
         {
             // A client may complete the handshake for one name (SNI) and then ask for another (Host). Never let that
@@ -29,6 +36,7 @@ internal static class RequestLifecycle
             else if (ctx.ServerRt.RejectHandshake) reject = 421;
         }
         ctx.SelectLocation(ctx.ServerRt.Root, null);
+        if (reject != 0 && reject != 444) ctx.SecurityEvent(reject == 421 ? "tls_policy_mismatch" : "request_rejected");
         return reject;
     }
 
@@ -42,6 +50,7 @@ internal static class RequestLifecycle
         else await ctx.Rt.Pipeline.RunAsync(ctx).ConfigureAwait(false);
         // Dropped (444): nothing was written and nothing will be.
         bool clean = !ctx.Broken && !ctx.Dropped && await ctx.Resp.CompleteAsync().ConfigureAwait(false);
+        ctx.ResponseComplete = clean;
         ctx.Resp.ReturnBuffer();
         return clean;
     }
@@ -49,6 +58,8 @@ internal static class RequestLifecycle
     /// <summary>The log phase, request-end callbacks (exactly once) and the response counters.</summary>
     public static async ValueTask FinishAsync(HttpContextImpl ctx, ConnectionManager mgr)
     {
+        if (!ctx.RequestPending || ctx.Loc is null) return;
+        ctx.RequestPending = false;
         await ctx.Rt.Pipeline.RunLogAsync(ctx).ConfigureAwait(false);
         ctx.EndRequest();
         mgr.CountResponse(ctx.Resp.Status);

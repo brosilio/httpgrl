@@ -1,4 +1,4 @@
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>
 /// QUIC transport parameters (RFC 9000 18, RFC 9221 3), carried in the TLS handshake. Parsing is strict: a duplicate,

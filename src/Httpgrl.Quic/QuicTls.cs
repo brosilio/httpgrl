@@ -2,10 +2,10 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 
-namespace Httpgrl.Core.Quic;
+namespace Httpgrl.Quic;
 
 /// <summary>QUIC encryption levels, numbered as OpenSSL's protection levels (OSSL_RECORD_PROTECTION_LEVEL_*).</summary>
-internal enum QuicLevel : byte
+public enum QuicLevel : byte
 {
     Initial = 0,
     ZeroRtt = 1,
@@ -13,8 +13,8 @@ internal enum QuicLevel : byte
     OneRtt = 3,
 }
 
-/// <summary>What a <see cref="QuicTls"/> asks of its connection. Called synchronously, from inside <see cref="QuicTls.Advance"/>.</summary>
-internal interface IQuicTlsHost
+/// <summary>What a TLS session asks of its connection. Called synchronously, from inside <see cref="IQuicTlsSession.Advance"/>.</summary>
+public interface IQuicTlsHost
 {
     /// <summary>Handshake bytes to send in CRYPTO frames at <paramref name="level"/>.</summary>
     void OnCryptoData(QuicLevel level, ReadOnlySpan<byte> data);
@@ -28,6 +28,39 @@ internal interface IQuicTlsHost
 }
 
 /// <summary>
+/// One connection's TLS 1.3 handshake, as QUIC drives it (RFC 9001): CRYPTO bytes in at an encryption level, and
+/// through <see cref="IQuicTlsHost"/>, CRYPTO bytes out, traffic secrets, and the peer's transport parameters. Used by
+/// one thread at a time, and calls its host only from inside <see cref="Advance"/> (or <see cref="Receive"/>).
+/// Made by a <see cref="QuicTlsContext"/>.
+/// </summary>
+public interface IQuicTlsSession : IDisposable
+{
+    bool HandshakeComplete { get; }
+    /// <summary>Set once a call failed: the CONNECTION_CLOSE code (CRYPTO_ERROR + alert where TLS sent one).</summary>
+    QuicError? Error { get; }
+    string? ErrorReason { get; }
+    /// <summary>The SNI the client sent (servers, after the handshake).</summary>
+    string? ServerName { get; }
+    /// <summary>The negotiated ALPN protocol. A session must fail the handshake when there's none (RFC 9001 8.1).</summary>
+    string? Alpn { get; }
+    /// <summary>The context SNI selected (a server's), or the one the session started with.</summary>
+    QuicTlsContext Context { get; }
+    /// <summary>The client's certificate as received (servers whose context has a client-certificate policy).</summary>
+    System.Security.Cryptography.X509Certificates.X509Certificate2? PeerCertificate { get; }
+    /// <summary>The intermediates the client sent with it.</summary>
+    System.Security.Cryptography.X509Certificates.X509Certificate2Collection PeerChain { get; }
+
+    /// <summary>
+    /// CRYPTO data the peer sent at <paramref name="level"/>, in order and new (the connection reassembles). Data at a
+    /// level below the one TLS now reads must throw a PROTOCOL_VIOLATION <see cref="QuicException"/> (RFC 9001 4.1.3).
+    /// </summary>
+    void Receive(QuicLevel level, ReadOnlySpan<byte> data);
+
+    /// <summary>Make progress with what has arrived. False if the connection must close (see <see cref="Error"/>).</summary>
+    bool Advance();
+}
+
+/// <summary>
 /// The TLS 1.3 handshake for QUIC, run by the system OpenSSL through its third-party QUIC TLS API (OpenSSL 3.5,
 /// SSL_set_quic_tls_cbs). OpenSSL does the handshake and certificate work; we move CRYPTO bytes and receive the
 /// traffic secrets. All of HTTP/3's native interop is in this file.
@@ -36,9 +69,9 @@ internal interface IQuicTlsHost
 /// our calls to it, on that thread. Buffers OpenSSL may read later (records, transport parameters) live in native
 /// memory we own until it's done with them.
 /// </summary>
-internal sealed unsafe partial class QuicTls : IDisposable
+internal sealed unsafe partial class QuicTls : IQuicTlsSession
 {
-    private const string LibSsl = "libssl.so.3", LibCrypto = "libcrypto.so.3";
+    internal const string LibSsl = "libssl", LibCrypto = "libcrypto";
 
     // OSSL_FUNC_SSL_QUIC_TLS_* (core_dispatch.h).
     private const int CryptoSendId = 2001, CryptoRecvRcdId = 2002, CryptoReleaseRcdId = 2003, YieldSecretId = 2004, GotTransportParamsId = 2005, AlertId = 2006;
@@ -57,6 +90,7 @@ internal sealed unsafe partial class QuicTls : IDisposable
     [LibraryImport(LibSsl)] private static partial int SSL_CTX_check_private_key(IntPtr ctx);
     [LibraryImport(LibSsl, StringMarshalling = StringMarshalling.Utf8)] private static partial int SSL_CTX_load_verify_locations(IntPtr ctx, string? file, string? path);
     [LibraryImport(LibSsl)] private static partial void SSL_CTX_set_verify(IntPtr ctx, int mode, IntPtr callback);
+    [LibraryImport(LibSsl)] private static partial int SSL_CTX_set_default_verify_paths(IntPtr ctx);
     [LibraryImport(LibSsl)] private static partial void SSL_CTX_set_alpn_select_cb(IntPtr ctx, IntPtr cb, IntPtr arg);
     [LibraryImport(LibSsl)] private static partial nint SSL_CTX_callback_ctrl(IntPtr ctx, int cmd, IntPtr fp);
     [LibraryImport(LibSsl)] private static partial IntPtr SSL_new(IntPtr ctx);
@@ -99,16 +133,20 @@ internal sealed unsafe partial class QuicTls : IDisposable
     [LibraryImport(LibCrypto)] private static partial void ERR_error_string_n(nuint e, byte* buf, nuint len);
     [LibraryImport(LibCrypto)] private static partial void ERR_clear_error();
 
-    /// <summary>Null if QUIC TLS works here; otherwise why not (not Linux, or an OpenSSL without the QUIC TLS API).</summary>
+    /// <summary>Null if QUIC TLS works here; otherwise why not (no OpenSSL found, or one without the QUIC TLS API).</summary>
     public static string? Unavailable => _unavailable.Value;
 
     private static readonly Lazy<string?> _unavailable = new(() =>
     {
-        if (!OperatingSystem.IsLinux()) return "HTTP/3 is only implemented on Linux";
-        if (!NativeLibrary.TryLoad(LibSsl, out var lib)) return "libssl.so.3 not found";
-        if (!NativeLibrary.TryGetExport(lib, "SSL_set_quic_tls_cbs", out _)) return "the system OpenSSL has no QUIC TLS API (needs OpenSSL 3.5 or newer)";
+        var (ssl, _) = QuicOpenSsl.Names;
+        if (QuicOpenSsl.Load(LibSsl) is not { } lib) return ssl + " not found";
+        if (!NativeLibrary.TryGetExport(lib, "SSL_set_quic_tls_cbs", out _)) return "the OpenSSL found (" + ssl + ") has no QUIC TLS API (needs OpenSSL 3.5 or newer)";
         return null;
     });
+
+    // Our [LibraryImport]s name libssl/libcrypto by these constants; QuicOpenSsl's resolver maps them to the files of
+    // this platform (or the ones the application chose). Set before the first call into either library.
+    static QuicTls() => QuicOpenSsl.Install();
 
     // The dispatch table OpenSSL calls through: one for every connection (the connection is the callbacks' "arg").
     private static readonly IntPtr Dispatch = MakeDispatch();
@@ -155,13 +193,13 @@ internal sealed unsafe partial class QuicTls : IDisposable
 
     /// <summary>A server-side handshake. <paramref name="selectServer"/> maps the client's SNI (or null) to a context, or null to refuse.</summary>
     public static QuicTls Server(QuicTlsContext initial, Func<string?, QuicTlsContext?> selectServer, IQuicTlsHost host) =>
-        new(initial, host, server: true, selectServer, sni: null, alpn: null, transportParameters: null);
+        new((OpenSslQuicTlsContext)initial, host, server: true, selectServer, sni: null, alpn: null, transportParameters: null);
 
     /// <summary>A client-side handshake (tests and interop tooling): SNI, ALPN offered, and our transport parameters.</summary>
     public static QuicTls Client(QuicTlsContext ctx, string sni, string[] alpn, byte[] transportParameters, IQuicTlsHost host) =>
-        new(ctx, host, server: false, null, sni, alpn, transportParameters);
+        new((OpenSslQuicTlsContext)ctx, host, server: false, null, sni, alpn, transportParameters);
 
-    private QuicTls(QuicTlsContext ctx, IQuicTlsHost host, bool server, Func<string?, QuicTlsContext?>? selectServer, string? sni, string[]? alpn, byte[]? transportParameters)
+    private QuicTls(OpenSslQuicTlsContext ctx, IQuicTlsHost host, bool server, Func<string?, QuicTlsContext?>? selectServer, string? sni, string[]? alpn, byte[]? transportParameters)
     {
         _host = host;
         _isServer = server;
@@ -181,7 +219,7 @@ internal sealed unsafe partial class QuicTls : IDisposable
             try { SSL_ctrl(_ssl, SslCtrlSetTlsextHostname, 0, name); }
             finally { Marshal.FreeCoTaskMem(name); }
             if (ctx.VerifyPeer && SSL_set1_host(_ssl, sni!) != 1) throw new InvalidOperationException("SSL_set1_host failed");
-            var wire = QuicTlsContext.AlpnWire(alpn!);
+            var wire = OpenSslQuicTlsContext.AlpnWire(alpn!);
             fixed (byte* w = wire)
                 if (SSL_set_alpn_protos(_ssl, w, (uint)wire.Length) != 0) throw new InvalidOperationException("SSL_set_alpn_protos failed");
             SetOurParameters(transportParameters!);
@@ -433,7 +471,8 @@ internal sealed unsafe partial class QuicTls : IDisposable
             var t = From(SSL_get_ex_data(ssl, 0));
             if (t?._selectServer is null) return TlsextErrNoAck;
             var name = Marshal.PtrToStringUTF8(SSL_get_servername(ssl, 0));
-            var ctx = t._selectServer(name);
+            // A context of another provider can't take over an OpenSSL handshake: refused like an unknown name.
+            var ctx = t._selectServer(name) as OpenSslQuicTlsContext;
             if (ctx is null)
             {
                 *alert = AlertUnrecognizedName;
@@ -479,7 +518,7 @@ internal sealed unsafe partial class QuicTls : IDisposable
         }
         if (server)
         {
-            var wire = QuicTlsContext.AlpnWire(alpn);
+            var wire = OpenSslQuicTlsContext.AlpnWire(alpn);
             var a = (byte*)NativeMemory.Alloc((nuint)(4 + wire.Length));
             *(int*)a = wire.Length;
             wire.CopyTo(new Span<byte>(a + 4, wire.Length));
@@ -515,10 +554,15 @@ internal sealed unsafe partial class QuicTls : IDisposable
         }
     }
 
-    internal static void LoadVerify(IntPtr ctx, string caFile)
+    /// <summary>Verify the peer: against <paramref name="caFile"/>, or the system's trusted roots when it's null.</summary>
+    internal static void LoadVerify(IntPtr ctx, string? caFile)
     {
         ERR_clear_error();
-        if (SSL_CTX_load_verify_locations(ctx, caFile, null) != 1) throw new InvalidOperationException($"can't load {caFile}: {LastError()}");
+        if (caFile is null)
+        {
+            if (SSL_CTX_set_default_verify_paths(ctx) != 1) throw new InvalidOperationException("can't load the system's trusted roots: " + LastError());
+        }
+        else if (SSL_CTX_load_verify_locations(ctx, caFile, null) != 1) throw new InvalidOperationException($"can't load {caFile}: {LastError()}");
         SSL_CTX_set_verify(ctx, 1 /* SSL_VERIFY_PEER */, IntPtr.Zero);
     }
 
@@ -598,18 +642,79 @@ internal sealed unsafe class ChaChaMask : IDisposable
 }
 
 /// <summary>
-/// An OpenSSL context for QUIC: one per server{} (its certificate, AES-GCM suites, ALPN), or a client's (its CA).
+/// A server's client-certificate policy, applied once the handshake has collected the client's certificate and before
+/// anything 1-RTT is processed. OpenSSL only collects the certificate; the verdict is entirely the policy's.
+/// </summary>
+public interface IQuicClientCertificatePolicy
+{
+    /// <summary>
+    /// The verdict (for logs and <c>$ssl_client_verify</c>-like variables) and whether the handshake may proceed.
+    /// <paramref name="certificate"/> is null when the client sent none.
+    /// </summary>
+    (string Verdict, bool Accept) Evaluate(System.Security.Cryptography.X509Certificates.X509Certificate2? certificate, System.Security.Cryptography.X509Certificates.X509Certificate2Collection? intermediates);
+}
+
+/// <summary>
+/// A TLS configuration for QUIC, and the maker of its sessions: a server's (certificate, ALPN, client-certificate
+/// policy) or a client's (what it trusts). The built-in provider is the system OpenSSL 3.5's QUIC TLS API
+/// (<see cref="Server"/>, <see cref="Client"/>); a platform without it (a console) supplies its own subclass.
+/// </summary>
+public abstract class QuicTlsContext : IDisposable
+{
+    /// <summary>A server's client-certificate policy, applied after the handshake; null: none asked.</summary>
+    public IQuicClientCertificatePolicy? ClientAuth { get; protected init; }
+
+    /// <summary>
+    /// A server-side session starting under this context. <paramref name="selectServer"/> maps the client's SNI (or
+    /// null) to the context that answers, or null to refuse the handshake.
+    /// </summary>
+    public abstract IQuicTlsSession CreateServerSession(Func<string?, QuicTlsContext?> selectServer, IQuicTlsHost host);
+
+    /// <summary>
+    /// A client-side session: the server name (SNI, and what the certificate must match when verifying), the ALPN
+    /// protocols offered, and our transport parameters (encoded) for the ClientHello.
+    /// </summary>
+    public abstract IQuicTlsSession CreateClientSession(string serverName, string[] alpn, byte[] transportParameters, IQuicTlsHost host);
+
+    public abstract void Dispose();
+
+    /// <summary>Why the built-in OpenSSL provider can't run here (no OpenSSL 3.5 with its QUIC API), or null when it can.</summary>
+    public static string? Unavailable => QuicTls.Unavailable;
+
+    /// <summary>
+    /// A server context from the built-in OpenSSL provider: the PEM certificate chain and key, offering
+    /// <paramref name="alpn"/>. With <paramref name="clientAuth"/>, it asks for a client certificate (naming the CAs in
+    /// <paramref name="clientCa"/>) and the policy judges it.
+    /// </summary>
+    public static QuicTlsContext Server(string certFile, string keyFile, string[] alpn, IQuicClientCertificatePolicy? clientAuth = null, string? clientCa = null) =>
+        OpenSslQuicTlsContext.Server(certFile, keyFile, alpn, clientAuth, clientCa);
+
+    /// <summary>
+    /// A client context from the built-in OpenSSL provider. The server's certificate is verified, always: against
+    /// <paramref name="caFile"/> (PEM) when given, else the system's trusted roots; and it must match the server name.
+    /// <paramref name="certFile"/>/<paramref name="keyFile"/>: a certificate to present when a server asks for one.
+    /// </summary>
+    public static QuicTlsContext Client(string? caFile = null, string? certFile = null, string? keyFile = null, string? suites = null) =>
+        OpenSslQuicTlsContext.Client(caFile, verify: true, certFile, keyFile, suites);
+
+    /// <summary>
+    /// A client context that does <b>not</b> verify the server at all: anyone on the path can impersonate it. Only for
+    /// interop probes and tests.
+    /// </summary>
+    public static QuicTlsContext ClientWithoutVerification(string? certFile = null, string? keyFile = null, string? suites = null) =>
+        OpenSslQuicTlsContext.Client(null, verify: false, certFile, keyFile, suites);
+}
+
+/// <summary>
+/// An OpenSSL context for QUIC: one per server{} (its certificate, AES-GCM suites, ALPN), or a client's (its trust).
 /// Built at configuration time; disposed with the configuration.
 /// </summary>
-internal sealed class QuicTlsContext : IDisposable
+internal sealed class OpenSslQuicTlsContext : QuicTlsContext
 {
     internal IntPtr Handle { get; private set; }
     private readonly IntPtr _alpnArg;
     public bool VerifyPeer { get; }
-    /// <summary>A server's client-certificate policy (ssl_verify_client), applied after the handshake; null: none asked.</summary>
-    public Modules.ClientAuth? ClientAuth { get; private init; }
-
-    private QuicTlsContext(IntPtr handle, IntPtr alpnArg, bool verify)
+    private OpenSslQuicTlsContext(IntPtr handle, IntPtr alpnArg, bool verify)
     {
         Handle = handle;
         _alpnArg = alpnArg;
@@ -620,7 +725,7 @@ internal sealed class QuicTlsContext : IDisposable
     /// A server context: the PEM certificate chain and key (the ssl_certificate files), offering <paramref name="alpn"/>.
     /// With <paramref name="clientAuth"/>, it asks for a client certificate (naming the CAs in <paramref name="clientCa"/>).
     /// </summary>
-    public static QuicTlsContext Server(string certFile, string keyFile, string[] alpn, Modules.ClientAuth? clientAuth = null, string? clientCa = null)
+    public static new OpenSslQuicTlsContext Server(string certFile, string keyFile, string[] alpn, IQuicClientCertificatePolicy? clientAuth = null, string? clientCa = null)
     {
         var ctx = QuicTls.NewContext(server: true, alpn, out var arg);
         try
@@ -633,19 +738,19 @@ internal sealed class QuicTlsContext : IDisposable
             QuicTls.FreeContext(ctx, arg);
             throw;
         }
-        return new QuicTlsContext(ctx, arg, verify: false) { ClientAuth = clientAuth };
+        return new OpenSslQuicTlsContext(ctx, arg, verify: false) { ClientAuth = clientAuth };
     }
 
     /// <summary>
     /// A client context, verifying the server against <paramref name="caFile"/> (or nothing, for interop probes), and
     /// presenting <paramref name="certFile"/> / <paramref name="keyFile"/> when a server asks for a certificate.
     /// </summary>
-    public static QuicTlsContext Client(string? caFile, string? certFile = null, string? keyFile = null, string? suites = null)
+    public static OpenSslQuicTlsContext Client(string? caFile, bool verify, string? certFile = null, string? keyFile = null, string? suites = null)
     {
         var ctx = QuicTls.NewContext(server: false, [], out _, suites);
         try
         {
-            if (caFile is not null) QuicTls.LoadVerify(ctx, caFile);
+            if (verify) QuicTls.LoadVerify(ctx, caFile);
             if (certFile is not null) QuicTls.LoadCertificate(ctx, certFile, keyFile!);
         }
         catch
@@ -653,7 +758,7 @@ internal sealed class QuicTlsContext : IDisposable
             QuicTls.FreeContext(ctx, IntPtr.Zero);
             throw;
         }
-        return new QuicTlsContext(ctx, IntPtr.Zero, verify: caFile is not null);
+        return new OpenSslQuicTlsContext(ctx, IntPtr.Zero, verify);
     }
 
     /// <summary>ALPN's wire format: each protocol as a length byte and its name.</summary>
@@ -669,7 +774,13 @@ internal sealed class QuicTlsContext : IDisposable
         return [.. b];
     }
 
-    public void Dispose()
+    public override IQuicTlsSession CreateServerSession(Func<string?, QuicTlsContext?> selectServer, IQuicTlsHost host) =>
+        QuicTls.Server(this, selectServer, host);
+
+    public override IQuicTlsSession CreateClientSession(string serverName, string[] alpn, byte[] transportParameters, IQuicTlsHost host) =>
+        QuicTls.Client(this, serverName, alpn, transportParameters, host);
+
+    public override void Dispose()
     {
         if (Handle == IntPtr.Zero) return;
         QuicTls.FreeContext(Handle, _alpnArg);

@@ -1,4 +1,4 @@
-using Httpgrl.Core.Quic;
+using Httpgrl.Quic;
 using System.Text;
 using Httpgrl.Core.Http3;
 

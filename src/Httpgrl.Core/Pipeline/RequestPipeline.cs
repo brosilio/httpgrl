@@ -26,6 +26,7 @@ internal sealed class RequestPipeline(HttpHandler[] rewrite, HttpHandler[] acces
             // A backtracking regex (one the non-backtracking engine can't run) hit its match timeout. Neither "matched"
             // nor "didn't match" can be assumed without failing open somewhere (if ... ~ / !~, map defaults), so it's a
             // 500, as nginx answers a failed regex execution. One warn line, no stack: the input is the client's to choose.
+            ctx.SecurityEvent("routing_regex_timeout");
             ctx.Log.Warn("regex match timed out", new("conn", ctx.Info.Id), new("uri", ctx.Req.RawTargetValue),
                 new("location", ctx.Loc?.Name), new("pattern", e.Pattern));
             ctx.SetKeepAlive(false);

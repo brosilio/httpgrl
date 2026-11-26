@@ -1,0 +1,13 @@
+# Merge into an existing rsyslog config; load imjournal only once.
+# Requires the separately installed rsyslog TLS driver. Replace hostname and CA path.
+module(load="imjournal" StateFile="httpgrl-journal.state" PersistStateInterval="100")
+# Set a writable workDirectory in the main rsyslog config for disk queues/state.
+if $!_SYSTEMD_UNIT == "httpgrl.service" or $!_SYSTEMD_UNIT == "httpgrl-monitor.service" then {
+  action(type="omfwd" target="logs.example.invalid" port="6514" protocol="tcp"
+    StreamDriver="gtls" StreamDriverMode="1" StreamDriverAuthMode="x509/name"
+    StreamDriverPermittedPeers="logs.example.invalid"
+    StreamDriver.CAFile="/etc/rsyslog.d/collector-ca.pem"
+    template="RSYSLOG_SyslogProtocol23Format"
+    queue.type="LinkedList" queue.filename="httpgrl-forward"
+    queue.maxDiskSpace="1g" queue.saveOnShutdown="on" action.resumeRetryCount="-1")
+}
