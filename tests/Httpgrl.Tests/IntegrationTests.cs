@@ -654,8 +654,15 @@ internal static class IntegrationTests
             var held = new List<Socket>();
             for (int i = 0; i < 3; i++) held.Add(await Connect(s.Port));
             await Task.Delay(100);
-            using var extra = await Connect(s.Port);
-            var r = await ReadToClose(extra, 2000);
+            // The refusal is a reset right after accept. It can land before the client's connect completes, in which
+            // case the connect itself reports it.
+            string r;
+            try
+            {
+                using var extra = await Connect(s.Port);
+                r = await ReadToClose(extra, 2000);
+            }
+            catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionReset) { r = "<<RESET>>"; }
             T.True(r.Length == 0 || r.Contains("<<RESET>>"));
             foreach (var h in held) h.Dispose();
             // The slots free once the server notices the closes: soon, but not by a fixed time on a busy machine.
