@@ -3,7 +3,7 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
-## [0.5.0] - Unreleased
+## [0.5.0] - 2026-11-25
 
 ### Changed (may need action)
 - JSON log schema 2 removes query/fragment values from URI fields and replaces access-log Referer values with
