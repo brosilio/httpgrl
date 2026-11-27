@@ -3,7 +3,7 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
-## [Unreleased]
+## [0.6.0] - 2026-11-27
 
 ### Changed (may need action)
 - Redirect targets built from variables (`return`, `rewrite ... redirect|permanent`, absolute `error_page` URLs) never
