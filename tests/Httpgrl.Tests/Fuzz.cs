@@ -43,7 +43,7 @@ internal static partial class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        LogPrivacyTarget(), H2HeadTarget(), RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
+        LogPrivacyTarget(), H2HeadTarget(), RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), OcspSignedTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
         QuicVarIntTarget(), QuicPacketTarget(), QuicFramesTarget(), QuicTransportParametersTarget(), QuicConnectionTarget(), QuicClientHandshakeTarget(), QuicClientFramesTarget(), QpackTarget(), H3FramesTarget(), H3SessionTarget(),
     ]);
 
@@ -62,7 +62,7 @@ internal static partial class Fuzz
         }
     }
 
-    private static readonly string[] SuiteTargets = [ "log-privacy", "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-head", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "quic-client-handshake", "quic-client-frames", "qpack", "h3-frames", "h3-session"];
+    private static readonly string[] SuiteTargets = [ "log-privacy", "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "ocsp-signed", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-head", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "quic-client-handshake", "quic-client-frames", "qpack", "h3-frames", "h3-session"];
 
     private static void RegisterReproducibility() =>
         T.Add("fuzz: inputs derive from (seed, iteration, target) alone, identically in every process", () =>
@@ -81,7 +81,7 @@ internal static partial class Fuzz
     /// <summary>The suite's input count per target: the slow, stateful targets get fewer.</summary>
     private static int SuiteIterations(string name) => name switch
     {
-        "config" or "quic-client-handshake" => 3_000,
+        "config" or "quic-client-handshake" or "ocsp-signed" => 3_000,
         "h2-session" => 2_000,
         "quic-connection" or "quic-client-frames" => 1_000,
         "h3-session" => 100,
@@ -743,6 +743,54 @@ internal static partial class Fuzz
             if (v.Expires <= now) throw new Finding("accepted an expired response");
             return true;
         }, MaxLen: 8192);
+    }
+
+    /// <summary>
+    /// OCSP acceptance logic. The "ocsp" target mutates whole signed responses, so the signature check rejects nearly all
+    /// of them and its acceptance invariants never run; here the mutated bytes are the ResponseData, re-signed by the CA
+    /// each time, so only the semantics vary: status, times, certID, responder ID, extensions.
+    /// </summary>
+    private static Target OcspSignedTarget()
+    {
+        var pki = new OcspPki("fuzz-signed.test");
+        var seeds = new List<byte[]> { pki.MakeResponseData() };
+        pki.Revoked = true; seeds.Add(pki.MakeResponseData()); pki.Revoked = false;
+        pki.Validity = TimeSpan.FromSeconds(-60); seeds.Add(pki.MakeResponseData()); // already expired
+        pki.Validity = TimeSpan.FromDays(3650); seeds.Add(pki.MakeResponseData());
+        pki.Validity = TimeSpan.FromHours(1);
+        // Fuzz the ResponseData's contents; each input is re-wrapped in one SEQUENCE, so it stays a single value to sign.
+        for (int k = 0; k < seeds.Count; k++)
+        {
+            System.Formats.Asn1.AsnDecoder.ReadEncodedValue(seeds[k], System.Formats.Asn1.AsnEncodingRules.DER, out int off, out int len, out _);
+            seeds[k] = seeds[k].AsSpan(off, len).ToArray();
+        }
+        static byte[] Sequence(byte[] content)
+        {
+            var hdr = new List<byte> { 0x30 };
+            int n = content.Length;
+            if (n < 0x80) hdr.Add((byte)n);
+            else if (n < 0x100) { hdr.Add(0x81); hdr.Add((byte)n); }
+            else { hdr.Add(0x82); hdr.Add((byte)(n >> 8)); hdr.Add((byte)n); }
+            return [.. hdr, .. content];
+        }
+        var leaf = pki.Leaf;
+        var issuer = pki.Ca;
+        var serial = leaf.SerialNumberBytes.ToArray();
+        var gate = new object();
+        return new Target("ocsp-signed", seeds.ToArray(),
+            B("\x80\x00", "\xa1", "\x82\x00", "\x18\x0f", "20991231235959Z", "19700101000000Z", "\xa0", "\xa2", "\x04\x14", "\x02\x01\x01", "\x30", "\x00"),
+            data =>
+            {
+                byte[] resp;
+                lock (gate) resp = pki.Sign(Sequence(data)); // ECDsa key use is serialized: the PKI object isn't thread-safe
+                var now = DateTime.UtcNow;
+                var v = Httpgrl.Core.Modules.Ocsp.Verify(resp, leaf, issuer, now, out _);
+                if (v is null) return false;
+                if (v.Status == Httpgrl.Core.Modules.OcspCertStatus.Unknown) throw new Finding("accepted status unknown");
+                if (v.Expires <= now) throw new Finding("accepted an expired response");
+                if (data.AsSpan().IndexOf(serial) < 0) throw new Finding("accepted a response that doesn't name the certificate");
+                return true;
+            }, MaxLen: 2048);
     }
 
     /// <summary>CRLs (DER). Only CryptographicException is a legitimate rejection.</summary>

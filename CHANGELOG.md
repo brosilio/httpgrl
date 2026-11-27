@@ -26,6 +26,13 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
 ### Tests
 - Fuzz inputs are reproducible across processes (they were seeded with the per-process-randomized `HashCode`), pinned
   by a golden-value test; every fuzz target is in the suite (`log-privacy` wasn't); long runs weight slow targets.
+- New fuzz targets: `h2-head` (HTTP/2 and HTTP/3 request heads) and `ocsp-signed` (re-signed OCSP response contents,
+  so the acceptance rules are reached; the `ocsp` target accepted 0 % of its inputs).
+- New tests: no replay of a non-idempotent request to another upstream; mTLS servers never resume and a handshake
+  without a callback verdict is verified; the fail-closed cipher check (through a test-only fault hook); RSA CRLs;
+  close-delimited upstream bodies; hostile upstream trailers, mid-chunk closes and interim floods; `proxy_set_header`
+  CR/LF; request heads past the first 4 KiB buffer; `OPTIONS *`; internal redirect cycles; `http`-level access rules;
+  PROXY protocol per-client accounting; redirect and `error_page` escaping.
 - Absence-only security assertions are paired with a status check (`T.Refused`); a test that times out gets time to
   wind down and is reported if it keeps running; the slowest test went from ~14 s to ~2 s; `"=name"` runs one test.
 

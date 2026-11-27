@@ -405,7 +405,8 @@ Routing regex timeouts fail closed: location matching returns 500, Host matching
 
 **Fuzzing.** Every parser of untrusted or semi-trusted bytes has a mutation-fuzz target in
 `tests/Httpgrl.Tests/Fuzz.cs`: the request head, the URI normalizer, chunked bodies, upstream response heads, the
-config parser (with every module's directives), CRLs, OCSP responses, PROXY protocol headers, `Accept-Encoding`,
+config parser (with every module's directives), CRLs, OCSP responses (whole signed responses, and re-signed
+response contents so the acceptance rules are reached), HTTP/2 and HTTP/3 request heads, PROXY protocol headers, `Accept-Encoding`,
 the tunnel handshake response, `Range`, `Host`/SNI names, rewrite results, and the mapping of request paths through
 `root`/`alias` (checked for containment independently of the mapper). Each target states which rejections are legitimate and
 which invariants an accepted input must hold (e.g. never both `Content-Length` and `chunked`, no dot segments
