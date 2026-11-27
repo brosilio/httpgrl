@@ -172,6 +172,11 @@ internal static class ClientAuthTests
             T.Contains("not signed by that CA", Load(CrlPem(forger)));
             T.Contains("cannot load CRL", Load("-----BEGIN X509 CRL-----\nMAMCAQA=\n-----END X509 CRL-----\n"));
             T.Contains("no CRLs", Load("nothing here\n-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n"));
+            // RSASSA-PSS isn't verified: a clear "unsupported" (it used to read as a corrupt file, "malformed CRL").
+            using var rsaCa = RsaCa();
+            var pss = Load(PemEncoding.WriteString("X509 CRL", RsaCrl(rsaCa, RSASignaturePadding.Pss)) + "\n");
+            T.Contains("unsupported CRL signature algorithm RSASSA-PSS", pss);
+            T.NotContains("malformed", pss);
             return Task.CompletedTask;
         });
 
@@ -213,6 +218,24 @@ internal static class ClientAuthTests
 
     internal static string CrlPem(X509Certificate2 issuer, params X509Certificate2[] revoked) =>
         CrlPem(issuer, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1), revoked);
+
+    private static X509Certificate2 RsaCa()
+    {
+        using var key = RSA.Create(2048);
+        var req = new CertificateRequest("CN=rsa root", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+        req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+        return req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+    }
+
+    private static byte[] RsaCrl(X509Certificate2 issuer, RSASignaturePadding padding, HashAlgorithmName? hash = null, params X509Certificate2[] revoked)
+    {
+        var b = new CertificateRevocationListBuilder();
+        var now = DateTimeOffset.UtcNow;
+        foreach (var r in revoked) b.AddEntry(r, now.AddMinutes(-5), X509RevocationReason.KeyCompromise);
+        return b.Build(issuer, BigInteger.One, now.AddDays(1), hash ?? HashAlgorithmName.SHA256, padding, now.AddMinutes(-5));
+    }
 
     private static string CrlPem(X509Certificate2 issuer, DateTimeOffset thisUpdate, DateTimeOffset nextUpdate, params X509Certificate2[] revoked)
     {

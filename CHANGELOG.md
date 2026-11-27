@@ -16,6 +16,7 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
 ### Fixed
 - `error_page code https://...$uri;` sent the evaluated URL unescaped: a non-Latin-1 path answered 500 with an
   error-level log line and stack trace (any client could flood the log), and spaces or Latin-1 went out raw.
+- An RSASSA-PSS-signed CRL failed the config load as "malformed CRL"; it now says the algorithm is unsupported.
 
 ### Tests
 - Fuzz inputs are reproducible across processes (they were seeded with the per-process-randomized `HashCode`), pinned

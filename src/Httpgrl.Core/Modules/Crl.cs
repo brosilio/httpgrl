@@ -182,6 +182,10 @@ public sealed class Crl
     {
         var alg = r.ReadSequence();
         var oid = alg.ReadObjectIdentifier();
+        // Before the parameters: an algorithm we don't verify (RSASSA-PSS carries a parameter SEQUENCE) would otherwise
+        // read as a "malformed CRL", which sends an admin looking for file corruption.
+        if (!Supported(oid))
+            throw new CryptographicException($"unsupported CRL signature algorithm {(oid == "1.2.840.113549.1.1.10" ? "RSASSA-PSS" : oid)}");
         if (alg.HasData) alg.ReadNull(); // RSA algorithms carry NULL parameters; ECDSA none
         alg.ThrowIfNotEmpty();
         return oid;
