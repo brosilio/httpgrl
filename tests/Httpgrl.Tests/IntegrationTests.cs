@@ -580,6 +580,58 @@ internal static class IntegrationTests
             T.Eq("custom", Body(r));
         });
 
+        T.Add("http: request heads past the first 4 KiB buffer, OPTIONS *, internal redirect cycles", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { large_client_header_buffers 4 8k; server { listen 127.0.0.1:0; root {DIR};
+                    location /loop1 { try_files /missing /loop2; }
+                    location /loop2 { try_files /missing /loop1; }
+                    location / { return 200 "h=$http_x_last"; }
+                } }
+                """);
+            // The input buffer starts at 4 KiB and must grow (and compact) correctly for a valid larger head.
+            foreach (int total in new[] { 5_000, 18_000, 30_000 })
+            {
+                var sb = new StringBuilder("GET /big HTTP/1.1\r\nHost: t\r\n");
+                for (int i = 0; sb.Length < total; i++) sb.Append($"X-Pad-{i}: {new string('p', 900)}\r\n");
+                sb.Append("X-Last: end\r\nConnection: close\r\n\r\n");
+                var r = await s.Raw(sb.ToString());
+                T.Eq(200, Status(r));
+                T.Eq("h=end", Body(r));
+            }
+            // Over the limits: a line over 8k, or a head over 4 x 8k.
+            T.Eq(431, Status(await s.Raw("GET / HTTP/1.1\r\nHost: t\r\nX-Long: " + new string('l', 9000) + "\r\nConnection: close\r\n\r\n")));
+            var huge = new StringBuilder("GET / HTTP/1.1\r\nHost: t\r\n");
+            for (int i = 0; i < 40; i++) huge.Append($"X-Pad-{i}: {new string('p', 900)}\r\n");
+            T.Eq(431, Status(await s.Raw(huge.Append("Connection: close\r\n\r\n").ToString())));
+            // Pipelined behind a large head: the next request is intact (Scan bookkeeping across compaction).
+            var pad = string.Concat(Enumerable.Range(0, 8).Select(i => $"X-Pad-{i}: {new string('p', 900)}\r\n"));
+            var two = await s.Raw($"GET /a HTTP/1.1\r\nHost: t\r\n{pad}X-Last: one\r\n\r\nGET /b HTTP/1.1\r\nHost: t\r\n{pad}X-Last: two\r\nConnection: close\r\n\r\n");
+            T.Contains("h=one", two);
+            T.Contains("h=two", two);
+
+            var o = await s.Raw("OPTIONS * HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+            T.Eq(200, Status(o));
+            T.Eq("GET, HEAD, OPTIONS", Header(o, "Allow"));
+            T.Eq(400, Status(await s.Raw("GET * HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")));
+
+            T.Eq(500, Status(await s.Raw(Get("/loop1"))));
+            T.Contains("internal redirection cycle", s.LogText());
+        });
+
+        T.Add("access: allow/deny at http level is inherited by servers and locations without their own rules", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { deny 127.0.0.1; allow all;
+                  server { listen 127.0.0.1:0; root {DIR};
+                    location /own/ { allow 127.0.0.1; }
+                  } }
+                """, d => { File.WriteAllText(Path.Combine(d, "x"), "in"); Directory.CreateDirectory(Path.Combine(d, "own")); File.WriteAllText(Path.Combine(d, "own", "x"), "own"); });
+            // (return runs in the rewrite phase, before access, as in nginx: static files show the access phase.)
+            T.Eq(403, Status(await s.Raw(Get("/x"))));
+            T.Eq("own", Body(await s.Raw(Get("/own/x"))));
+        });
+
         T.Add("error_page with an absolute URL: the Location is escaped, never a 500 or an error line", async () =>
         {
             await using var s = TestServer.Start("""
