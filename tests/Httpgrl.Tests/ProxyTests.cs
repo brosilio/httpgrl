@@ -608,11 +608,12 @@ internal static class ProxyTests
             T.Eq("only-some", Body(trunc));
             // Either nothing reached the client or a cut-off body: never a terminated chunked message.
             var chunk = await s.Raw(Get("/chunk"));
+            T.True(Status(chunk) is 502 or 200, chunk);
             T.NotContains("\r\n0\r\n\r\n", Body(chunk));
             foreach (var p in new[] { "/trailer", "/ext" })
             {
                 var r = await s.Raw(Get(p));
-                T.True(Status(r) == 502 || !r.Contains("\r\n0\r\n\r\n", StringComparison.Ordinal), $"{p}: {r}");
+                T.True(Status(r) == 502 || (Status(r) == 200 && !r.Contains("\r\n0\r\n\r\n", StringComparison.Ordinal)), $"{p}: {r}");
             }
         });
 

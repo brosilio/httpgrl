@@ -3,6 +3,12 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
+## [Unreleased]
+
+### Tests
+- Absence-only security assertions are paired with a status check (`T.Refused`); a test that times out gets time to
+  wind down and is reported if it keeps running; the slowest test went from ~14 s to ~2 s; `"=name"` runs one test.
+
 ## [0.5.0] - 2026-11-25
 
 ### Changed (may need action)

@@ -253,6 +253,7 @@ internal static class IntegrationTests
             T.Eq("PNG", Body(await s.Raw(Get("/img/cat.png"))));
             // Classic nginx alias bug: "location /img { alias .../images/; }" + "/img../x" escapes the alias dir.
             var r = await s.Raw(Get("/img../imagessecret.txt"));
+            T.Refused(r);
             T.NotContains("should not leak", r);
             T.Eq(404, Status(r));
             r = await s.Raw(Get("/x.secret"));
@@ -282,8 +283,10 @@ internal static class IntegrationTests
             foreach (var d in new[] { $"{www}/..", $"{www}/../www/..", "..", "www", $"{www}/./.." })
             {
                 var r = await s.Raw(Get($"/r/secret.txt?d={d}"));
+                T.Refused(r); // a real answer, not a hang or reset passing for "defended"
                 T.NotContains("TOP SECRET", r);
                 r = await s.Raw(Get($"/a/secret.txt?d={d}"));
+                T.Refused(r);
                 T.NotContains("TOP SECRET", r);
             }
             T.Eq("fine", Body(await s.Raw(Get($"/a/ok.txt?d={www}/r"))));
@@ -362,6 +365,8 @@ internal static class IntegrationTests
             T.NotContains("EVIL", r);
             // Expect: 100-continue that's never honored (answered early): the body may never come, so the connection closes.
             r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: {hidden.Length}\r\nExpect: 100-continue\r\n\r\n{hidden}{next}");
+            T.Eq(200, Status(r));
+            T.Contains("ok /a", r);
             T.NotContains("EVIL", r);
         });
 

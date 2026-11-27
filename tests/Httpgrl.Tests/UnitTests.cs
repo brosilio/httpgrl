@@ -281,7 +281,8 @@ internal static class UnitTests
             using (var log = new JsonLogger(sink, LogLevel.Info))
             {
                 var big = new string('\u0001', 4000); // escapes to 6 bytes a char: the most a request can inflate a field
-                for (int i = 0; i < 20_000; i++)
+                // Stop shortly after the queue overflows: a fixed 20 000 lines took ~14 s of the harness's 20 s cap.
+                for (int i = 0, past = 0; i < 20_000 && past < 1_000; i++, past += log.DroppedTotal > 0 ? 1 : 0)
                     log.Info("access", new LogField("uri", big), new("ua", big), new("referer", big), new("host", big));
                 T.True(log.QueuedBytes <= JsonLogger.MaxQueuedBytes, $"queued {log.QueuedBytes}");
                 T.True(log.DroppedTotal > 0, "drops counted");
