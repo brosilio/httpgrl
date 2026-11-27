@@ -427,6 +427,36 @@ internal static class IntegrationTests
                 T.Contains(msg, T.Throws<ConfigException>(() => TestServer.Start(Conf(conf), Populate).DisposeAsync().AsTask().GetAwaiter().GetResult()).Message);
         });
 
+        T.Add("ssl_ciphers: a negotiated suite outside the list closes the connection (fail closed)", async () =>
+        {
+            if (OperatingSystem.IsWindows()) return;
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0 ssl; server_name t.test;
+                  ssl_certificate {DIR}/t.crt; ssl_certificate_key {DIR}/t.key; return 200 "ok"; } }
+                """, d => ProxyTests.MakeCert("t.test", d, "t"));
+            async Task<string> Request()
+            {
+                using var tcp = new System.Net.Sockets.TcpClient();
+                await tcp.ConnectAsync(System.Net.IPAddress.Loopback, s.Port);
+                using var ssl = new System.Net.Security.SslStream(tcp.GetStream(), false, (_, _, _, _) => true);
+                try
+                {
+                    await ssl.AuthenticateAsClientAsync(new System.Net.Security.SslClientAuthenticationOptions { TargetHost = "t.test", EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 });
+                    await ssl.WriteAsync("GET / HTTP/1.1\r\nHost: t.test\r\nConnection: close\r\n\r\n"u8.ToArray());
+                    using var cts = new CancellationTokenSource(5000);
+                    return await new StreamReader(ssl, Encoding.Latin1).ReadToEndAsync(cts.Token);
+                }
+                catch (Exception e) when (e is System.Security.Authentication.AuthenticationException or IOException) { return ""; }
+            }
+            T.Eq(200, Status(await Request()));
+            // As if the platform had negotiated a CBC suite despite the configured (AEAD-only) list.
+            Httpgrl.Core.Http.Http1Session.NegotiatedSuiteForTests = _ => System.Net.Security.TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256;
+            try { T.Eq("", await Request()); }
+            finally { Httpgrl.Core.Http.Http1Session.NegotiatedSuiteForTests = null; }
+            T.Contains("negotiated a cipher suite outside ssl_ciphers", s.LogText());
+            T.Eq(200, Status(await Request()));
+        });
+
         T.Add("tls: sessions resume (TLS 1.2 IDs, TLS 1.3 tickets) with the strict default suites still enforced", async () =>
         {
             // .NET caches its OpenSSL context, where resumable sessions live, only without a CipherSuitesPolicy. The

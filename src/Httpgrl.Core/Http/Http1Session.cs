@@ -92,10 +92,11 @@ internal sealed class Http1Session
                 await ssl.AuthenticateAsServerAsync(SelectTls, this, CancellationToken.None).ConfigureAwait(false);
                 // Fail closed: the suite list is set on .NET's cached OpenSSL context (OpenSslContextAccess). Should the
                 // runtime ever rebuild that context without it, a suite outside the list is caught here, not served.
-                if (_tlsServer!.AllowedSuites is { } allowed && !allowed.Contains(ssl.NegotiatedCipherSuite))
+                var suite = NegotiatedSuiteForTests is { } fault ? fault(ssl.NegotiatedCipherSuite) : ssl.NegotiatedCipherSuite;
+                if (_tlsServer!.AllowedSuites is { } allowed && !allowed.Contains(suite))
                 {
                     _rt.Log.Warn("negotiated a cipher suite outside ssl_ciphers; closing", new("conn", _conn.Id),
-                        new("suite", ssl.NegotiatedCipherSuite.ToString()), new("remote", info.RemoteAddress));
+                        new("suite", suite.ToString()), new("remote", info.RemoteAddress));
                     return;
                 }
                 X509Certificate2? clientCert = null;
@@ -300,6 +301,12 @@ internal sealed class Http1Session
             return true;
         }
     }
+
+    /// <summary>
+    /// Fault injection for the test suite only (null in production): stands in for what the platform reports as the
+    /// negotiated suite, so the fail-closed check above can be exercised without a broken TLS stack.
+    /// </summary>
+    internal static Func<TlsCipherSuite, TlsCipherSuite>? NegotiatedSuiteForTests;
 
     private static readonly byte[] Continue100 = "HTTP/1.1 100 Continue\r\n\r\n"u8.ToArray();
 
