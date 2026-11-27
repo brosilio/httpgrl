@@ -74,14 +74,14 @@ internal static class IntegrationTests
         catch (Exception e) when (e is System.Security.Authentication.AuthenticationException or IOException) { return null; }
     }
 
-    private static bool HasOpenSsl()
+    internal static bool HasOpenSsl()
     {
         try { using var p = Process.Start(new ProcessStartInfo("openssl", ["version"]) { RedirectStandardOutput = true })!; p.WaitForExit(); return p.ExitCode == 0; }
         catch (System.ComponentModel.Win32Exception) { return false; }
     }
 
     /// <summary>Run openssl with <paramref name="stdin"/> (then EOF); its stdout and stderr together.</summary>
-    private static async Task<string> OpenSsl(string[] args, string stdin)
+    internal static async Task<string> OpenSsl(string[] args, string stdin)
     {
         var psi = new ProcessStartInfo("openssl") { RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (var a in args) psi.ArgumentList.Add(a);

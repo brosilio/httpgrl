@@ -103,16 +103,12 @@ internal sealed class Http1Session
                 if (_tlsServer!.ClientAuth is { } auth)
                 {
                     clientCert = ssl.RemoteCertificate as X509Certificate2;
-                    verdict = ssl.Verdict;
-                    if (verdict is null)
+                    // A callback verdict means the handshake already accepted it; without one, verify here, same policy.
+                    (verdict, bool accept) = auth.Settle(ssl.Verdict, clientCert);
+                    if (!accept)
                     {
-                        // The callback didn't run (e.g. a resumed session): verify here, under the same policy.
-                        (verdict, bool accept) = auth.Evaluate(clientCert);
-                        if (!accept)
-                        {
-                            _rt.Log.Info("client certificate rejected", new("event", "client_certificate_rejected"), new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", verdict));
-                            return;
-                        }
+                        _rt.Log.Info("client certificate rejected", new("event", "client_certificate_rejected"), new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", verdict));
+                        return;
                     }
                 }
                 info.SetTls(TlsHost(ssl.TargetHostName), ssl.SslProtocol.ToString(), clientCert, verdict);

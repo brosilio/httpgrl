@@ -201,6 +201,49 @@ internal static class ClientAuthTests
             T.Eq("admin CN=alice", Body(await GetPath(s.Port, P.Alice, "/admin")));
         });
 
+        T.Add("mtls: client-certificate servers never resume TLS sessions (every handshake verifies)", async () =>
+        {
+            if (!OperatingSystem.IsLinux()) return;
+            if (!IntegrationTests.HasOpenSsl()) throw new Exception("this test needs the openssl command-line tool");
+            await using var s = TestServer.Start(Conf("on", "ssl_verify_depth 2;"), d =>
+            {
+                Populate(d);
+                File.WriteAllText(Path.Combine(d, "bob.crt"), P.Bob.ExportCertificatePem() + "\n" + P.Intermediate.ExportCertificatePem() + "\n");
+                File.WriteAllText(Path.Combine(d, "bob.key"), (P.Bob.GetECDsaPrivateKey() ?? throw new Exception("no key")).ExportPkcs8PrivateKeyPem());
+            });
+            string[] Args(string tls) => ["s_client", "-connect", $"127.0.0.1:{s.Port}", "-servername", "secure.test", tls,
+                "-cert", Path.Combine(s.Dir, "bob.crt"), "-key", Path.Combine(s.Dir, "bob.key"), "-cert_chain", Path.Combine(s.Dir, "bob.crt")];
+            // TLS 1.2: -reconnect offers the first session five more times. Every one must be a full handshake.
+            var r12 = await IntegrationTests.OpenSsl([.. Args("-tls1_2"), "-reconnect"], "");
+            T.Contains("\nNew, TLSv1.2", r12);
+            T.NotContains("\nReused,", r12);
+            // TLS 1.3: a saved ticket is not accepted, and the request is still served under a verified certificate.
+            var sess = Path.Combine(s.Dir, "sess.pem");
+            await IntegrationTests.OpenSsl([.. Args("-tls1_3"), "-sess_out", sess], "GET / HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n");
+            var r13 = File.Exists(sess)
+                ? await IntegrationTests.OpenSsl([.. Args("-tls1_3"), "-sess_in", sess], "GET / HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n")
+                : await IntegrationTests.OpenSsl(Args("-tls1_3"), "GET / HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n");
+            T.NotContains("Reused, TLSv1.3", r13);
+            T.Contains("SUCCESS|CN=bob|", r13);
+        });
+
+        T.Add("mtls: a handshake whose verify callback didn't run is verified afterwards, never waved through", () =>
+        {
+            var on = new Httpgrl.Core.Modules.ClientAuth(Httpgrl.Core.Modules.VerifyClient.On, new X509Certificate2Collection(P.Root), depth: 1);
+            T.Eq(("SUCCESS", true), on.Settle(null, P.Alice));
+            T.Eq(false, on.Settle(null, P.Mallory).Accept);  // unknown CA
+            T.Eq(false, on.Settle(null, P.Expired).Accept);
+            T.Eq(false, on.Settle(null, P.ServerOnly).Accept); // no clientAuth EKU
+            T.Eq(("NONE", false), on.Settle(null, null));
+            T.Eq(false, on.Settle(null, P.Bob).Accept);       // a resumed session carries no intermediates: no chain
+            var optional = new Httpgrl.Core.Modules.ClientAuth(Httpgrl.Core.Modules.VerifyClient.Optional, new X509Certificate2Collection(P.Root), depth: 1);
+            T.Eq(("NONE", true), optional.Settle(null, null));
+            T.Eq(false, optional.Settle(null, P.Mallory).Accept);
+            // The callback's verdict stands (the handshake already acted on it).
+            T.Eq(("SUCCESS", true), on.Settle("SUCCESS", null));
+            return Task.CompletedTask;
+        });
+
         T.Add("mtls: config errors (missing CA, unsupported revocation directives)", () =>
         {
             const string NoCa = """
