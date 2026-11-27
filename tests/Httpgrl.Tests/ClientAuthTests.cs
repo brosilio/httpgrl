@@ -180,6 +180,27 @@ internal static class ClientAuthTests
             return Task.CompletedTask;
         });
 
+        T.Add("crl: RSA-signed CRLs verify against their CA; tampered or foreign-signed ones don't", () =>
+        {
+            using var ca = RsaCa();
+            using var other = RsaCa();
+            using var leafKey = RSA.Create(2048);
+            var leafReq = new CertificateRequest("CN=leaf", leafKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            using var leaf = leafReq.Create(ca, DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddHours(12), [7, 7, 7]); // inside the CA's validity
+            foreach (var hash in new[] { HashAlgorithmName.SHA256, HashAlgorithmName.SHA384, HashAlgorithmName.SHA512 })
+            {
+                var der = RsaCrl(ca, RSASignaturePadding.Pkcs1, hash, leaf);
+                var crl = Httpgrl.Core.Modules.Crl.Parse(der, "test");
+                T.True(crl.IsSignedBy(ca), $"{hash} CRL verifies");
+                T.True(!crl.IsSignedBy(other), $"{hash} CRL from another key");
+                T.True(crl.IsRevoked(leaf));
+                var bad = (byte[])der.Clone();
+                bad[^1] ^= 1; // last byte of the signature
+                T.True(!Httpgrl.Core.Modules.Crl.Parse(bad, "test").IsSignedBy(ca), $"{hash} tampered signature");
+            }
+            return Task.CompletedTask;
+        });
+
         T.Add("crl: a new CRL takes effect on reload", async () =>
         {
             var conf = Conf("on", "ssl_crl {DIR}/crl.pem;");
