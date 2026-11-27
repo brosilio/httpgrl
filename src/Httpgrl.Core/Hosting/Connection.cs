@@ -12,7 +12,13 @@ internal sealed class Connection : Deadlines
 {
     public readonly long Id;
     public readonly Socket Socket;
-    public readonly IpKey IpKey;
+    /// <summary>
+    /// The per-client accounting key. On a <c>proxy_protocol</c> listener it starts as the relay's address and is
+    /// replaced by the relayed source once the header is read (<see cref="ConnectionManager.TryRekey"/>, under its lock).
+    /// </summary>
+    public IpKey IpKey { get; internal set; }
+    /// <summary>Counted against <see cref="IpKey"/>'s per-client cap (always, except before a PROXY header is read).</summary>
+    public bool ClientCounted;
     public readonly long AcceptedAt;
     public int Slot = -1;
     /// <summary>The configuration this connection runs under (set before admission).</summary>

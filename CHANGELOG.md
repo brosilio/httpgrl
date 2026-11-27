@@ -9,6 +9,8 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
 - Redirect targets built from variables (`return`, `rewrite ... redirect|permanent`, absolute `error_page` URLs) never
   come out protocol-relative unless the configured text starts with `//`: `rewrite ^/(.*)/$ /$1 permanent;` on
   `GET //evil.example/` now redirects to `/evil.example`. `\` is percent-encoded. *(Deviation from nginx.)*
+- `connections_per_client` on a `proxy_protocol` listener counts the client the PROXY header names, not the relay.
+  Clients behind one load balancer no longer share one cap (default 256).
 - Plugin API: `Redirects.Escape` / `Redirects.Location` in `Httpgrl.Abstractions`, the shared `Location` builder.
 
 ### Fixed

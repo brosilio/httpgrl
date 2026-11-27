@@ -75,6 +75,43 @@ internal static class ProxyProtocolTests
                 "http { server { listen 127.0.0.1:18999 proxy_protocol; } server { listen 127.0.0.1:18999; } }")).Message);
         });
 
+        T.Add("proxy_protocol: connections_per_client counts the relayed clients, not the relay", async () =>
+        {
+            await using var s = TestServer.Start($"events {{ connections_per_client 2; }} http {{ server {{ listen 127.0.0.1:0 proxy_protocol; {Show} }} }}");
+            var keepAlive = "GET / HTTP/1.1\r\nHost: t\r\n\r\n"u8.ToArray();
+            async Task<Socket> Client(string ip)
+            {
+                var c = await Connect(s.Port);
+                await c.SendAsync(Encoding.ASCII.GetBytes($"PROXY TCP4 {ip} 192.0.2.1 4000 80\r\n"), SocketFlags.None);
+                await c.SendAsync(keepAlive, SocketFlags.None);
+                T.Eq($"[{ip}]:[4000]>[192.0.2.1]:[80]|127.0.0.1", Body(await ReadOne(c)));
+                return c;
+            }
+            // Five connections from one relay, four clients behind it: each client is within its cap of 2.
+            var held = new List<Socket> { await Client("203.0.113.1"), await Client("203.0.113.1") };
+            foreach (var ip in new[] { "203.0.113.2", "203.0.113.3", "203.0.113.4" }) held.Add(await Client(ip));
+            // A third connection for the same relayed client is refused once its header names it.
+            using (var extra = await Connect(s.Port))
+            {
+                await extra.SendAsync(Encoding.ASCII.GetBytes("PROXY TCP4 203.0.113.1 192.0.2.1 4000 80\r\n"), SocketFlags.None);
+                await extra.SendAsync(Req, SocketFlags.None);
+                var r = await ReadToClose(extra, 3000);
+                T.True(r.Length == 0 || r.Contains("<<RESET>>"), r);
+            }
+            // The held connections are untouched, and a closed one frees its client's slot.
+            await held[2].SendAsync(Req, SocketFlags.None);
+            T.Eq(200, Status(await ReadToClose(held[2], 3000)));
+            held[0].Dispose();
+            string body = "";
+            for (long until = Environment.TickCount64 + 5000; body.Length == 0 && Environment.TickCount64 < until;)
+            {
+                body = Body(await Send(s.Port, Encoding.ASCII.GetBytes("PROXY TCP4 203.0.113.1 192.0.2.1 4000 80\r\n"), Req));
+                if (body.Length == 0) await Task.Delay(50);
+            }
+            T.Eq("[203.0.113.1]:[4000]>[192.0.2.1]:[80]|127.0.0.1", body);
+            foreach (var h in held) h.Dispose();
+        });
+
         T.Add("proxy_protocol: in front of TLS, as a TCP relay sends it", async () =>
         {
             await using var s = TestServer.Start($$"""http { server { listen 127.0.0.1:0 ssl proxy_protocol; ssl_certificate {DIR}/c.crt; ssl_certificate_key {DIR}/c.key; {{Show}} } }""",

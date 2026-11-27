@@ -72,6 +72,14 @@ internal sealed class Http1Session
                     return;
                 }
                 info.SetProxy(hdr.Source, hdr.Destination);
+                // The per-client cap counts the client the relay names, not the relay (LOCAL/UNKNOWN: the relay itself).
+                // Re-checked only here, so a relay keeps one key per connection for its whole life.
+                if (!_conn.ClientCounted && !_mgr.TryRekey(_conn, hdr.Source is { } src ? IpKey.From(src) : _conn.IpKey, out var why))
+                {
+                    _rt.Log.Debug("connection refused", new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", why));
+                    _conn.Abort(why!);
+                    return;
+                }
                 if (rest.Value.Length > 0) transport = new PrefixedStream(rest.Value, transport);
                 _transport = transport;
             }
