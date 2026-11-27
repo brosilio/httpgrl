@@ -172,6 +172,32 @@ internal static class ClientAuthTests
             T.Contains("not signed by that CA", Load(CrlPem(forger)));
             T.Contains("cannot load CRL", Load("-----BEGIN X509 CRL-----\nMAMCAQA=\n-----END X509 CRL-----\n"));
             T.Contains("no CRLs", Load("nothing here\n-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n"));
+            // RSASSA-PSS isn't verified: a clear "unsupported" (it used to read as a corrupt file, "malformed CRL").
+            using var rsaCa = RsaCa();
+            var pss = Load(PemEncoding.WriteString("X509 CRL", RsaCrl(rsaCa, RSASignaturePadding.Pss)) + "\n");
+            T.Contains("unsupported CRL signature algorithm RSASSA-PSS", pss);
+            T.NotContains("malformed", pss);
+            return Task.CompletedTask;
+        });
+
+        T.Add("crl: RSA-signed CRLs verify against their CA; tampered or foreign-signed ones don't", () =>
+        {
+            using var ca = RsaCa();
+            using var other = RsaCa();
+            using var leafKey = RSA.Create(2048);
+            var leafReq = new CertificateRequest("CN=leaf", leafKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            using var leaf = leafReq.Create(ca, DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddHours(12), [7, 7, 7]); // inside the CA's validity
+            foreach (var hash in new[] { HashAlgorithmName.SHA256, HashAlgorithmName.SHA384, HashAlgorithmName.SHA512 })
+            {
+                var der = RsaCrl(ca, RSASignaturePadding.Pkcs1, hash, leaf);
+                var crl = Httpgrl.Core.Modules.Crl.Parse(der, "test");
+                T.True(crl.IsSignedBy(ca), $"{hash} CRL verifies");
+                T.True(!crl.IsSignedBy(other), $"{hash} CRL from another key");
+                T.True(crl.IsRevoked(leaf));
+                var bad = (byte[])der.Clone();
+                bad[^1] ^= 1; // last byte of the signature
+                T.True(!Httpgrl.Core.Modules.Crl.Parse(bad, "test").IsSignedBy(ca), $"{hash} tampered signature");
+            }
             return Task.CompletedTask;
         });
 
@@ -196,6 +222,49 @@ internal static class ClientAuthTests
             T.Eq("admin CN=alice", Body(await GetPath(s.Port, P.Alice, "/admin")));
         });
 
+        T.Add("mtls: client-certificate servers never resume TLS sessions (every handshake verifies)", async () =>
+        {
+            if (!OperatingSystem.IsLinux()) return;
+            if (!IntegrationTests.HasOpenSsl()) throw new Exception("this test needs the openssl command-line tool");
+            await using var s = TestServer.Start(Conf("on", "ssl_verify_depth 2;"), d =>
+            {
+                Populate(d);
+                File.WriteAllText(Path.Combine(d, "bob.crt"), P.Bob.ExportCertificatePem() + "\n" + P.Intermediate.ExportCertificatePem() + "\n");
+                File.WriteAllText(Path.Combine(d, "bob.key"), (P.Bob.GetECDsaPrivateKey() ?? throw new Exception("no key")).ExportPkcs8PrivateKeyPem());
+            });
+            string[] Args(string tls) => ["s_client", "-connect", $"127.0.0.1:{s.Port}", "-servername", "secure.test", tls,
+                "-cert", Path.Combine(s.Dir, "bob.crt"), "-key", Path.Combine(s.Dir, "bob.key"), "-cert_chain", Path.Combine(s.Dir, "bob.crt")];
+            // TLS 1.2: -reconnect offers the first session five more times. Every one must be a full handshake.
+            var r12 = await IntegrationTests.OpenSsl([.. Args("-tls1_2"), "-reconnect"], "");
+            T.Contains("\nNew, TLSv1.2", r12);
+            T.NotContains("\nReused,", r12);
+            // TLS 1.3: a saved ticket is not accepted, and the request is still served under a verified certificate.
+            var sess = Path.Combine(s.Dir, "sess.pem");
+            await IntegrationTests.OpenSsl([.. Args("-tls1_3"), "-sess_out", sess], "GET / HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n");
+            var r13 = File.Exists(sess)
+                ? await IntegrationTests.OpenSsl([.. Args("-tls1_3"), "-sess_in", sess], "GET / HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n")
+                : await IntegrationTests.OpenSsl(Args("-tls1_3"), "GET / HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n");
+            T.NotContains("Reused, TLSv1.3", r13);
+            T.Contains("SUCCESS|CN=bob|", r13);
+        });
+
+        T.Add("mtls: a handshake whose verify callback didn't run is verified afterwards, never waved through", () =>
+        {
+            var on = new Httpgrl.Core.Modules.ClientAuth(Httpgrl.Core.Modules.VerifyClient.On, new X509Certificate2Collection(P.Root), depth: 1);
+            T.Eq(("SUCCESS", true), on.Settle(null, P.Alice));
+            T.Eq(false, on.Settle(null, P.Mallory).Accept);  // unknown CA
+            T.Eq(false, on.Settle(null, P.Expired).Accept);
+            T.Eq(false, on.Settle(null, P.ServerOnly).Accept); // no clientAuth EKU
+            T.Eq(("NONE", false), on.Settle(null, null));
+            T.Eq(false, on.Settle(null, P.Bob).Accept);       // a resumed session carries no intermediates: no chain
+            var optional = new Httpgrl.Core.Modules.ClientAuth(Httpgrl.Core.Modules.VerifyClient.Optional, new X509Certificate2Collection(P.Root), depth: 1);
+            T.Eq(("NONE", true), optional.Settle(null, null));
+            T.Eq(false, optional.Settle(null, P.Mallory).Accept);
+            // The callback's verdict stands (the handshake already acted on it).
+            T.Eq(("SUCCESS", true), on.Settle("SUCCESS", null));
+            return Task.CompletedTask;
+        });
+
         T.Add("mtls: config errors (missing CA, unsupported revocation directives)", () =>
         {
             const string NoCa = """
@@ -213,6 +282,24 @@ internal static class ClientAuthTests
 
     internal static string CrlPem(X509Certificate2 issuer, params X509Certificate2[] revoked) =>
         CrlPem(issuer, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1), revoked);
+
+    private static X509Certificate2 RsaCa()
+    {
+        using var key = RSA.Create(2048);
+        var req = new CertificateRequest("CN=rsa root", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+        req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+        return req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+    }
+
+    private static byte[] RsaCrl(X509Certificate2 issuer, RSASignaturePadding padding, HashAlgorithmName? hash = null, params X509Certificate2[] revoked)
+    {
+        var b = new CertificateRevocationListBuilder();
+        var now = DateTimeOffset.UtcNow;
+        foreach (var r in revoked) b.AddEntry(r, now.AddMinutes(-5), X509RevocationReason.KeyCompromise);
+        return b.Build(issuer, BigInteger.One, now.AddDays(1), hash ?? HashAlgorithmName.SHA256, padding, now.AddMinutes(-5));
+    }
 
     private static string CrlPem(X509Certificate2 issuer, DateTimeOffset thisUpdate, DateTimeOffset nextUpdate, params X509Certificate2[] revoked)
     {

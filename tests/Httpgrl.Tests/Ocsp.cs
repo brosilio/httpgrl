@@ -119,7 +119,23 @@ internal sealed class OcspPki : IAsyncDisposable
         return _delegate = cert.CopyWithPrivateKey(key);
     }
 
-    private byte[] BuildResponse(ReadOnlySpan<byte> certId)
+    private byte[] BuildResponse(ReadOnlySpan<byte> certId) => Sign(ResponseData(certId));
+
+    /// <summary>The ResponseData (the signed part) for <see cref="Leaf"/>, for fuzzing what's inside the signature.</summary>
+    public byte[] MakeResponseData()
+    {
+        var w = new AsnWriter(AsnEncodingRules.DER);
+        using (w.PushSequence())
+        {
+            using (w.PushSequence()) { w.WriteObjectIdentifier("1.3.14.3.2.26"); w.WriteNull(); }
+            w.WriteOctetString(SHA1.HashData(Ca.SubjectName.RawData));
+            w.WriteOctetString(SHA1.HashData(Ca.PublicKey.EncodedKeyValue.RawData));
+            w.WriteInteger(Leaf.SerialNumberBytes.Span);
+        }
+        return ResponseData(w.Encode());
+    }
+
+    private byte[] ResponseData(ReadOnlySpan<byte> certId)
     {
         var now = DateTime.UtcNow;
         bool delegated = Delegated || DelegatedWithoutEku;
@@ -145,7 +161,14 @@ internal sealed class OcspPki : IAsyncDisposable
                     w.WriteGeneralizedTime(now.Add(Validity), omitFractionalSeconds: true); // nextUpdate
             }
         }
-        var tbsData = w.Encode();
+        return w.Encode();
+    }
+
+    /// <summary>Sign any ResponseData bytes (valid or not) as the configured signer and wrap them in an OCSPResponse.</summary>
+    public byte[] Sign(byte[] tbsData)
+    {
+        bool delegated = Delegated || DelegatedWithoutEku;
+        var signerCert = delegated ? Delegate() : Ca;
         using var caKey = BadSignature ? ECDsa.Create(ECCurve.NamedCurves.nistP256) : signerCert.GetECDsaPrivateKey()!;
         var sig = caKey.SignData(tbsData, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence);
 

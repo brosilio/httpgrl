@@ -22,12 +22,20 @@ internal static class T
         var sw = Stopwatch.StartNew();
         foreach (var (name, body) in Tests)
         {
-            if (filter is not null && !name.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
+            // A substring of the name, or "=" plus the exact name ("parser" alone also matches every fuzz target).
+            if (filter is not null && !(filter.StartsWith('=') ? name.Equals(filter[1..], StringComparison.OrdinalIgnoreCase) : name.Contains(filter, StringComparison.OrdinalIgnoreCase))) continue;
             var t = Stopwatch.StartNew();
             try
             {
                 var task = body();
-                if (await Task.WhenAny(task, Task.Delay(20_000)) != task) throw new TimeoutException("test exceeded 20s");
+                if (await Task.WhenAny(task, Task.Delay(20_000)) != task)
+                {
+                    // A test can't be cancelled from here: its servers, sockets and threads run on. Give it a while to
+                    // wind down before the next test starts, so its fallout isn't blamed on that one; say so if it won't.
+                    if (await Task.WhenAny(task, Task.Delay(20_000)) != task)
+                        Console.WriteLine($"  LEAK {name} is still running: later failures may be its fallout");
+                    throw new TimeoutException("test exceeded 20s");
+                }
                 await task;
                 pass++;
                 Console.WriteLine($"  ok   {name} ({t.ElapsedMilliseconds} ms)");
@@ -51,6 +59,16 @@ internal static class T
     public static void True(bool cond, [CallerArgumentExpression(nameof(cond))] string? expr = null)
     {
         if (!cond) throw new Exception($"expected true: {expr}");
+    }
+
+    /// <summary>
+    /// A real refusal: an HTTP 4xx or 5xx response. Pair it with absence checks (NotContains), which a timeout, reset or
+    /// crash would pass too.
+    /// </summary>
+    public static void Refused(string response, [CallerArgumentExpression(nameof(response))] string? expr = null)
+    {
+        int st = response.StartsWith("HTTP/1.", StringComparison.Ordinal) && response.Length >= 12 && int.TryParse(response.AsSpan(9, 3), out int v) ? v : -1;
+        if (st is < 400 or > 599) throw new Exception($"{expr}: expected a 4xx/5xx response, got <{Trunc(response)}>");
     }
 
     public static void Contains(string needle, string hay)

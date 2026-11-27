@@ -3,6 +3,45 @@
 All notable changes to httpgrl. Versions follow [Semantic Versioning](https://semver.org/). While at 0.y.z, a
 minor bump may break configuration, the plugin API or the Core APIs; the entry says how.
 
+## [0.6.0] - 2026-11-27
+
+### Changed (may need action)
+- Redirect targets built from variables (`return`, `rewrite ... redirect|permanent`, absolute `error_page` URLs) never
+  come out protocol-relative unless the configured text starts with `//`: `rewrite ^/(.*)/$ /$1 permanent;` on
+  `GET //evil.example/` now redirects to `/evil.example`. `\` is percent-encoded. *(Deviation from nginx.)*
+- `connections_per_client` on a `proxy_protocol` listener counts the client the PROXY header names, not the relay.
+  Clients behind one load balancer no longer share one cap (default 256).
+- HTTP/2 and HTTP/3 request field values containing control characters other than HTAB, or DEL, are malformed (as in
+  HTTP/1.1), not just NUL/CR/LF.
+- Chunk extensions are limited to 8 KiB per request body (400), and the 64 KiB keep-alive drain limit counts chunk
+  framing, so it bounds the bytes actually read.
+- Upstream responses with more than 16 interim (1xx) heads are refused (502).
+- Plugin API: `Redirects.Escape` / `Redirects.Location` in `Httpgrl.Abstractions`, the shared `Location` builder.
+
+### Fixed
+- `error_page code https://...$uri;` sent the evaluated URL unescaped: a non-Latin-1 path answered 500 with an
+  error-level log line and stack trace (any client could flood the log), and spaces or Latin-1 went out raw.
+- An RSASSA-PSS-signed CRL failed the config load as "malformed CRL"; it now says the algorithm is unsupported.
+
+### Tests
+- Fuzz inputs are reproducible across processes (they were seeded with the per-process-randomized `HashCode`), pinned
+  by a golden-value test; every fuzz target is in the suite (`log-privacy` wasn't); long runs weight slow targets.
+- New fuzz targets: `h2-head` (HTTP/2 and HTTP/3 request heads) and `ocsp-signed` (re-signed OCSP response contents,
+  so the acceptance rules are reached; the `ocsp` target accepted 0 % of its inputs).
+- New tests: no replay of a non-idempotent request to another upstream; mTLS servers never resume and a handshake
+  without a callback verdict is verified; the fail-closed cipher check (through a test-only fault hook); RSA CRLs;
+  close-delimited upstream bodies; hostile upstream trailers, mid-chunk closes and interim floods; `proxy_set_header`
+  CR/LF; request heads past the first 4 KiB buffer; `OPTIONS *`; internal redirect cycles; `http`-level access rules;
+  PROXY protocol per-client accounting; redirect and `error_page` escaping.
+- Absence-only security assertions are paired with a status check (`T.Refused`); a test that times out gets time to
+  wind down and is reported if it keeps running; the slowest test went from ~14 s to ~2 s; `"=name"` runs one test.
+
+### Docs
+- The README is now an overview. The directive reference, proxy and tunnels, operations, security model and
+  development guide live in `docs/` (`configuration.md`, `proxy.md`, `operations.md`, `security.md`,
+  `development.md`). The HTTP/2–HTTP/3 and protocol-library plans were removed: their lasting decisions are in
+  `docs/development.md`, and their open work is GitHub issues #1–#8.
+
 ## [0.5.0] - 2026-11-25
 
 ### Changed (may need action)

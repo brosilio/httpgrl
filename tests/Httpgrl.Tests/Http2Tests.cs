@@ -88,6 +88,10 @@ internal static class Http2Tests
             Bad("te gzip", true, [.. Base, ("te", "gzip")]);
             Bad("CR in value", true, [.. Base, ("x", "a\rb")]);
             Bad("NUL in value", true, [.. Base, ("x", "a\0b")]);
+            Bad("SOH in value", true, [.. Base, ("x", "a\u0001b")]); // HTTP/1.1's rule, not just RFC 9113's NUL/CR/LF
+            Bad("ESC in value", true, [.. Base, ("x", "a\u001bb")]);
+            Bad("DEL in value", true, [.. Base, ("x", "a\u007fb")]);
+            T.Eq(0, Head(true, [.. Base, ("x", "a\tb \u00e9")]).Code); // HTAB, SP and obs-text stay legal, as in HTTP/1.1
             Bad("leading space", true, [.. Base, ("x", " a")]);
             Bad("authority disagrees with host", true, [.. Base, ("host", "other.test")]);
             Bad("two hosts", true, [(":method", "GET"), (":scheme", "https"), (":path", "/"), ("host", "a"), ("host", "b")]);

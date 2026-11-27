@@ -74,14 +74,14 @@ internal static class IntegrationTests
         catch (Exception e) when (e is System.Security.Authentication.AuthenticationException or IOException) { return null; }
     }
 
-    private static bool HasOpenSsl()
+    internal static bool HasOpenSsl()
     {
         try { using var p = Process.Start(new ProcessStartInfo("openssl", ["version"]) { RedirectStandardOutput = true })!; p.WaitForExit(); return p.ExitCode == 0; }
         catch (System.ComponentModel.Win32Exception) { return false; }
     }
 
     /// <summary>Run openssl with <paramref name="stdin"/> (then EOF); its stdout and stderr together.</summary>
-    private static async Task<string> OpenSsl(string[] args, string stdin)
+    internal static async Task<string> OpenSsl(string[] args, string stdin)
     {
         var psi = new ProcessStartInfo("openssl") { RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (var a in args) psi.ArgumentList.Add(a);
@@ -253,6 +253,7 @@ internal static class IntegrationTests
             T.Eq("PNG", Body(await s.Raw(Get("/img/cat.png"))));
             // Classic nginx alias bug: "location /img { alias .../images/; }" + "/img../x" escapes the alias dir.
             var r = await s.Raw(Get("/img../imagessecret.txt"));
+            T.Refused(r);
             T.NotContains("should not leak", r);
             T.Eq(404, Status(r));
             r = await s.Raw(Get("/x.secret"));
@@ -282,8 +283,10 @@ internal static class IntegrationTests
             foreach (var d in new[] { $"{www}/..", $"{www}/../www/..", "..", "www", $"{www}/./.." })
             {
                 var r = await s.Raw(Get($"/r/secret.txt?d={d}"));
+                T.Refused(r); // a real answer, not a hang or reset passing for "defended"
                 T.NotContains("TOP SECRET", r);
                 r = await s.Raw(Get($"/a/secret.txt?d={d}"));
+                T.Refused(r);
                 T.NotContains("TOP SECRET", r);
             }
             T.Eq("fine", Body(await s.Raw(Get($"/a/ok.txt?d={www}/r"))));
@@ -355,6 +358,14 @@ internal static class IntegrationTests
             r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{hidden.Length:x}\r\n{hidden}\r\n0\r\n\r\n{next}");
             T.NotContains("EVIL", r);
             T.Contains("ok /next", r);
+            // The drain limit counts wire bytes, chunk framing included: 1-byte chunks are six bytes each on the wire.
+            var tiny = string.Concat(Enumerable.Repeat("1\r\nx\r\n", 20_000)); // 20 kB of data, 120 kB read
+            r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{tiny}0\r\n\r\n{next}", 10_000);
+            T.True(r.StartsWith("HTTP/1.1 200", StringComparison.Ordinal) || r.Contains("<<RESET>>"), r[..Math.Min(r.Length, 200)]); // closing on unread bytes may reset
+            T.NotContains("ok /next", r); // not drained: the connection closed instead
+            var few = string.Concat(Enumerable.Repeat("1\r\nx\r\n", 2_000));
+            r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{few}0\r\n\r\n{next}");
+            T.Contains("ok /next", r);
             // Too big to accept (413): the server can't know where the body ends without reading it, so it closes.
             var big = new string('x', 200);
             r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: {big.Length + hidden.Length}\r\n\r\n{big}{hidden}{next}");
@@ -362,6 +373,8 @@ internal static class IntegrationTests
             T.NotContains("EVIL", r);
             // Expect: 100-continue that's never honored (answered early): the body may never come, so the connection closes.
             r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: {hidden.Length}\r\nExpect: 100-continue\r\n\r\n{hidden}{next}");
+            T.Eq(200, Status(r));
+            T.Contains("ok /a", r);
             T.NotContains("EVIL", r);
         });
 
@@ -412,6 +425,36 @@ internal static class IntegrationTests
                 ("ssl_ciphers TLS_RSA_WITH_3DES_EDE_CBC_SHA;", "isn't allowed"),
             })
                 T.Contains(msg, T.Throws<ConfigException>(() => TestServer.Start(Conf(conf), Populate).DisposeAsync().AsTask().GetAwaiter().GetResult()).Message);
+        });
+
+        T.Add("ssl_ciphers: a negotiated suite outside the list closes the connection (fail closed)", async () =>
+        {
+            if (OperatingSystem.IsWindows()) return;
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0 ssl; server_name t.test;
+                  ssl_certificate {DIR}/t.crt; ssl_certificate_key {DIR}/t.key; return 200 "ok"; } }
+                """, d => ProxyTests.MakeCert("t.test", d, "t"));
+            async Task<string> Request()
+            {
+                using var tcp = new System.Net.Sockets.TcpClient();
+                await tcp.ConnectAsync(System.Net.IPAddress.Loopback, s.Port);
+                using var ssl = new System.Net.Security.SslStream(tcp.GetStream(), false, (_, _, _, _) => true);
+                try
+                {
+                    await ssl.AuthenticateAsClientAsync(new System.Net.Security.SslClientAuthenticationOptions { TargetHost = "t.test", EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 });
+                    await ssl.WriteAsync("GET / HTTP/1.1\r\nHost: t.test\r\nConnection: close\r\n\r\n"u8.ToArray());
+                    using var cts = new CancellationTokenSource(5000);
+                    return await new StreamReader(ssl, Encoding.Latin1).ReadToEndAsync(cts.Token);
+                }
+                catch (Exception e) when (e is System.Security.Authentication.AuthenticationException or IOException) { return ""; }
+            }
+            T.Eq(200, Status(await Request()));
+            // As if the platform had negotiated a CBC suite despite the configured (AEAD-only) list.
+            Httpgrl.Core.Http.Http1Session.NegotiatedSuiteForTests = _ => System.Net.Security.TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256;
+            try { T.Eq("", await Request()); }
+            finally { Httpgrl.Core.Http.Http1Session.NegotiatedSuiteForTests = null; }
+            T.Contains("negotiated a cipher suite outside ssl_ciphers", s.LogText());
+            T.Eq(200, Status(await Request()));
         });
 
         T.Add("tls: sessions resume (TLS 1.2 IDs, TLS 1.3 tickets) with the strict default suites still enforced", async () =>
@@ -535,6 +578,128 @@ internal static class IntegrationTests
             r = await s.Raw(Get("/nf"));
             T.Eq(404, Status(r));
             T.Eq("custom", Body(r));
+        });
+
+        T.Add("http: request heads past the first 4 KiB buffer, OPTIONS *, internal redirect cycles", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { large_client_header_buffers 4 8k; server { listen 127.0.0.1:0; root {DIR};
+                    location /loop1 { try_files /missing /loop2; }
+                    location /loop2 { try_files /missing /loop1; }
+                    location / { return 200 "h=$http_x_last"; }
+                } }
+                """);
+            // The input buffer starts at 4 KiB and must grow (and compact) correctly for a valid larger head.
+            foreach (int total in new[] { 5_000, 18_000, 30_000 })
+            {
+                var sb = new StringBuilder("GET /big HTTP/1.1\r\nHost: t\r\n");
+                for (int i = 0; sb.Length < total; i++) sb.Append($"X-Pad-{i}: {new string('p', 900)}\r\n");
+                sb.Append("X-Last: end\r\nConnection: close\r\n\r\n");
+                var r = await s.Raw(sb.ToString());
+                T.Eq(200, Status(r));
+                T.Eq("h=end", Body(r));
+            }
+            // Over the limits: a line over 8k, or a head over 4 x 8k.
+            T.Eq(431, Status(await s.Raw("GET / HTTP/1.1\r\nHost: t\r\nX-Long: " + new string('l', 9000) + "\r\nConnection: close\r\n\r\n")));
+            var huge = new StringBuilder("GET / HTTP/1.1\r\nHost: t\r\n");
+            for (int i = 0; i < 40; i++) huge.Append($"X-Pad-{i}: {new string('p', 900)}\r\n");
+            T.Eq(431, Status(await s.Raw(huge.Append("Connection: close\r\n\r\n").ToString())));
+            // Pipelined behind a large head: the next request is intact (Scan bookkeeping across compaction).
+            var pad = string.Concat(Enumerable.Range(0, 8).Select(i => $"X-Pad-{i}: {new string('p', 900)}\r\n"));
+            var two = await s.Raw($"GET /a HTTP/1.1\r\nHost: t\r\n{pad}X-Last: one\r\n\r\nGET /b HTTP/1.1\r\nHost: t\r\n{pad}X-Last: two\r\nConnection: close\r\n\r\n");
+            T.Contains("h=one", two);
+            T.Contains("h=two", two);
+
+            var o = await s.Raw("OPTIONS * HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+            T.Eq(200, Status(o));
+            T.Eq("GET, HEAD, OPTIONS", Header(o, "Allow"));
+            T.Eq(400, Status(await s.Raw("GET * HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")));
+
+            T.Eq(500, Status(await s.Raw(Get("/loop1"))));
+            T.Contains("internal redirection cycle", s.LogText());
+        });
+
+        T.Add("access: allow/deny at http level is inherited by servers and locations without their own rules", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { deny 127.0.0.1; allow all;
+                  server { listen 127.0.0.1:0; root {DIR};
+                    location /own/ { allow 127.0.0.1; }
+                  } }
+                """, d => { File.WriteAllText(Path.Combine(d, "x"), "in"); Directory.CreateDirectory(Path.Combine(d, "own")); File.WriteAllText(Path.Combine(d, "own", "x"), "own"); });
+            // (return runs in the rewrite phase, before access, as in nginx: static files show the access phase.)
+            T.Eq(403, Status(await s.Raw(Get("/x"))));
+            T.Eq("own", Body(await s.Raw(Get("/own/x"))));
+        });
+
+        T.Add("error_page with an absolute URL: the Location is escaped, never a 500 or an error line", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR};
+                    error_page 404 https://x.test$uri;
+                    location /perm/ { error_page 404 =301 https://x.test$uri; }
+                } }
+                """, d => Directory.CreateDirectory(Path.Combine(d, "perm")));
+            var r = await s.Raw(Get("/%E6%97%A5%E6%9C%AC")); // non-Latin-1: used to throw in HeaderCollection (500 + stack trace)
+            T.Eq(302, Status(r));
+            T.Eq("https://x.test/%E6%97%A5%E6%9C%AC", Header(r, "Location"));
+            r = await s.Raw(Get("/caf%C3%A9%20x")); // Latin-1 and space: used to go out raw
+            T.Eq(302, Status(r));
+            T.Eq("https://x.test/caf%C3%A9%20x", Header(r, "Location"));
+            r = await s.Raw(Get("/%5Cevil"));
+            T.Eq("https://x.test/%5Cevil", Header(r, "Location"));
+            r = await s.Raw(Get("/perm/gone"));
+            T.Eq(301, Status(r));
+            T.Eq("https://x.test/perm/gone", Header(r, "Location"));
+            T.NotContains("\"level\":\"error\"", s.LogText());
+        });
+
+        T.Add("static: the directory redirect escapes a query that came from config (internal redirect)", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR};
+                    location /go { try_files /nope "/d?q=日本 x"; }
+                } }
+                """, d => Directory.CreateDirectory(Path.Combine(d, "d")));
+            var r = await s.Raw(Get("/go"));
+            T.Eq(301, Status(r)); // used to be a 500: HeaderCollection refuses non-Latin-1
+            T.Eq("/d/?q=%E6%97%A5%E6%9C%AC%20x", Header(r, "Location"));
+            r = await s.Raw(Get("/d?a=b"));
+            T.Eq("/d/?a=b", Header(r, "Location"));
+        });
+
+        T.Add("redirects built from $uri or captures are never protocol-relative and never carry a backslash", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR};
+                    location /a/ { rewrite ^/a/(.*)/$ /$1 permanent; }
+                    location /b/ { rewrite ^/b(.*)/$ $1 redirect; }
+                    location /c/ { return 302 $uri; }
+                    location ~ ^/d(/.*)$ { return 302 /$1; }
+                    location /cdn/ { return 302 //cdn.test$uri; }
+                    location /rq { return 302 $request_uri; }
+                } }
+                """);
+            async Task<string?> Loc(string path, int status)
+            {
+                var r = await s.Raw(Get(path));
+                T.Eq(status, Status(r));
+                return Header(r, "Location");
+            }
+            // The classic "strip the trailing slash" rule: /\evil.example is //evil.example to a browser.
+            T.Eq("/%5Cevil.example", await Loc("/a/%5Cevil.example/", 301));
+            T.Eq("/x/y", await Loc("/a/x/y/", 301));
+            // A capture that supplies the leading slashes: collapsed to one, so the target stays on this host.
+            T.Eq("/evil.example", await Loc("/b//evil.example/", 302));
+            T.Eq("/evil.example", await Loc("/b/%2Fevil.example/", 302));
+            T.Eq("/c/x", await Loc("/c/x", 302));
+            T.Eq("/evil.example/", await Loc("/d//evil.example/", 302));
+            // $request_uri is raw: GET //rq.example would be a redirect to the host rq.example.
+            var rq = await s.Raw("GET //rq.example HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+            T.Eq(302, Status(rq));
+            T.Eq("/rq.example", Header(rq, "Location"));
+            // The admin wrote // themselves: left alone.
+            T.Eq("//cdn.test/cdn/x", await Loc("/cdn/x", 302));
         });
 
         T.Add("return 444 and error_page =444 drop the connection without a byte", async () =>
@@ -727,6 +892,11 @@ internal static class IntegrationTests
             T.Eq("5:abcde", Body(r));
             T.Eq(413, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 2048\r\n\r\n")));
             T.Eq(413, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n" + new string('x', 2048) + "\r\n0\r\n\r\n")));
+            // Chunk extensions are bounded per body, not just per line: "1;<4 KiB>" per data byte stays under 1k of data.
+            var extLine = "1;" + new string('e', 4000) + "\r\nx\r\n";
+            T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n" + string.Concat(Enumerable.Repeat(extLine, 3)) + "0\r\n\r\n")));
+            r = await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n" + extLine + extLine + "0\r\n\r\n"); // 8 KiB: still fine
+            T.Eq("2:xx", Body(r));
             T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")));
             T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n")));
             // Trailers are dropped but must be well-formed: a bare CR is where two parsers disagree about where the body ends.

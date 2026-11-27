@@ -95,7 +95,7 @@ public sealed class StaticModule : IModule
             case OpenResult.Forbidden or OpenResult.NotRegularFile: return HandlerResult.WithStatus(403);
             case OpenResult.IsDirectory:
                 var location = UrlEncoding.EscapePath(uri) + "/";
-                if (req.Query.Length > 0) location += "?" + req.Query;
+                if (req.Query.Length > 0) location += "?" + Redirects.Escape(req.Query); // after an internal redirect the query comes from config
                 ctx.Response.Headers.Set("Location", location);
                 return HandlerResult.WithStatus(301);
             default: return HandlerResult.WithStatus(500);

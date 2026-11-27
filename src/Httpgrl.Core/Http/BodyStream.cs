@@ -48,6 +48,12 @@ internal sealed class BodyStream : RequestBody
 
     private const int MaxChunkLine = 4096;
     private const int MaxTrailer = 8192;
+    /// <summary>
+    /// Chunk extensions (and whitespace before them) across a whole body. They're ignored, and nothing real sends them,
+    /// but each chunk line may carry up to <see cref="MaxChunkLine"/>: uncounted, "1;&lt;4 KiB&gt;" per data byte made
+    /// client_max_body_size (and the drain limit) a bound on ~1/4000 of the bytes actually read.
+    /// </summary>
+    internal const int MaxExtensionBytes = 8192;
 
     private readonly Deadlines _conn;
     private readonly InputBuffer _in;
@@ -57,6 +63,8 @@ internal sealed class BodyStream : RequestBody
     private long _remaining;    // Length mode: bytes left; Chunked: bytes left in current chunk
     private long _total;
     private int _trailerBytes;
+    private int _extensionBytes;
+    private long _framing;      // chunked: size lines, extensions, CRLFs and trailers read so far (wire bytes beyond data)
     private bool _started;
 
     public BodyStream(Deadlines conn, InputBuffer input)
@@ -73,6 +81,8 @@ internal sealed class BodyStream : RequestBody
         _remaining = contentLength > 0 ? contentLength : 0;
         _total = 0;
         _trailerBytes = 0;
+        _extensionBytes = 0;
+        _framing = 0;
         _started = false;
         _broken = false;
         SendContinue = null;
@@ -152,8 +162,11 @@ internal sealed class BodyStream : RequestBody
                 {
                     int len = await LineAsync().ConfigureAwait(false);
                     long size = ParseChunkSize(_in.Buf.AsSpan(_in.Start, len - 2));
+                    int ext = len - 2 - HexDigits(_in.Buf.AsSpan(_in.Start, len - 2));
                     _in.Consume(len);
                     if (size < 0) throw new HttpBodyException(400, "invalid chunk size");
+                    _framing += len;
+                    if ((_extensionBytes += ext) > MaxExtensionBytes) throw new HttpBodyException(400, "chunk extensions too large");
                     if (size == 0) { _chunk = Chunk.Trailer; continue; }
                     _total += size;
                     if (MaxSize > 0 && _total > MaxSize) throw new HttpBodyException(413, "request body too large");
@@ -178,6 +191,7 @@ internal sealed class BodyStream : RequestBody
                         if (await FillAsync().ConfigureAwait(false) == 0) throw new HttpBodyException(400, "truncated chunk");
                     if (_in.Buf[_in.Start] != '\r' || _in.Buf[_in.Start + 1] != '\n') throw new HttpBodyException(400, "missing chunk terminator");
                     _in.Consume(2);
+                    _framing += 2;
                     _chunk = Chunk.Size;
                     continue;
                 }
@@ -185,6 +199,7 @@ internal sealed class BodyStream : RequestBody
                 {
                     int len = await LineAsync().ConfigureAwait(false);
                     _trailerBytes += len;
+                    _framing += len;
                     if (_trailerBytes > MaxTrailer) throw new HttpBodyException(431, "trailer too large");
                     // Dropped, but validated: a bare CR (or any CTL) is where parsers disagree about the line structure.
                     if (len > 2 && !ValidTrailer(_in.Buf.AsSpan(_in.Start, len - 2))) throw new HttpBodyException(400, "invalid trailer field");
@@ -218,6 +233,13 @@ internal sealed class BodyStream : RequestBody
     {
         int n = await _in.FillAsync(_transport, Math.Max(_in.Buf.Length, MaxChunkLine), _ct).ConfigureAwait(false);
         return n < 0 ? throw new HttpBodyException(400, "chunk line too long") : n;
+    }
+
+    private static int HexDigits(ReadOnlySpan<byte> line)
+    {
+        int i = 0;
+        while (i < line.Length && char.IsAsciiHexDigit((char)line[i])) i++;
+        return i;
     }
 
     /// <summary>Hex size, optional ";ext" (validated as visible ASCII, otherwise ignored). -1 on error.</summary>
@@ -254,7 +276,10 @@ internal sealed class BodyStream : RequestBody
         return true;
     }
 
-    /// <summary>Discard up to <paramref name="limit"/> remaining body bytes. False if the body is larger or broken.</summary>
+    /// <summary>
+    /// Discard up to <paramref name="limit"/> more bytes of body, counted as read off the wire (chunk framing too, so
+    /// the limit bounds the work done). False if the body is larger or broken.
+    /// </summary>
     public override async ValueTask<bool> DrainAsync(long limit)
     {
         if (IsComplete) return true;
@@ -262,7 +287,7 @@ internal sealed class BodyStream : RequestBody
         var tmp = System.Buffers.ArrayPool<byte>.Shared.Rent(8192);
         try
         {
-            long seen = 0;
+            long seen = 0, framing0 = _framing;
             long savedMax = MaxSize;
             MaxSize = 0;
             if (!_started) { _started = true; _conn.Phase = "request body"; _conn.StartRate(MinRate); }
@@ -271,7 +296,7 @@ internal sealed class BodyStream : RequestBody
             {
                 int n = _mode == Mode.Length ? await ReadLengthAsync(tmp).ConfigureAwait(false) : await ReadChunkedAsync(tmp).ConfigureAwait(false);
                 seen += n;
-                if (seen > limit) return false;
+                if (seen + (_framing - framing0) > limit) return false;
             }
             MaxSize = savedMax;
             _conn.StopRate();

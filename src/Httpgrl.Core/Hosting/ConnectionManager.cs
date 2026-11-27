@@ -80,15 +80,23 @@ internal sealed class ConnectionManager : IDisposable
 
     public long NextId() => Interlocked.Increment(ref _nextId);
 
-    /// <summary>Admit or refuse. On refusal the caller closes the socket.</summary>
-    public bool TryAdmit(Connection c, out string? refusal)
+    /// <summary>
+    /// Admit or refuse. On refusal the caller closes the socket. <paramref name="perClient"/> false admits under the
+    /// global cap only: a PROXY protocol listener's socket peer is the relay, so the per-client cap waits for the
+    /// header (<see cref="TryRekey"/>). Until then the header deadline bounds the connection.
+    /// </summary>
+    public bool TryAdmit(Connection c, out string? refusal, bool perClient = true)
     {
         Connection? evict = null;
         lock (_lock)
         {
             if (_stopping) { refusal = "shutting down"; _refused++; return false; }
-            _perIp.TryGetValue(c.IpKey, out int n);
-            if (_perIpMax > 0 && n >= _perIpMax) { refusal = "per-client connection limit"; _refused++; return false; }
+            int n = 0;
+            if (perClient)
+            {
+                _perIp.TryGetValue(c.IpKey, out n);
+                if (_perIpMax > 0 && n >= _perIpMax) { refusal = "per-client connection limit"; _refused++; return false; }
+            }
             if (_freeCount == 0)
             {
                 evict = OldestIdleLocked();
@@ -98,10 +106,29 @@ internal sealed class ConnectionManager : IDisposable
             int slot = _free[--_freeCount];
             _slots[slot] = c;
             c.Slot = slot;
-            _perIp[c.IpKey] = n + 1;
+            if (perClient) { _perIp[c.IpKey] = n + 1; c.ClientCounted = true; }
             _active++;
         }
         evict?.Abort("evicted idle connection");
+        refusal = null;
+        return true;
+    }
+
+    /// <summary>
+    /// Count an admitted connection against the per-client cap under <paramref name="key"/> (the client a PROXY header
+    /// named). False when that client is at its cap: the caller closes the connection.
+    /// </summary>
+    public bool TryRekey(Connection c, IpKey key, out string? refusal)
+    {
+        lock (_lock)
+        {
+            if (c.ClientCounted) throw new InvalidOperationException("connection already counted per client");
+            _perIp.TryGetValue(key, out int n);
+            if (_perIpMax > 0 && n >= _perIpMax) { refusal = "per-client connection limit"; _refused++; return false; }
+            c.IpKey = key;
+            c.ClientCounted = true;
+            _perIp[key] = n + 1;
+        }
         refusal = null;
         return true;
     }
@@ -119,7 +146,7 @@ internal sealed class ConnectionManager : IDisposable
         c.Slot = -1;
         _free[_freeCount++] = slot;
         _active--;
-        if (_perIp.TryGetValue(c.IpKey, out int n))
+        if (c.ClientCounted && _perIp.TryGetValue(c.IpKey, out int n))
         {
             if (n <= 1) _perIp.Remove(c.IpKey);
             else _perIp[c.IpKey] = n - 1;

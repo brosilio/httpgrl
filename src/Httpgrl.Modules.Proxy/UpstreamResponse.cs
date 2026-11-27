@@ -27,11 +27,17 @@ internal sealed class UpstreamResponse
         return false;
     }
 
+    /// <summary>Interim (1xx) heads skipped before a final one: real servers send one or two (100, 103).</summary>
+    internal const int MaxInterim = 16;
+
     /// <summary>Read the next final (or 101) response head; interim 1xx responses are skipped.</summary>
     public static async ValueTask<UpstreamResponse> ReadAsync(UpstreamConn conn, int maxHead, int timeoutMs, bool requestWasHead)
     {
-        while (true)
+        for (int interim = 0; ; interim++)
         {
+            // Each interim head resets nothing but the read timeout: without a cap, an upstream streaming
+            // "100 Continue" forever would hold the request (and its client) indefinitely.
+            if (interim > MaxInterim) throw new UpstreamException("upstream sent too many interim responses");
             int headLen;
             while ((headLen = conn.Buf.AsSpan(conn.Start, conn.Buffered).IndexOf("\r\n\r\n"u8)) < 0)
             {

@@ -72,6 +72,14 @@ internal sealed class Http1Session
                     return;
                 }
                 info.SetProxy(hdr.Source, hdr.Destination);
+                // The per-client cap counts the client the relay names, not the relay (LOCAL/UNKNOWN: the relay itself).
+                // Re-checked only here, so a relay keeps one key per connection for its whole life.
+                if (!_conn.ClientCounted && !_mgr.TryRekey(_conn, hdr.Source is { } src ? IpKey.From(src) : _conn.IpKey, out var why))
+                {
+                    _rt.Log.Debug("connection refused", new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", why));
+                    _conn.Abort(why!);
+                    return;
+                }
                 if (rest.Value.Length > 0) transport = new PrefixedStream(rest.Value, transport);
                 _transport = transport;
             }
@@ -84,10 +92,11 @@ internal sealed class Http1Session
                 await ssl.AuthenticateAsServerAsync(SelectTls, this, CancellationToken.None).ConfigureAwait(false);
                 // Fail closed: the suite list is set on .NET's cached OpenSSL context (OpenSslContextAccess). Should the
                 // runtime ever rebuild that context without it, a suite outside the list is caught here, not served.
-                if (_tlsServer!.AllowedSuites is { } allowed && !allowed.Contains(ssl.NegotiatedCipherSuite))
+                var suite = NegotiatedSuiteForTests is { } fault ? fault(ssl.NegotiatedCipherSuite) : ssl.NegotiatedCipherSuite;
+                if (_tlsServer!.AllowedSuites is { } allowed && !allowed.Contains(suite))
                 {
                     _rt.Log.Warn("negotiated a cipher suite outside ssl_ciphers; closing", new("conn", _conn.Id),
-                        new("suite", ssl.NegotiatedCipherSuite.ToString()), new("remote", info.RemoteAddress));
+                        new("suite", suite.ToString()), new("remote", info.RemoteAddress));
                     return;
                 }
                 X509Certificate2? clientCert = null;
@@ -95,16 +104,12 @@ internal sealed class Http1Session
                 if (_tlsServer!.ClientAuth is { } auth)
                 {
                     clientCert = ssl.RemoteCertificate as X509Certificate2;
-                    verdict = ssl.Verdict;
-                    if (verdict is null)
+                    // A callback verdict means the handshake already accepted it; without one, verify here, same policy.
+                    (verdict, bool accept) = auth.Settle(ssl.Verdict, clientCert);
+                    if (!accept)
                     {
-                        // The callback didn't run (e.g. a resumed session): verify here, under the same policy.
-                        (verdict, bool accept) = auth.Evaluate(clientCert);
-                        if (!accept)
-                        {
-                            _rt.Log.Info("client certificate rejected", new("event", "client_certificate_rejected"), new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", verdict));
-                            return;
-                        }
+                        _rt.Log.Info("client certificate rejected", new("event", "client_certificate_rejected"), new("conn", _conn.Id), new("remote", info.RemoteAddress), new("reason", verdict));
+                        return;
                     }
                 }
                 info.SetTls(TlsHost(ssl.TargetHostName), ssl.SslProtocol.ToString(), clientCert, verdict);
@@ -296,6 +301,12 @@ internal sealed class Http1Session
             return true;
         }
     }
+
+    /// <summary>
+    /// Fault injection for the test suite only (null in production): stands in for what the platform reports as the
+    /// negotiated suite, so the fail-closed check above can be exercised without a broken TLS stack.
+    /// </summary>
+    internal static Func<TlsCipherSuite, TlsCipherSuite>? NegotiatedSuiteForTests;
 
     private static readonly byte[] Continue100 = "HTTP/1.1 100 Continue\r\n\r\n"u8.ToArray();
 

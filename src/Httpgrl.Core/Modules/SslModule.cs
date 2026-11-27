@@ -135,6 +135,14 @@ public sealed class ClientAuth : Httpgrl.Quic.IQuicClientCertificatePolicy
         return Evaluate(cert, chain, ok ? SslPolicyErrors.None : SslPolicyErrors.RemoteCertificateChainErrors);
     }
 
+    /// <summary>
+    /// The verdict for a finished handshake: the verify callback's, or, if it didn't run (no session resumes on a
+    /// client-certificate server, so this is defence in depth), a full verification of <paramref name="cert"/> now.
+    /// Never "accepted" just because nothing was checked.
+    /// </summary>
+    public (string Verdict, bool Accept) Settle(string? callbackVerdict, X509Certificate2? cert) =>
+        callbackVerdict is not null ? (callbackVerdict, true) : Evaluate(cert);
+
     private const X509ChainStatusFlags CaFlags = X509ChainStatusFlags.UntrustedRoot | X509ChainStatusFlags.PartialChain;
 
     private static string Describe(X509Chain? chain, out bool caOnly)

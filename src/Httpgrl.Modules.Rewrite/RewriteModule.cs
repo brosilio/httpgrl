@@ -143,7 +143,7 @@ public sealed class RewriteModule : IModule
     private enum Flow : byte { Done, Stop, Reselect, Respond }
 
     /// <summary>What to answer with when a script ends the request (return, or a rewrite redirect).</summary>
-    private sealed record Response(ReturnOp? Return, int RedirectStatus = 0, string? Location = null);
+    private sealed record Response(ReturnOp? Return, int RedirectStatus = 0, string? Location = null, ComplexValue? Template = null);
 
     private const int MaxLocationCycles = 10;
 
@@ -213,7 +213,7 @@ public sealed class RewriteModule : IModule
                     bool absolute = target.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || target.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
                     if (absolute || rw.Flag is RewriteFlag.Redirect or RewriteFlag.Permanent)
                     {
-                        resp = new Response(null, rw.Flag == RewriteFlag.Permanent ? 301 : 302, query.Length > 0 ? path + "?" + query : path);
+                        resp = new Response(null, rw.Flag == RewriteFlag.Permanent ? 301 : 302, query.Length > 0 ? path + "?" + query : path, rw.Replacement);
                         return Flow.Respond;
                     }
                     switch (rw.Flag)
@@ -262,7 +262,7 @@ public sealed class RewriteModule : IModule
     private static ValueTask<HandlerResult> Respond(HttpContext ctx, Response r)
     {
         if (r.Return is { } ret) return ReturnAsync(ctx, ret);
-        ctx.Response.Headers.Set("Location", EscapeForHeader(r.Location!));
+        ctx.Response.Headers.Set("Location", Redirects.Location(r.Template!, r.Location!));
         return new(HandlerResult.WithStatus(r.RedirectStatus));
     }
 
@@ -279,7 +279,7 @@ public sealed class RewriteModule : IModule
         if (c.Code == HandlerResult.DropStatus) return HandlerResult.Drop;
         if (IsRedirect(c.Code))
         {
-            ctx.Response.Headers.Set("Location", EscapeForHeader(c.Text!.Evaluate(ctx)));
+            ctx.Response.Headers.Set("Location", Redirects.Location(c.Text!, c.Text!.Evaluate(ctx)));
             return HandlerResult.WithStatus(c.Code);
         }
         if (c.Text is null) return HandlerResult.WithStatus(c.Code); // core body; error_page applies, as in nginx
@@ -291,25 +291,6 @@ public sealed class RewriteModule : IModule
         resp.ContentLength = body.Length;
         await resp.WriteAsync(body).ConfigureAwait(false);
         return HandlerResult.Done;
-    }
-
-    /// <summary>
-    /// Variables like $uri are percent-decoded and may hold CR/LF or non-ASCII. Re-encode those, so
-    /// <c>return 301 https://$host$uri</c> can never split the response (a classic nginx misconfiguration).
-    /// </summary>
-    internal static string EscapeForHeader(string url)
-    {
-        bool clean = true;
-        foreach (char c in url)
-            if (c is < (char)0x21 or > (char)0x7E) { clean = false; break; }
-        if (clean) return url;
-        var sb = new StringBuilder(url.Length + 16);
-        foreach (byte b in Encoding.UTF8.GetBytes(url))
-        {
-            if (b is >= 0x21 and <= 0x7E) sb.Append((char)b);
-            else sb.Append('%').Append("0123456789ABCDEF"[b >> 4]).Append("0123456789ABCDEF"[b & 15]);
-        }
-        return sb.ToString();
     }
 }
 

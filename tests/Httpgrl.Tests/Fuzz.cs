@@ -17,7 +17,8 @@ namespace Httpgrl.Tests;
 /// <summary>
 /// Dependency-free mutation fuzzing of everything that parses untrusted (or semi-trusted) bytes. Each target states
 /// which exceptions are legitimate rejections and which invariants an accepted input must satisfy; anything else is
-/// a bug. Inputs derive from (seed, iteration) alone, so a failure reproduces exactly from the printed numbers.
+/// a bug. Inputs derive from (seed, iteration, target) alone, so a failure reproduces exactly from the printed numbers
+/// (pinned by the "fuzz: inputs derive from ..." test).
 ///
 /// The test suite runs a short fixed-seed pass of every target. Long runs:
 ///   dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz [target|all] [seconds] [seed]
@@ -42,15 +43,16 @@ internal static partial class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        LogPrivacyTarget(), RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
+        LogPrivacyTarget(), H2HeadTarget(), RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), OcspSignedTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
         QuicVarIntTarget(), QuicPacketTarget(), QuicFramesTarget(), QuicTransportParametersTarget(), QuicConnectionTarget(), QuicClientHandshakeTarget(), QuicClientFramesTarget(), QpackTarget(), H3FramesTarget(), H3SessionTarget(),
     ]);
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "quic-client-handshake", "quic-client-frames", "qpack", "h3-frames", "h3-session" })
+        RegisterReproducibility();
+        foreach (var name in SuiteTargets)
         {
-            int iterations = name == "config" ? 3_000 : name == "h2-session" ? 2_000 : name is "quic-connection" or "quic-client-frames" ? 1_000 : name == "quic-client-handshake" ? 3_000 : name == "h3-session" ? 100 : 20_000;
+            int iterations = SuiteIterations(name);
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
             {
                 var t = Array.Find(All.Value, x => x.Name == name)!;
@@ -60,6 +62,38 @@ internal static partial class Fuzz
         }
     }
 
+    private static readonly string[] SuiteTargets = [ "log-privacy", "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "ocsp-signed", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-head", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "quic-client-handshake", "quic-client-frames", "qpack", "h3-frames", "h3-session"];
+
+    private static void RegisterReproducibility() =>
+        T.Add("fuzz: inputs derive from (seed, iteration, target) alone, identically in every process", () =>
+        {
+            // Golden values: a per-process-randomized hash (System.HashCode) would change these on every run.
+            T.Eq(GoldenSeed, StableSeed(1, 0, "request"));
+            T.Eq(GoldenInput, Convert.ToHexString(InputFor("request", 1, 0)));
+            T.True(StableSeed(1, 0, "uri") != StableSeed(1, 0, "crl")); // same-length names get their own streams
+            T.True(StableSeed(1, 0, "request") != StableSeed(1, 1, "request") && StableSeed(1, 0, "request") != StableSeed(2, 0, "request"));
+            foreach (var t in All.Value) T.True(SuiteTargets.Contains(t.Name), $"fuzz target {t.Name} isn't in the suite");
+        });
+
+    private const int GoldenSeed = -1360830446;
+    private const string GoldenInput = "474554202F20485454502F312E310D0A486F73743A20612E74652F73740D0A0D54202F20485454502F312E310D0A486F73743A20612E74652F73740D0A0D0A0A";
+
+    /// <summary>The suite's input count per target: the slow, stateful targets get fewer.</summary>
+    private static int SuiteIterations(string name) => name switch
+    {
+        "config" or "quic-client-handshake" or "ocsp-signed" => 3_000,
+        "h2-session" => 2_000,
+        "quic-connection" or "quic-client-frames" => 1_000,
+        "h3-session" => 100,
+        _ => 20_000,
+    };
+
+    /// <summary>
+    /// A target's share of a long run's time. An even split left the stateful targets (which reach the most code, but
+    /// cost milliseconds per input) with a few hundred inputs against tens of millions for the byte parsers.
+    /// </summary>
+    private static int TimeWeight(string name) => SuiteIterations(name) switch { < 1_000 => 8, < 20_000 => 4, _ => 1 };
+
     /// <summary>Long-running mode. Exit code 1 on the first finding.</summary>
     public static int RunCli(string[] args)
     {
@@ -67,10 +101,12 @@ internal static partial class Fuzz
         int seconds = args.Length > 2 ? int.Parse(args[2]) : 60;
         int seed = args.Length > 3 ? int.Parse(args[3]) : Environment.TickCount & 0x7fffffff;
         var targets = which == "all" ? All.Value : [Array.Find(All.Value, t => t.Name == which) ?? throw new ArgumentException($"unknown target \"{which}\"")];
-        long perTarget = seconds * 1000L / targets.Length;
+        long totalWeight = 0;
+        foreach (var t in targets) totalWeight += TimeWeight(t.Name);
         foreach (var t in targets)
         {
-            var (failure, done, accepted) = Run(t, seed, long.MaxValue, Environment.TickCount64 + perTarget, parallel: true);
+            long budget = seconds * 1000L * TimeWeight(t.Name) / totalWeight;
+            var (failure, done, accepted) = Run(t, seed, long.MaxValue, Environment.TickCount64 + budget, parallel: true);
             Console.WriteLine($"fuzz {t.Name}: {done} inputs ({100.0 * accepted / Math.Max(1, done):F1}% accepted), seed {seed}{(failure is null ? ", no findings" : "")}");
             if (failure is not null)
             {
@@ -126,13 +162,31 @@ internal static partial class Fuzz
 
     private static byte[] Input(Target t, int seed, long i)
     {
-        var r = new Random(HashCode.Combine(seed, i, t.Name.Length));
+        var r = new Random(StableSeed(seed, i, t.Name));
         var data = new List<byte>(t.Seeds[r.Next(t.Seeds.Length)]);
         int ops = 1 + r.Next(r.Next(2) == 0 ? 3 : 12);
         for (int k = 0; k < ops; k++) Mutate(r, data, t);
         if (data.Count > t.MaxLen) data.RemoveRange(t.MaxLen, data.Count - t.MaxLen);
         return data.ToArray();
     }
+
+    /// <summary>
+    /// The per-input seed. Must be the same in every process (System.HashCode isn't: it is randomized per process, so
+    /// a printed "seed S iteration I" reproduced nothing). FNV-1a over the target name, then a SplitMix64 finalizer.
+    /// <c>new Random(int)</c> is itself deterministic for a given seed.
+    /// </summary>
+    internal static int StableSeed(int seed, long i, string name)
+    {
+        ulong h = 1469598103934665603UL;
+        foreach (char c in name) { h ^= c; h *= 1099511628211UL; }
+        ulong z = h ^ ((ulong)(uint)seed << 32) ^ (ulong)i;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+        return (int)(z ^ (z >> 31));
+    }
+
+    /// <summary>The input for (target, seed, iteration), for the reproducibility test.</summary>
+    internal static byte[] InputFor(string target, int seed, long i) => Input(Array.Find(All.Value, x => x.Name == target)!, seed, i);
 
     private static readonly byte[] Interesting = [0, (byte)'\r', (byte)'\n', (byte)' ', (byte)'\t', (byte)':', (byte)'%', (byte)';', (byte)'{', (byte)'}', (byte)'"', (byte)'\\', (byte)'/', (byte)'.', (byte)'0', (byte)'9', (byte)'f', 0x7f, 0x80, 0xc0, 0xff];
 
@@ -470,6 +524,45 @@ internal static partial class Fuzz
             return any;
         }, MaxLen: 256);
 
+    /// <summary>
+    /// HTTP/2 and HTTP/3 request heads (fields as HPACK/QPACK hand them over: any bytes). Input: fields separated by
+    /// '\n', name and value by the first ':' after the first byte. What's accepted has a valid method, path and host,
+    /// and only field values the HTTP/1.1 parser would accept too (they may be forwarded to an HTTP/1.1 upstream).
+    /// </summary>
+    private static Target H2HeadTarget() => new("h2-head",
+        B(":method:GET\n:scheme:https\n:path:/\n:authority:a.test\naccept:*/*",
+          ":method:POST\n:scheme:https\n:path:/x?y\n:authority:a.test\ncontent-length:3\nx-a:b\tc",
+          ":method:CONNECT\n:protocol:websocket\n:scheme:https\n:path:/ws\n:authority:a.test\nte:trailers"),
+        B(":", "\n", "\r", "\0", "\t", " ", "\x01", "\x1b", "\x7f", "\xff", "host:", "cookie:", "te:", "content-length:", ":path:", ":authority:", "%00", "..", "_"),
+        data =>
+        {
+            var req = new RequestImpl();
+            var h = new Httpgrl.Core.Http2.RequestHead(underscores: false);
+            h.Begin(req);
+            int start = 0;
+            for (int k = 0; k <= data.Length; k++)
+            {
+                if (k < data.Length && data[k] != (byte)'\n') continue;
+                var field = data.AsSpan(start, k - start);
+                start = k + 1;
+                int colon = field.Length > 1 ? field[1..].IndexOf((byte)':') : -1;
+                if (colon < 0) continue;
+                h.OnField(field[..(colon + 1)], field[(colon + 2)..]);
+            }
+            if (h.Finish(endStream: true) != 0) return false;
+            var hs = req.HeaderList;
+            for (int k = 0; k < hs.Count; k++)
+            {
+                foreach (char c in hs.ValueAt(k))
+                    if ((c < ' ' && c != '\t') || c == (char)0x7f) throw new Finding($"field {hs.NameAt(k)} carries 0x{(int)c:x2}");
+                foreach (char c in hs.NameAt(k))
+                    if (c is <= ' ' or >= (char)0x7f or ':') throw new Finding($"field name \"{hs.NameAt(k)}\"");
+            }
+            if (req.Method.Length == 0) throw new Finding("accepted without a method");
+            if (req.Method != "CONNECT" && req.RawTargetValue != "*") CheckPath(req.PathValue);
+            return true;
+        }, MaxLen: 2048);
+
     /// <summary>Host header / SNI normalization: what comes out is a valid, lower-case, port-free name, and stable.</summary>
     private static Target HostTarget() => new("host",
         B("a.test", "A.Test:8080", "[::1]:80", "a.test.", "xn--bcher-kva.example", "a_b.test", "[]", "a..", "1.2.3.4"),
@@ -492,6 +585,8 @@ internal static partial class Fuzz
     /// a query that can sit on a request line, and a Location value that can't split the response. Input: the
     /// replacement result, then optionally '\x01' and the original query.
     /// </summary>
+    private static readonly ComplexValue VariableTemplate = new("$1", []), LiteralSlashesTemplate = new("//cdn.example$1", []);
+
     private static Target RewriteTarget() => new("rewrite",
         B("/new/path", "/a?x=1", "/a?", "/a?b=2\x01c=3", "/../../etc", "/x/%2e%2e/y", "http://evil/\r\nSet-Cookie: x", "/caf\u00e9?q=\u00e9 \t#f"),
         B("?", "&", "#", "/", "..", ".", "%", "%0d%0a", "\r", "\n", "\0", " ", "\t", "\x7f", "\xff", "\x01", "//", "\\"),
@@ -500,8 +595,10 @@ internal static partial class Fuzz
             int sep = Array.IndexOf(data, (byte)1);
             var target = Encoding.UTF8.GetString(sep < 0 ? data : data[..sep]);
             var orig = sep < 0 ? "" : Encoding.Latin1.GetString(data, sep + 1, data.Length - sep - 1);
-            var loc = Httpgrl.Modules.Rewrite.RewriteModule.EscapeForHeader(target);
-            foreach (char c in loc) if (c is < (char)0x21 or > (char)0x7e) throw new Finding($"Location carries 0x{(int)c:x2}");
+            var loc = Redirects.Location(VariableTemplate, target);
+            foreach (char c in loc) if (c is < (char)0x21 or > (char)0x7e or '\\') throw new Finding($"Location carries 0x{(int)c:x2}");
+            if (loc.StartsWith("//", StringComparison.Ordinal)) throw new Finding($"variable-built Location is protocol-relative: \"{loc}\"");
+            if (Redirects.Location(LiteralSlashesTemplate, target) != Redirects.Escape(target)) throw new Finding("a template written with // was changed");
             var (path, query) = Httpgrl.Modules.Rewrite.RewriteModule.SplitTarget(target, orig);
             if (path.Contains('?')) throw new Finding($"'?' left in path \"{path}\"");
             var q = HttpContextImpl.EscapeQuery(query);
@@ -646,6 +743,54 @@ internal static partial class Fuzz
             if (v.Expires <= now) throw new Finding("accepted an expired response");
             return true;
         }, MaxLen: 8192);
+    }
+
+    /// <summary>
+    /// OCSP acceptance logic. The "ocsp" target mutates whole signed responses, so the signature check rejects nearly all
+    /// of them and its acceptance invariants never run; here the mutated bytes are the ResponseData, re-signed by the CA
+    /// each time, so only the semantics vary: status, times, certID, responder ID, extensions.
+    /// </summary>
+    private static Target OcspSignedTarget()
+    {
+        var pki = new OcspPki("fuzz-signed.test");
+        var seeds = new List<byte[]> { pki.MakeResponseData() };
+        pki.Revoked = true; seeds.Add(pki.MakeResponseData()); pki.Revoked = false;
+        pki.Validity = TimeSpan.FromSeconds(-60); seeds.Add(pki.MakeResponseData()); // already expired
+        pki.Validity = TimeSpan.FromDays(3650); seeds.Add(pki.MakeResponseData());
+        pki.Validity = TimeSpan.FromHours(1);
+        // Fuzz the ResponseData's contents; each input is re-wrapped in one SEQUENCE, so it stays a single value to sign.
+        for (int k = 0; k < seeds.Count; k++)
+        {
+            System.Formats.Asn1.AsnDecoder.ReadEncodedValue(seeds[k], System.Formats.Asn1.AsnEncodingRules.DER, out int off, out int len, out _);
+            seeds[k] = seeds[k].AsSpan(off, len).ToArray();
+        }
+        static byte[] Sequence(byte[] content)
+        {
+            var hdr = new List<byte> { 0x30 };
+            int n = content.Length;
+            if (n < 0x80) hdr.Add((byte)n);
+            else if (n < 0x100) { hdr.Add(0x81); hdr.Add((byte)n); }
+            else { hdr.Add(0x82); hdr.Add((byte)(n >> 8)); hdr.Add((byte)n); }
+            return [.. hdr, .. content];
+        }
+        var leaf = pki.Leaf;
+        var issuer = pki.Ca;
+        var serial = leaf.SerialNumberBytes.ToArray();
+        var gate = new object();
+        return new Target("ocsp-signed", seeds.ToArray(),
+            B("\x80\x00", "\xa1", "\x82\x00", "\x18\x0f", "20991231235959Z", "19700101000000Z", "\xa0", "\xa2", "\x04\x14", "\x02\x01\x01", "\x30", "\x00"),
+            data =>
+            {
+                byte[] resp;
+                lock (gate) resp = pki.Sign(Sequence(data)); // ECDsa key use is serialized: the PKI object isn't thread-safe
+                var now = DateTime.UtcNow;
+                var v = Httpgrl.Core.Modules.Ocsp.Verify(resp, leaf, issuer, now, out _);
+                if (v is null) return false;
+                if (v.Status == Httpgrl.Core.Modules.OcspCertStatus.Unknown) throw new Finding("accepted status unknown");
+                if (v.Expires <= now) throw new Finding("accepted an expired response");
+                if (data.AsSpan().IndexOf(serial) < 0) throw new Finding("accepted a response that doesn't name the certificate");
+                return true;
+            }, MaxLen: 2048);
     }
 
     /// <summary>CRLs (DER). Only CryptographicException is a legitimate rejection.</summary>

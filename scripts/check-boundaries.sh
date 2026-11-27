@@ -26,7 +26,7 @@ for dir in src/Httpgrl.Modules.*; do
     done
 done
 
-# Protocol libraries (docs/plan-protocol-libraries.md): Httpgrl.HttpFields and Httpgrl.Quic reference nothing of ours,
+# Protocol libraries (docs/development.md, "Design decisions"): Httpgrl.HttpFields and Httpgrl.Quic reference nothing of ours,
 # Httpgrl.Http3 only those two. None of them may reach into Core or Abstractions, and none lets Core see its internals:
 # the server uses them through their public API, like any other consumer.
 check_lib() { # project, allowed references (regex)

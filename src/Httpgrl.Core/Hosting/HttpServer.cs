@@ -360,7 +360,7 @@ public sealed class HttpServer : IAsyncDisposable
             if (!pinned) { s.Dispose(); return; }
             conn.Generation = st.Rt;
             conn.Tls = st.Binding.Ssl;
-            if (!_mgr.TryAdmit(conn, out var why))
+            if (!_mgr.TryAdmit(conn, out var why, perClient: !st.Binding.ProxyProtocol))
             {
                 st.Rt.Release();
                 st.Rt.Log.Debug("connection refused", new("remote", remote?.ToString()), new("reason", why));

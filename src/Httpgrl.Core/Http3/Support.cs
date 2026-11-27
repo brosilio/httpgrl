@@ -1,6 +1,6 @@
 namespace Httpgrl.Core.Http3;
 
-/// <summary>Whether this server can serve HTTP/3 here (docs/plan-http2-http3.md, decision 4).</summary>
+/// <summary>Whether this server can serve HTTP/3 here (docs/development.md, "Design decisions": Linux with OpenSSL 3.5 or newer).</summary>
 internal static class Http3Support
 {
     /// <summary>
