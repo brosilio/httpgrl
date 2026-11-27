@@ -489,6 +489,27 @@ internal static class ProxyTests
             T.True(sw.ElapsedMilliseconds is > 800 and < 3000);
         });
 
+        T.Add("proxy: a non-idempotent request that reached an upstream is never retried on another", async () =>
+        {
+            // The primary reads the whole request, then closes without answering: it may have acted on it.
+            await using var drop = new FakeUpstream(async (st, rd) => { await rd.ReadRequestAsync(); });
+            await using var ok = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf("""
+                location / { proxy_pass http://app; proxy_read_timeout 3s; }
+                """, $$"""upstream app { server 127.0.0.1:{{drop.Port}} max_fails=0; server 127.0.0.1:{{ok.Port}} backup; }"""));
+            T.Eq(502, Status(await s.Raw("POST /delete-account HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")));
+            T.Eq(502, Status(await s.Raw("POST /pay HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 6\r\n\r\namount")));
+            T.Eq(502, Status(await s.Raw("PATCH /x HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 1\r\n\r\nx")));
+            T.Eq(3, drop.Requests.Count);
+            T.Eq(0, ok.Requests.Count); // never duplicated onto the backup
+            // The other half: an idempotent request is retried on the next peer.
+            var r = await s.Raw(Get("/again"));
+            T.Eq(200, Status(r));
+            T.Contains("GET /again ", Body(r));
+            T.Eq(4, drop.Requests.Count);
+            T.Eq(1, ok.Requests.Count);
+        });
+
         T.Add("proxy: an upstream that answers before reading the whole body is relayed, not turned into a 502/504", async () =>
         {
             // Reads only the head, refuses at once, then neither reads nor closes (the case that used to wait out
