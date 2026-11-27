@@ -17,7 +17,8 @@ namespace Httpgrl.Tests;
 /// <summary>
 /// Dependency-free mutation fuzzing of everything that parses untrusted (or semi-trusted) bytes. Each target states
 /// which exceptions are legitimate rejections and which invariants an accepted input must satisfy; anything else is
-/// a bug. Inputs derive from (seed, iteration) alone, so a failure reproduces exactly from the printed numbers.
+/// a bug. Inputs derive from (seed, iteration, target) alone, so a failure reproduces exactly from the printed numbers
+/// (pinned by the "fuzz: inputs derive from ..." test).
 ///
 /// The test suite runs a short fixed-seed pass of every target. Long runs:
 ///   dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz [target|all] [seconds] [seed]
@@ -48,9 +49,10 @@ internal static partial class Fuzz
 
     public static void Register()
     {
-        foreach (var name in new[] { "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "quic-client-handshake", "quic-client-frames", "qpack", "h3-frames", "h3-session" })
+        RegisterReproducibility();
+        foreach (var name in SuiteTargets)
         {
-            int iterations = name == "config" ? 3_000 : name == "h2-session" ? 2_000 : name is "quic-connection" or "quic-client-frames" ? 1_000 : name == "quic-client-handshake" ? 3_000 : name == "h3-session" ? 100 : 20_000;
+            int iterations = SuiteIterations(name);
             T.Add($"fuzz: {name} parser ({iterations} mutated inputs, fixed seed)", () =>
             {
                 var t = Array.Find(All.Value, x => x.Name == name)!;
@@ -60,6 +62,38 @@ internal static partial class Fuzz
         }
     }
 
+    private static readonly string[] SuiteTargets = [ "log-privacy", "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "quic-client-handshake", "quic-client-frames", "qpack", "h3-frames", "h3-session"];
+
+    private static void RegisterReproducibility() =>
+        T.Add("fuzz: inputs derive from (seed, iteration, target) alone, identically in every process", () =>
+        {
+            // Golden values: a per-process-randomized hash (System.HashCode) would change these on every run.
+            T.Eq(GoldenSeed, StableSeed(1, 0, "request"));
+            T.Eq(GoldenInput, Convert.ToHexString(InputFor("request", 1, 0)));
+            T.True(StableSeed(1, 0, "uri") != StableSeed(1, 0, "crl")); // same-length names get their own streams
+            T.True(StableSeed(1, 0, "request") != StableSeed(1, 1, "request") && StableSeed(1, 0, "request") != StableSeed(2, 0, "request"));
+            foreach (var t in All.Value) T.True(SuiteTargets.Contains(t.Name), $"fuzz target {t.Name} isn't in the suite");
+        });
+
+    private const int GoldenSeed = -1360830446;
+    private const string GoldenInput = "474554202F20485454502F312E310D0A486F73743A20612E74652F73740D0A0D54202F20485454502F312E310D0A486F73743A20612E74652F73740D0A0D0A0A";
+
+    /// <summary>The suite's input count per target: the slow, stateful targets get fewer.</summary>
+    private static int SuiteIterations(string name) => name switch
+    {
+        "config" or "quic-client-handshake" => 3_000,
+        "h2-session" => 2_000,
+        "quic-connection" or "quic-client-frames" => 1_000,
+        "h3-session" => 100,
+        _ => 20_000,
+    };
+
+    /// <summary>
+    /// A target's share of a long run's time. An even split left the stateful targets (which reach the most code, but
+    /// cost milliseconds per input) with a few hundred inputs against tens of millions for the byte parsers.
+    /// </summary>
+    private static int TimeWeight(string name) => SuiteIterations(name) switch { < 1_000 => 8, < 20_000 => 4, _ => 1 };
+
     /// <summary>Long-running mode. Exit code 1 on the first finding.</summary>
     public static int RunCli(string[] args)
     {
@@ -67,10 +101,12 @@ internal static partial class Fuzz
         int seconds = args.Length > 2 ? int.Parse(args[2]) : 60;
         int seed = args.Length > 3 ? int.Parse(args[3]) : Environment.TickCount & 0x7fffffff;
         var targets = which == "all" ? All.Value : [Array.Find(All.Value, t => t.Name == which) ?? throw new ArgumentException($"unknown target \"{which}\"")];
-        long perTarget = seconds * 1000L / targets.Length;
+        long totalWeight = 0;
+        foreach (var t in targets) totalWeight += TimeWeight(t.Name);
         foreach (var t in targets)
         {
-            var (failure, done, accepted) = Run(t, seed, long.MaxValue, Environment.TickCount64 + perTarget, parallel: true);
+            long budget = seconds * 1000L * TimeWeight(t.Name) / totalWeight;
+            var (failure, done, accepted) = Run(t, seed, long.MaxValue, Environment.TickCount64 + budget, parallel: true);
             Console.WriteLine($"fuzz {t.Name}: {done} inputs ({100.0 * accepted / Math.Max(1, done):F1}% accepted), seed {seed}{(failure is null ? ", no findings" : "")}");
             if (failure is not null)
             {
@@ -126,13 +162,31 @@ internal static partial class Fuzz
 
     private static byte[] Input(Target t, int seed, long i)
     {
-        var r = new Random(HashCode.Combine(seed, i, t.Name.Length));
+        var r = new Random(StableSeed(seed, i, t.Name));
         var data = new List<byte>(t.Seeds[r.Next(t.Seeds.Length)]);
         int ops = 1 + r.Next(r.Next(2) == 0 ? 3 : 12);
         for (int k = 0; k < ops; k++) Mutate(r, data, t);
         if (data.Count > t.MaxLen) data.RemoveRange(t.MaxLen, data.Count - t.MaxLen);
         return data.ToArray();
     }
+
+    /// <summary>
+    /// The per-input seed. Must be the same in every process (System.HashCode isn't: it is randomized per process, so
+    /// a printed "seed S iteration I" reproduced nothing). FNV-1a over the target name, then a SplitMix64 finalizer.
+    /// <c>new Random(int)</c> is itself deterministic for a given seed.
+    /// </summary>
+    internal static int StableSeed(int seed, long i, string name)
+    {
+        ulong h = 1469598103934665603UL;
+        foreach (char c in name) { h ^= c; h *= 1099511628211UL; }
+        ulong z = h ^ ((ulong)(uint)seed << 32) ^ (ulong)i;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+        return (int)(z ^ (z >> 31));
+    }
+
+    /// <summary>The input for (target, seed, iteration), for the reproducibility test.</summary>
+    internal static byte[] InputFor(string target, int seed, long i) => Input(Array.Find(All.Value, x => x.Name == target)!, seed, i);
 
     private static readonly byte[] Interesting = [0, (byte)'\r', (byte)'\n', (byte)' ', (byte)'\t', (byte)':', (byte)'%', (byte)';', (byte)'{', (byte)'}', (byte)'"', (byte)'\\', (byte)'/', (byte)'.', (byte)'0', (byte)'9', (byte)'f', 0x7f, 0x80, 0xc0, 0xff];
 

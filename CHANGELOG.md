@@ -16,6 +16,8 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
   error-level log line and stack trace (any client could flood the log), and spaces or Latin-1 went out raw.
 
 ### Tests
+- Fuzz inputs are reproducible across processes (they were seeded with the per-process-randomized `HashCode`), pinned
+  by a golden-value test; every fuzz target is in the suite (`log-privacy` wasn't); long runs weight slow targets.
 - Absence-only security assertions are paired with a status check (`T.Refused`); a test that times out gets time to
   wind down and is reported if it keeps running; the slowest test went from ~14 s to ~2 s; `"=name"` runs one test.
 

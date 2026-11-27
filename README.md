@@ -409,11 +409,15 @@ config parser (with every module's directives), CRLs, OCSP responses, PROXY prot
 the tunnel handshake response, `Range`, `Host`/SNI names, rewrite results, and the mapping of request paths through
 `root`/`alias` (checked for containment independently of the mapper). Each target states which rejections are legitimate and
 which invariants an accepted input must hold (e.g. never both `Content-Length` and `chunked`, no dot segments
-in a path). The test suite runs a fixed-seed pass of each, so CI is also a regression fuzz. For long runs:
+in a path). The test suite runs a fixed-seed pass of each, so CI is also a regression fuzz. Inputs derive from
+(seed, iteration, target) alone, identically in every process, so a printed seed and iteration reproduce a finding.
+A long run gives the slow, stateful targets (sessions, connections, config) a larger share of its time. For long runs:
 
 ```sh
 dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz all 600        # 10 minutes, all targets, random seed
 dotnet run -c Release --project tests/Httpgrl.Tests -- --fuzz request 60 42  # one target, fixed seed
+dotnet run -c Release --project tests/Httpgrl.Tests -- "proxy:"              # tests whose name contains "proxy:"
+dotnet run -c Release --project tests/Httpgrl.Tests -- "=fuzz: uri parser (20000 mutated inputs, fixed seed)"  # one test by exact name
 ```
 
 **Soak test** (Linux). Runs the real binary as a child process under mixed load: static, proxied and POSTed
