@@ -609,9 +609,13 @@ internal static class ProxyTests
             await using var badExt = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;a\rb\r\nhello\r\n0\r\n\r\n");
             // An endless stream of interim heads (each one within proxy_read_timeout) used to hold the request forever.
             await using var interim = Says(string.Concat(Enumerable.Repeat("HTTP/1.1 100 Continue\r\n\r\n", 17)) + "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            // Each trailer line is short; together they pass the 8 KiB trailer cap.
+            await using var bigTrailer = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n" +
+                string.Concat(Enumerable.Range(0, 4).Select(i => $"X-T{i}: {new string('t', 3000)}\r\n")) + "\r\n");
+            await using var midChunk = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel");
             var locs = new StringBuilder();
             foreach (var (name, u) in new[] { ("both", both), ("twocl", twoCl), ("fold", fold), ("split", split), ("big", bigHead), ("line", badLine), ("te", badTe), ("short", short_), ("chunk", badChunk),
-                                              ("samecl", sameCl), ("st600", st600), ("trailer", badTrailer), ("ext", badExt), ("interim", interim) })
+                                              ("samecl", sameCl), ("st600", st600), ("trailer", badTrailer), ("ext", badExt), ("interim", interim), ("bigtrailer", bigTrailer), ("midchunk", midChunk) })
                 locs.Append($"location /{name} {{ proxy_pass http://127.0.0.1:{u.Port}; }}\n");
             locs.Append($"location /streamed-short {{ proxy_pass http://127.0.0.1:{short_.Port}; proxy_buffering off; }}\n");
             await using var s = TestServer.Start(Conf(locs.ToString()));
@@ -633,12 +637,73 @@ internal static class ProxyTests
             var chunk = await s.Raw(Get("/chunk"));
             T.True(Status(chunk) is 502 or 200, chunk);
             T.NotContains("\r\n0\r\n\r\n", Body(chunk));
-            foreach (var p in new[] { "/trailer", "/ext" })
+            foreach (var p in new[] { "/trailer", "/ext", "/bigtrailer", "/midchunk" })
             {
                 var r = await s.Raw(Get(p));
                 T.True(Status(r) == 502 || (Status(r) == 200 && !r.Contains("\r\n0\r\n\r\n", StringComparison.Ordinal)), $"{p}: {r}");
             }
             T.Contains("too many interim responses", s.LogText());
+            T.Contains("upstream trailer too large", s.LogText());
+        });
+
+        T.Add("proxy: close-delimited upstream bodies are relayed whole, buffered and streamed; a few interim heads are skipped", async () =>
+        {
+            var payload = new string('z', 100_000) + "END";
+            await using var http10 = new FakeUpstream(async (st, rd) =>
+            {
+                await rd.ReadRequestAsync();
+                await st.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n" + payload));
+            });
+            await using var noLength = new FakeUpstream(async (st, rd) =>
+            {
+                await rd.ReadRequestAsync();
+                await st.WriteAsync("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\n"u8.ToArray());
+                await st.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"));
+                for (int i = 0; i < payload.Length; i += 7000) { await st.WriteAsync(Encoding.ASCII.GetBytes(payload[i..Math.Min(payload.Length, i + 7000)])); await st.FlushAsync(); }
+            });
+            await using var s = TestServer.Start(Conf($$"""
+                location /b10/ { proxy_pass http://127.0.0.1:{{http10.Port}}; }
+                location /s10/ { proxy_pass http://127.0.0.1:{{http10.Port}}; proxy_buffering off; }
+                location /bnl/ { proxy_pass http://127.0.0.1:{{noLength.Port}}; }
+                location /snl/ { proxy_pass http://127.0.0.1:{{noLength.Port}}; proxy_buffering off; }
+                """));
+            foreach (var p in new[] { "/b10/x", "/s10/x", "/bnl/x", "/snl/x" })
+            {
+                var r = await s.Raw(Get(p), 10_000);
+                T.Eq(200, Status(r));
+                T.True(Dechunked(r) == payload, $"{p}: {Dechunked(r).Length} bytes"); // strict: an unterminated body throws
+                T.NotContains("Early Hints", r);
+            }
+            // Keep-alive to the client survives an upstream that could only end its body by closing.
+            using var c = await Connect(s.Port);
+            for (int i = 0; i < 2; i++)
+            {
+                await c.SendAsync(Encoding.ASCII.GetBytes("GET /bnl/k HTTP/1.1\r\nHost: t\r\n\r\n"));
+                var sb = new StringBuilder();
+                var buf = new byte[16 << 10];
+                using var cts = new CancellationTokenSource(10_000);
+                while (!sb.ToString().EndsWith("\r\n0\r\n\r\n", StringComparison.Ordinal))
+                {
+                    int n = await c.ReceiveAsync(buf, SocketFlags.None, cts.Token);
+                    if (n == 0) throw new IOException("closed: keep-alive was lost");
+                    sb.Append(Encoding.Latin1.GetString(buf, 0, n));
+                }
+                T.True(Dechunked(sb.ToString()) == payload);
+            }
+        });
+
+        T.Add("proxy: a proxy_set_header value with CR, LF or NUL is dropped, never sent", async () =>
+        {
+            await using var up = FakeUpstream.Echo();
+            await using var s = TestServer.Start(Conf($$"""
+                location / { proxy_pass http://127.0.0.1:{{up.Port}}; proxy_set_header X-Inject "a\r\nX-Evil: 1"; proxy_set_header X-Fine "ok-$uri"; }
+                """));
+            var r = await s.Raw(Get("/p"));
+            T.Eq(200, Status(r));
+            T.Contains("X-Fine: ok-/p", Body(r));
+            T.NotContains("X-Evil", Body(r));
+            T.NotContains("X-Inject", Body(r));
+            T.Contains("proxy_set_header value dropped", s.LogText());
         });
 
         T.Add("proxy: 101 without an upgrade request is refused; h2c upgrade is never forwarded", async () =>
