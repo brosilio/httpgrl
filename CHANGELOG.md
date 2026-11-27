@@ -11,6 +11,7 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
   `GET //evil.example/` now redirects to `/evil.example`. `\` is percent-encoded. *(Deviation from nginx.)*
 - `connections_per_client` on a `proxy_protocol` listener counts the client the PROXY header names, not the relay.
   Clients behind one load balancer no longer share one cap (default 256).
+- Upstream responses with more than 16 interim (1xx) heads are refused (502).
 - Plugin API: `Redirects.Escape` / `Redirects.Location` in `Httpgrl.Abstractions`, the shared `Location` builder.
 
 ### Fixed

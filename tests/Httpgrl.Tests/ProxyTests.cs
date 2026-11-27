@@ -586,13 +586,15 @@ internal static class ProxyTests
             await using var st600 = Says("HTTP/1.1 600 Weird\r\nContent-Length: 0\r\n\r\n");
             await using var badTrailer = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX: a\r\r\n\r\n");
             await using var badExt = Says("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;a\rb\r\nhello\r\n0\r\n\r\n");
+            // An endless stream of interim heads (each one within proxy_read_timeout) used to hold the request forever.
+            await using var interim = Says(string.Concat(Enumerable.Repeat("HTTP/1.1 100 Continue\r\n\r\n", 17)) + "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
             var locs = new StringBuilder();
             foreach (var (name, u) in new[] { ("both", both), ("twocl", twoCl), ("fold", fold), ("split", split), ("big", bigHead), ("line", badLine), ("te", badTe), ("short", short_), ("chunk", badChunk),
-                                              ("samecl", sameCl), ("st600", st600), ("trailer", badTrailer), ("ext", badExt) })
+                                              ("samecl", sameCl), ("st600", st600), ("trailer", badTrailer), ("ext", badExt), ("interim", interim) })
                 locs.Append($"location /{name} {{ proxy_pass http://127.0.0.1:{u.Port}; }}\n");
             locs.Append($"location /streamed-short {{ proxy_pass http://127.0.0.1:{short_.Port}; proxy_buffering off; }}\n");
             await using var s = TestServer.Start(Conf(locs.ToString()));
-            foreach (var p in new[] { "/both", "/twocl", "/fold", "/split", "/big", "/line", "/te", "/samecl", "/st600" })
+            foreach (var p in new[] { "/both", "/twocl", "/fold", "/split", "/big", "/line", "/te", "/samecl", "/st600", "/interim" })
             {
                 var r = await s.Raw(Get(p));
                 if (Status(r) != 502) throw new Exception($"{p}: expected 502, got {Status(r)}");
@@ -615,6 +617,7 @@ internal static class ProxyTests
                 var r = await s.Raw(Get(p));
                 T.True(Status(r) == 502 || (Status(r) == 200 && !r.Contains("\r\n0\r\n\r\n", StringComparison.Ordinal)), $"{p}: {r}");
             }
+            T.Contains("too many interim responses", s.LogText());
         });
 
         T.Add("proxy: 101 without an upgrade request is refused; h2c upgrade is never forwarded", async () =>
