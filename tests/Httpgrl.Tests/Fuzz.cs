@@ -43,7 +43,7 @@ internal static partial class Fuzz
 
     private static readonly Lazy<Target[]> All = new(() =>
     [
-        LogPrivacyTarget(), RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
+        LogPrivacyTarget(), H2HeadTarget(), RequestTarget(), UriTarget(), ChunkedTarget(), UpstreamTarget(), ConfigTarget(), CrlTarget(), AcceptEncodingTarget(), OcspTarget(), ProxyProtocolTarget(), TunnelHandshakeTarget(), PathMapTarget(), RangeTarget(), HostTarget(), RewriteTarget(), HpackTarget(), HuffmanTarget(), H2FramesTarget(), H2SessionTarget(),
         QuicVarIntTarget(), QuicPacketTarget(), QuicFramesTarget(), QuicTransportParametersTarget(), QuicConnectionTarget(), QuicClientHandshakeTarget(), QuicClientFramesTarget(), QpackTarget(), H3FramesTarget(), H3SessionTarget(),
     ]);
 
@@ -62,7 +62,7 @@ internal static partial class Fuzz
         }
     }
 
-    private static readonly string[] SuiteTargets = [ "log-privacy", "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "quic-client-handshake", "quic-client-frames", "qpack", "h3-frames", "h3-session"];
+    private static readonly string[] SuiteTargets = [ "log-privacy", "request", "uri", "chunked", "upstream", "config", "crl", "accept-encoding", "ocsp", "proxy-protocol", "tunnel-handshake", "path-map", "range", "host", "rewrite", "hpack", "huffman", "h2-head", "h2-frames", "h2-session", "quic-varint", "quic-packet", "quic-frames", "quic-tp", "quic-connection", "quic-client-handshake", "quic-client-frames", "qpack", "h3-frames", "h3-session"];
 
     private static void RegisterReproducibility() =>
         T.Add("fuzz: inputs derive from (seed, iteration, target) alone, identically in every process", () =>
@@ -523,6 +523,45 @@ internal static partial class Fuzz
             }
             return any;
         }, MaxLen: 256);
+
+    /// <summary>
+    /// HTTP/2 and HTTP/3 request heads (fields as HPACK/QPACK hand them over: any bytes). Input: fields separated by
+    /// '\n', name and value by the first ':' after the first byte. What's accepted has a valid method, path and host,
+    /// and only field values the HTTP/1.1 parser would accept too (they may be forwarded to an HTTP/1.1 upstream).
+    /// </summary>
+    private static Target H2HeadTarget() => new("h2-head",
+        B(":method:GET\n:scheme:https\n:path:/\n:authority:a.test\naccept:*/*",
+          ":method:POST\n:scheme:https\n:path:/x?y\n:authority:a.test\ncontent-length:3\nx-a:b\tc",
+          ":method:CONNECT\n:protocol:websocket\n:scheme:https\n:path:/ws\n:authority:a.test\nte:trailers"),
+        B(":", "\n", "\r", "\0", "\t", " ", "\x01", "\x1b", "\x7f", "\xff", "host:", "cookie:", "te:", "content-length:", ":path:", ":authority:", "%00", "..", "_"),
+        data =>
+        {
+            var req = new RequestImpl();
+            var h = new Httpgrl.Core.Http2.RequestHead(underscores: false);
+            h.Begin(req);
+            int start = 0;
+            for (int k = 0; k <= data.Length; k++)
+            {
+                if (k < data.Length && data[k] != (byte)'\n') continue;
+                var field = data.AsSpan(start, k - start);
+                start = k + 1;
+                int colon = field.Length > 1 ? field[1..].IndexOf((byte)':') : -1;
+                if (colon < 0) continue;
+                h.OnField(field[..(colon + 1)], field[(colon + 2)..]);
+            }
+            if (h.Finish(endStream: true) != 0) return false;
+            var hs = req.HeaderList;
+            for (int k = 0; k < hs.Count; k++)
+            {
+                foreach (char c in hs.ValueAt(k))
+                    if ((c < ' ' && c != '\t') || c == (char)0x7f) throw new Finding($"field {hs.NameAt(k)} carries 0x{(int)c:x2}");
+                foreach (char c in hs.NameAt(k))
+                    if (c is <= ' ' or >= (char)0x7f or ':') throw new Finding($"field name \"{hs.NameAt(k)}\"");
+            }
+            if (req.Method.Length == 0) throw new Finding("accepted without a method");
+            if (req.Method != "CONNECT" && req.RawTargetValue != "*") CheckPath(req.PathValue);
+            return true;
+        }, MaxLen: 2048);
 
     /// <summary>Host header / SNI normalization: what comes out is a valid, lower-case, port-free name, and stable.</summary>
     private static Target HostTarget() => new("host",

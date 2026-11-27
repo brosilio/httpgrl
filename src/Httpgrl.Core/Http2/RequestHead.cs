@@ -43,8 +43,10 @@ internal sealed class RequestHead(bool underscores, HttpVersion version = HttpVe
     {
         if (_malformed) return;
         if (name.IsEmpty) { Malformed("empty field name"); return; }
+        // RFC 9113 8.2.1 only forbids NUL, CR and LF; we apply HTTP/1.1's field-value rule (no CTL but HTAB, no DEL), so
+        // what h2/h3 accept is what the HTTP/1.1 parser would, and an HTTP/1.1 upstream never sees bytes it would refuse.
         foreach (byte b in value)
-            if (b is 0 or (byte)'\r' or (byte)'\n') { Malformed("CR, LF or NUL in a field value"); return; }
+            if ((b < 0x20 && b != '\t') || b == 0x7F) { Malformed("control character in a field value"); return; }
         if (value.Length > 0 && (value[0] is (byte)' ' or (byte)'\t' || value[^1] is (byte)' ' or (byte)'\t')) { Malformed("whitespace around a field value"); return; }
 
         if (name[0] == ':')
