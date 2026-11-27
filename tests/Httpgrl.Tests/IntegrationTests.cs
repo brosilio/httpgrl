@@ -358,6 +358,14 @@ internal static class IntegrationTests
             r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{hidden.Length:x}\r\n{hidden}\r\n0\r\n\r\n{next}");
             T.NotContains("EVIL", r);
             T.Contains("ok /next", r);
+            // The drain limit counts wire bytes, chunk framing included: 1-byte chunks are six bytes each on the wire.
+            var tiny = string.Concat(Enumerable.Repeat("1\r\nx\r\n", 20_000)); // 20 kB of data, 120 kB read
+            r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{tiny}0\r\n\r\n{next}", 10_000);
+            T.True(r.StartsWith("HTTP/1.1 200", StringComparison.Ordinal) || r.Contains("<<RESET>>"), r[..Math.Min(r.Length, 200)]); // closing on unread bytes may reset
+            T.NotContains("ok /next", r); // not drained: the connection closed instead
+            var few = string.Concat(Enumerable.Repeat("1\r\nx\r\n", 2_000));
+            r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{few}0\r\n\r\n{next}");
+            T.Contains("ok /next", r);
             // Too big to accept (413): the server can't know where the body ends without reading it, so it closes.
             var big = new string('x', 200);
             r = await s.Raw($"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: {big.Length + hidden.Length}\r\n\r\n{big}{hidden}{next}");
@@ -802,6 +810,11 @@ internal static class IntegrationTests
             T.Eq("5:abcde", Body(r));
             T.Eq(413, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 2048\r\n\r\n")));
             T.Eq(413, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n" + new string('x', 2048) + "\r\n0\r\n\r\n")));
+            // Chunk extensions are bounded per body, not just per line: "1;<4 KiB>" per data byte stays under 1k of data.
+            var extLine = "1;" + new string('e', 4000) + "\r\nx\r\n";
+            T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n" + string.Concat(Enumerable.Repeat(extLine, 3)) + "0\r\n\r\n")));
+            r = await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n" + extLine + extLine + "0\r\n\r\n"); // 8 KiB: still fine
+            T.Eq("2:xx", Body(r));
             T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")));
             T.Eq(400, Status(await s.Raw("POST /body HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n")));
             // Trailers are dropped but must be well-formed: a bare CR is where two parsers disagree about where the body ends.

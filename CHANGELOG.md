@@ -13,6 +13,8 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
   Clients behind one load balancer no longer share one cap (default 256).
 - HTTP/2 and HTTP/3 request field values containing control characters other than HTAB, or DEL, are malformed (as in
   HTTP/1.1), not just NUL/CR/LF.
+- Chunk extensions are limited to 8 KiB per request body (400), and the 64 KiB keep-alive drain limit counts chunk
+  framing, so it bounds the bytes actually read.
 - Upstream responses with more than 16 interim (1xx) heads are refused (502).
 - Plugin API: `Redirects.Escape` / `Redirects.Location` in `Httpgrl.Abstractions`, the shared `Location` builder.
 
