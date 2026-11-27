@@ -32,7 +32,7 @@ These are deliberate design decisions made by the project owner, not accidents t
 
 5. **Best implementation over backwards compatibility.**
    - Nothing is released and there are no compatibility promises: rename, restructure and delete freely when it's better.
-   - The config is nginx-*compatible-ish*. Follow nginx syntax and semantics unless they are unsafe or worse. Where we deviate, document it in README.md.
+   - The config is nginx-*compatible-ish*. Follow nginx syntax and semantics unless they are unsafe or worse. Where we deviate, document it in `docs/` (the directive's entry in `docs/configuration.md` or `docs/proxy.md`, and `docs/security.md` for security behaviour).
 
 6. **Security defaults are stricter than nginx. Don't loosen them to match nginx.** In particular:
    - **Request parsing:** strict. CRLF only, no obs-fold, a single `Content-Length`, `Transfer-Encoding: chunked` only and never alongside `Content-Length`, exactly one validated `Host`. Anything ambiguous is a 400. A future proxy module depends on this for smuggling safety.
@@ -119,6 +119,6 @@ actually takes effect.
 - Every security behaviour has a test in `tests/Httpgrl.Tests`. Adding a defence means adding the test that attacks it.
 - Every parser of untrusted bytes has a target in `tests/Httpgrl.Tests/Fuzz.cs` with its invariants. A new parser
   (or a new way to accept input in an existing one) gets a target or a stronger invariant in the same change.
-- Keep README.md current: the directive table, the security model and the module guide.
+- Keep the docs current: the directive tables (`docs/configuration.md`, `docs/proxy.md`), the security model (`docs/security.md`), the module guide and design decisions (`docs/development.md`), and the feature list in `README.md`.
 - New module project: `scripts/new-module-project.sh Name` (csproj with the Abstractions-only reference, plus its
   registration in the solution, host, tests and Dockerfile). Then list the module in `Program.cs` and `Harness.cs`.

@@ -36,6 +36,12 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
 - Absence-only security assertions are paired with a status check (`T.Refused`); a test that times out gets time to
   wind down and is reported if it keeps running; the slowest test went from ~14 s to ~2 s; `"=name"` runs one test.
 
+### Docs
+- The README is now an overview. The directive reference, proxy and tunnels, operations, security model and
+  development guide live in `docs/` (`configuration.md`, `proxy.md`, `operations.md`, `security.md`,
+  `development.md`). The HTTP/2–HTTP/3 and protocol-library plans were removed: their lasting decisions are in
+  `docs/development.md`, and their open work is GitHub issues #1–#8.
+
 ## [0.5.0] - 2026-11-25
 
 ### Changed (may need action)
