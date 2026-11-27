@@ -542,6 +542,76 @@ internal static class IntegrationTests
             T.Eq("custom", Body(r));
         });
 
+        T.Add("error_page with an absolute URL: the Location is escaped, never a 500 or an error line", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR};
+                    error_page 404 https://x.test$uri;
+                    location /perm/ { error_page 404 =301 https://x.test$uri; }
+                } }
+                """, d => Directory.CreateDirectory(Path.Combine(d, "perm")));
+            var r = await s.Raw(Get("/%E6%97%A5%E6%9C%AC")); // non-Latin-1: used to throw in HeaderCollection (500 + stack trace)
+            T.Eq(302, Status(r));
+            T.Eq("https://x.test/%E6%97%A5%E6%9C%AC", Header(r, "Location"));
+            r = await s.Raw(Get("/caf%C3%A9%20x")); // Latin-1 and space: used to go out raw
+            T.Eq(302, Status(r));
+            T.Eq("https://x.test/caf%C3%A9%20x", Header(r, "Location"));
+            r = await s.Raw(Get("/%5Cevil"));
+            T.Eq("https://x.test/%5Cevil", Header(r, "Location"));
+            r = await s.Raw(Get("/perm/gone"));
+            T.Eq(301, Status(r));
+            T.Eq("https://x.test/perm/gone", Header(r, "Location"));
+            T.NotContains("\"level\":\"error\"", s.LogText());
+        });
+
+        T.Add("static: the directory redirect escapes a query that came from config (internal redirect)", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR};
+                    location /go { try_files /nope "/d?q=日本 x"; }
+                } }
+                """, d => Directory.CreateDirectory(Path.Combine(d, "d")));
+            var r = await s.Raw(Get("/go"));
+            T.Eq(301, Status(r)); // used to be a 500: HeaderCollection refuses non-Latin-1
+            T.Eq("/d/?q=%E6%97%A5%E6%9C%AC%20x", Header(r, "Location"));
+            r = await s.Raw(Get("/d?a=b"));
+            T.Eq("/d/?a=b", Header(r, "Location"));
+        });
+
+        T.Add("redirects built from $uri or captures are never protocol-relative and never carry a backslash", async () =>
+        {
+            await using var s = TestServer.Start("""
+                http { server { listen 127.0.0.1:0; root {DIR};
+                    location /a/ { rewrite ^/a/(.*)/$ /$1 permanent; }
+                    location /b/ { rewrite ^/b(.*)/$ $1 redirect; }
+                    location /c/ { return 302 $uri; }
+                    location ~ ^/d(/.*)$ { return 302 /$1; }
+                    location /cdn/ { return 302 //cdn.test$uri; }
+                    location /rq { return 302 $request_uri; }
+                } }
+                """);
+            async Task<string?> Loc(string path, int status)
+            {
+                var r = await s.Raw(Get(path));
+                T.Eq(status, Status(r));
+                return Header(r, "Location");
+            }
+            // The classic "strip the trailing slash" rule: /\evil.example is //evil.example to a browser.
+            T.Eq("/%5Cevil.example", await Loc("/a/%5Cevil.example/", 301));
+            T.Eq("/x/y", await Loc("/a/x/y/", 301));
+            // A capture that supplies the leading slashes: collapsed to one, so the target stays on this host.
+            T.Eq("/evil.example", await Loc("/b//evil.example/", 302));
+            T.Eq("/evil.example", await Loc("/b/%2Fevil.example/", 302));
+            T.Eq("/c/x", await Loc("/c/x", 302));
+            T.Eq("/evil.example/", await Loc("/d//evil.example/", 302));
+            // $request_uri is raw: GET //rq.example would be a redirect to the host rq.example.
+            var rq = await s.Raw("GET //rq.example HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+            T.Eq(302, Status(rq));
+            T.Eq("/rq.example", Header(rq, "Location"));
+            // The admin wrote // themselves: left alone.
+            T.Eq("//cdn.test/cdn/x", await Loc("/cdn/x", 302));
+        });
+
         T.Add("return 444 and error_page =444 drop the connection without a byte", async () =>
         {
             await using var s = TestServer.Start("""

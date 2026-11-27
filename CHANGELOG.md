@@ -5,6 +5,16 @@ minor bump may break configuration, the plugin API or the Core APIs; the entry s
 
 ## [Unreleased]
 
+### Changed (may need action)
+- Redirect targets built from variables (`return`, `rewrite ... redirect|permanent`, absolute `error_page` URLs) never
+  come out protocol-relative unless the configured text starts with `//`: `rewrite ^/(.*)/$ /$1 permanent;` on
+  `GET //evil.example/` now redirects to `/evil.example`. `\` is percent-encoded. *(Deviation from nginx.)*
+- Plugin API: `Redirects.Escape` / `Redirects.Location` in `Httpgrl.Abstractions`, the shared `Location` builder.
+
+### Fixed
+- `error_page code https://...$uri;` sent the evaluated URL unescaped: a non-Latin-1 path answered 500 with an
+  error-level log line and stack trace (any client could flood the log), and spaces or Latin-1 went out raw.
+
 ### Tests
 - Absence-only security assertions are paired with a status check (`T.Refused`); a test that times out gets time to
   wind down and is reported if it keeps running; the slowest test went from ~14 s to ~2 s; `"=name"` runs one test.

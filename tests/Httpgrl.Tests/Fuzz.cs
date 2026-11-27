@@ -492,6 +492,8 @@ internal static partial class Fuzz
     /// a query that can sit on a request line, and a Location value that can't split the response. Input: the
     /// replacement result, then optionally '\x01' and the original query.
     /// </summary>
+    private static readonly ComplexValue VariableTemplate = new("$1", []), LiteralSlashesTemplate = new("//cdn.example$1", []);
+
     private static Target RewriteTarget() => new("rewrite",
         B("/new/path", "/a?x=1", "/a?", "/a?b=2\x01c=3", "/../../etc", "/x/%2e%2e/y", "http://evil/\r\nSet-Cookie: x", "/caf\u00e9?q=\u00e9 \t#f"),
         B("?", "&", "#", "/", "..", ".", "%", "%0d%0a", "\r", "\n", "\0", " ", "\t", "\x7f", "\xff", "\x01", "//", "\\"),
@@ -500,8 +502,10 @@ internal static partial class Fuzz
             int sep = Array.IndexOf(data, (byte)1);
             var target = Encoding.UTF8.GetString(sep < 0 ? data : data[..sep]);
             var orig = sep < 0 ? "" : Encoding.Latin1.GetString(data, sep + 1, data.Length - sep - 1);
-            var loc = Httpgrl.Modules.Rewrite.RewriteModule.EscapeForHeader(target);
-            foreach (char c in loc) if (c is < (char)0x21 or > (char)0x7e) throw new Finding($"Location carries 0x{(int)c:x2}");
+            var loc = Redirects.Location(VariableTemplate, target);
+            foreach (char c in loc) if (c is < (char)0x21 or > (char)0x7e or '\\') throw new Finding($"Location carries 0x{(int)c:x2}");
+            if (loc.StartsWith("//", StringComparison.Ordinal)) throw new Finding($"variable-built Location is protocol-relative: \"{loc}\"");
+            if (Redirects.Location(LiteralSlashesTemplate, target) != Redirects.Escape(target)) throw new Finding("a template written with // was changed");
             var (path, query) = Httpgrl.Modules.Rewrite.RewriteModule.SplitTarget(target, orig);
             if (path.Contains('?')) throw new Finding($"'?' left in path \"{path}\"");
             var q = HttpContextImpl.EscapeQuery(query);

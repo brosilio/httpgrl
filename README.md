@@ -160,7 +160,7 @@ inherited by nested locations (nginx semantics).
 
 | Directive | Context | Default | Notes |
 |---|---|---|---|
-| `return code [text];` `return 301\|302\|303\|307\|308 url;` `return url;` `return 444;` | server, location, if | | nginx semantics. Without text, the core renders the body and `error_page` applies. `$variables` in redirect URLs are re-encoded, so a decoded `$uri` can't inject headers. `444` closes the connection silently. |
+| `return code [text];` `return 301\|302\|303\|307\|308 url;` `return url;` `return 444;` | server, location, if | | nginx semantics. Without text, the core renders the body and `error_page` applies. `$variables` in redirect URLs are re-encoded (controls, spaces, non-ASCII and `\`), so a decoded `$uri` can't inject headers, and a redirect URL whose own text doesn't start with `//` never comes out protocol-relative (see [Security model](#security-model)). `444` closes the connection silently. |
 | `set $var value;` | server, location, if | | Declares `$var` (usable anywhere in the config, even before the `set`). Values are per request and survive internal redirects. Built-in variables can't be overwritten. |
 | `if (condition) { ... }` | server, location, if | | Conditions: `($var)` (false if empty or `"0"`), `$var = value`, `$var != value`, `$var ~ regex`, `~*` (case-insensitive), `!~`, `!~*`. A positive regex match sets `$1`..`$9`. **Deviation:** the block may contain only `return`, `set`, `break` and nested `if`. nginx's "if is evil" comes from `if` being a half-location where other directives misbehave; here that can't happen. For a conditional header or upstream, compute a value with `map`. File tests (`-f`, `-d`, ...) aren't supported (modules never see paths): use `try_files`. Quote regexes that contain `{`, `}` or `;`. |
 | `break;` | server, location, if | | Stops the rest of the current block's script. |
@@ -475,6 +475,11 @@ coverage-guided, so it's a complement to, not a replacement for, a coverage-guid
   form (`GET http://a.test/ HTTP/1.1`) still needs a valid `Host` field (RFC 9112 3.2), though the target's authority
   is what selects the server. `$request_uri` is the origin-form path and query even then, as in nginx, so
   `return 302 $request_uri;` can't be pointed at another host.
+- Redirect targets built from variables (`return`, `rewrite ... redirect|permanent`, `error_page ... http(s)://...`)
+  are percent-encoded for the header, including `\`, which browsers read as `/`. If the result starts with `//`
+  but the configured text doesn't, the leading slashes collapse to one: with the common
+  `rewrite ^/(.*)/$ /$1 permanent;`, `GET //evil.example/` redirects to `/evil.example`, not to another host.
+  *(Deviation: nginx sends `//evil.example`.)* Write `//host/...` literally if you mean a protocol-relative URL.
 - Header names containing `_` are ignored unless `underscores_in_headers on` (nginx's default too). CGI-style
   backends (FastCGI, WSGI, Rack) fold `_` and `-` into one variable name, so `X_Client_Verify` would otherwise reach
   them as the `X-Client-Verify` a proxy sets or strips.

@@ -203,7 +203,7 @@ internal sealed class RequestPipeline(HttpHandler[] rewrite, HttpHandler[] acces
         var uri = page.Uri!.Evaluate(ctx);
         if (uri.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || uri.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
         {
-            ctx.Resp.Headers.Set("Location", uri);
+            ctx.Resp.Headers.Set("Location", Httpgrl.Redirects.Location(page.Uri!, uri));
             redirectStatus = page.Override is 301 or 302 or 303 or 307 or 308 ? page.Override : 302;
             return true;
         }
